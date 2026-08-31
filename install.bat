@@ -23,7 +23,7 @@ if errorlevel 1 (
     echo [..] Installing pyyaml ...
     pip install pyyaml
     if errorlevel 1 (
-        echo [WARN] pyyaml install failed (no network?). Use JSON config or retry later.
+        echo [WARN] pyyaml install failed - no network? Use JSON config or retry later.
     ) else (
         echo [OK] pyyaml installed
     )
@@ -46,7 +46,7 @@ if not exist "%PCFG%" (
     copy /Y "%SRC%astrbot_plugin_xtc_bridge\plugin_config.example.json" "%PCFG%" >nul
     echo [OK] Plugin config initialized: %PCFG%
 ) else (
-    echo [OK] Plugin config already exists (keep as-is)
+    echo [OK] Plugin config already exists - keep as-is
 )
 
 REM ---------- 5. Bridge config.yaml (only if missing) ----------
@@ -54,7 +54,7 @@ if not exist "%SRC%config.yaml" (
     copy /Y "%SRC%config.example.yaml" "%SRC%config.yaml" >nul
     echo [OK] config.yaml created from template - EDIT IT before running!
 ) else (
-    echo [OK] config.yaml exists (keep as-is)
+    echo [OK] config.yaml exists - keep as-is
 )
 
 echo.

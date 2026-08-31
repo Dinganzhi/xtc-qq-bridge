@@ -11,6 +11,8 @@
 QQ 侧通过 **AstrBot 插件**（常驻 AstrBot 进程）收发，已实现：
 双向消息桥接、账密自动登录、登录态检测、安全验证提醒与自动恢复。
 
+> 🚀 **安装：双击项目根目录的 `install.bat` 即可一键初始化**（详见下方「快速安装」）。
+
 ```
 小天才 App(雷电模拟器) ──ADB──▶ Python 桥脚本 ──HTTP──▶ AstrBot 插件 ──▶ QQ
        ▲                                                        │
@@ -52,6 +54,13 @@ project/
 ├── install.bat             # 一键安装（新机器）
 └── requirements.txt
 ```
+
+## 快速安装（推荐）
+
+> 💡 **最简单的方式：双击 `install.bat`** —— 一键完成：
+> ① 安装 pyyaml ② 复制 AstrBot 插件到 `~\.astrbot\data\plugins\xtc_qq_bridge\`
+> ③ 从 `config.example.yaml` 生成 `config.yaml` ④ 生成插件初始配置。
+> 之后只需编辑 `config.yaml` 并按下方步骤启用插件即可。
 
 ## 快速开始
 
