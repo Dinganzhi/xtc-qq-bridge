@@ -69,6 +69,18 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                     daemon=True, name="qq-to-xtc",
                 ).start()
                 self._send(200, b"OK")
+            elif data.get("action") == "login":
+                # /小天才登录 命令：执行账密登录（后台线程）
+                user = str(data.get("user_id") or "")
+                group = str(data.get("group_id") or "")
+                if bridge.qq_sender_allowed(user, group):
+                    threading.Thread(
+                        target=bridge.login_xiaotiancai, daemon=True,
+                        name="xtc-login",
+                    ).start()
+                    self._send(200, b"OK")
+                else:
+                    self._send(200, b"IGNORED")
             else:
                 self._send(200, b"IGNORED")
 

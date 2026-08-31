@@ -26,6 +26,7 @@ target:
                                                  # 行首 # 是注释=不生效；启用时删掉 #
     # "小宝": "宝贝"
   default_nickname: ""                           # 未命中映射时的兜底；留空回退 App 原始名
+  notify_qq: ""                                  # 登录/异常通知目标 QQ 号（留空则用 qq_private 第一个）
   qq_private: ""                                 # 转发目标 QQ 号：单个 "10001" 或多个 ["10001","10002"]
   qq_group: ""                                   # 转发目标群号：单个或多个（可与 qq_private 并存）
 
@@ -40,10 +41,16 @@ xiaotiancai:
   main_activity: ".MainActivity"
   check_interval: 2
   auto_install_adbkeyboard: true                 # 优先用捆绑的 APK，其次在线下载
+  login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
+    phone: ""                                    # 手机号
+    password: ""                                 # 密码（注意：不是验证码）
+  login_check_interval: 600                      # 未登录自动检测间隔（秒）= 10 分钟
   ui:
     # 登录家长账号后运行 `python tools/dump_ui.py` 查看真实界面，按需修改：
     message_tab_text: "微聊"                     # 聊天列表 Tab 文案（精确匹配）
     login_markers: ["注册/登录"]                 # 出现这些文案视为未登录
+    risk_markers: ["安全验证", "风险", "滑块", "拖动滑块", "图形验证", "验证码"]
+    login_error_markers: ["密码错误", "账号不存在", "不存在", "错误", "失败", "次数过多"]
     watch_contact: ""                            # 与 target.xtc_contact 相同（列表读取用）
     input_resource_id: "com.xtc.watch:id/et_chat_text_content"
     send_resource_id: "com.xtc.watch:id/tv_send_view"

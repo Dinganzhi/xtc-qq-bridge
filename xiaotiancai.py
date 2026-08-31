@@ -72,8 +72,11 @@ class Xiaotiancai:
         return self.adb.get_current_focus() or ""
 
     def is_logged_in(self) -> bool:
-        """通过 Activity 名 + 界面文案判断是否已登录家长账号。"""
+        """通过 Activity 名 + 界面文案判断是否已登录家长账号。
+        小天才 App 不在前台（如桌面）时一律视为未登录。"""
         act = self.current_activity()
+        if not act.startswith(self.package):
+            return False
         for marker in ("welcome", "login", "register", "signin"):
             if marker in act.lower():
                 return False
@@ -86,6 +89,9 @@ class Xiaotiancai:
         for marker in self.ui.get("login_markers", ["注册/登录", "立即登录", "登录"]):
             if marker in joined:
                 return False
+        # 首启隐私协议弹窗 = 尚未进入 App，视为未登录
+        if "温馨提示" in joined and ("同意" in joined or "不同意" in joined):
+            return False
         return True
 
     def require_login(self) -> bool:
@@ -95,9 +101,200 @@ class Xiaotiancai:
             self._warned_not_login = True
         return ok
 
+    # ------------------------------------------------------------------ 账密登录
+    def login(self, phone: str, password: str) -> str:
+        """账密登录小天才（手机号 + 密码，非验证码）。
+
+        返回状态：
+        - 'already' 已经登录，无需操作
+        - 'ok'      登录成功
+        - 'risk'    触发安全验证，需要用户手动在模拟器操作
+        - 'fail'    账号/密码错误等（登录失败）
+        - 'error'   流程异常（未找到控件/未配置账密）
+        """
+        if not phone or not password:
+            self.log("error", "账密登录需要 config.yaml → xiaotiancai.login.phone / password")
+            return "error"
+        if self.is_logged_in():
+            return "already"
+        try:
+            # 0) 确保 App 在前台 + 处理首启隐私弹窗/权限等
+            self.launch()
+            time.sleep(2.0)
+            self._dismiss_blockers()
+            # 1) 进入登录页（欢迎页 → 点"注册/登录"）
+            root = self.adb.dump_ui()
+            if not self._is_login_page(root):
+                entry = self._first(
+                    self.adb.find_element(root, text="注册/登录", text_contains=True),
+                    self.adb.find_element(root, content_desc="注册/登录"))
+                if entry is None:
+                    entry = self._first(
+                        self.adb.find_element(root, text="登录", text_contains=True),
+                        self.adb.find_element(root, content_desc="登录"))
+                if entry is not None:
+                    self.log("debug", f"点登录入口 {entry.get('bounds')}")
+                    self.adb.tap_element(entry)
+                    time.sleep(2.0)
+                    root = self.adb.dump_ui()
+            # 2) 切到"账号密码登录"（短信登录页底部多段链接的最左段）
+            if not self._is_account_login_page(root):
+                switch = self._find_account_login_entry(root)
+                if switch is not None:
+                    self.log("debug", f"点账密入口 {switch.get('bounds')}")
+                    self._tap_entry_left(switch)
+                    time.sleep(2.0)
+                    root = self.adb.dump_ui()
+                else:
+                    self.log("debug", "未找到账密入口")
+            self.log("debug",
+                     f"切换后前台={self.current_activity()} "
+                     f"EditText={len(self.adb.find_elements(root, class_name='EditText'))}")
+            # 3) 找手机号 + 密码两个输入框
+            edits = self.adb.find_elements(root, class_name="EditText")
+            edits.sort(key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
+            if len(edits) < 2:
+                self.log("error", "未找到账密输入框（页面结构变化？运行 python tools/dump_ui.py 查看登录页）")
+                return "error"
+            # 4) 输入手机号、密码（先清空再输入）
+            for edit, value in ((edits[0], phone), (edits[1], password)):
+                self.adb.tap_element(edit)
+                time.sleep(1.5)
+                for _ in range(20):
+                    self.adb.keyevent(67)  # 清空可能残留的内容
+                if not self.adb.input_text(value):
+                    self.log("error", "文本注入失败（ADBKeyBoard 未就绪？）")
+                    return "error"
+                time.sleep(0.5)
+            # 5) 勾选协议（若存在且未勾选）
+            root = self.adb.dump_ui()
+            cb = self._first(
+                self.adb.find_element(root, class_name="CheckBox"),
+                self.adb.find_element(root, resource_id="com.xtc.watch:id/cb_protocol"))
+            if cb is not None and cb.get("checked") != "true":
+                self.adb.tap_element(cb)
+                time.sleep(0.5)
+            # 6) 点登录（先收起键盘——输入密码后键盘仍打开，会挡住/截获点击）
+            #    未离开账密登录页说明点击被吞，重试最多 3 次
+            self.adb.keyevent(4)
+            time.sleep(0.8)
+            tapped = False
+            for attempt in range(1, 4):
+                root = self.adb.dump_ui()
+                btn = self._find_login_button(root)
+                if btn is None:
+                    break  # 页面已跳转（登录中/验证页/成功）
+                self.log("debug", f"点登录按钮（第 {attempt} 次）{btn.get('bounds')}")
+                self.adb.tap_element(btn)
+                tapped = True
+                time.sleep(2.5)
+                act = self.current_activity()
+                if not act.endswith("LoginActivity"):
+                    break  # 已离开账密登录页，请求已发出
+                self.log("debug", "点击后仍在登录页，重试")
+            if not tapped:
+                self.log("error", "未找到登录按钮（页面结构变化？运行 dump_ui 查看）")
+                return "error"
+            # 7) 等待结果（最多 25s）
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                time.sleep(2.5)
+                try:
+                    if self.is_logged_in():
+                        self.log("info", "小天才账密登录成功")
+                        return "ok"
+                    root = self.adb.dump_ui()
+                    risk = self._detect_risk(root)
+                    if risk:
+                        self.log("warning", f"登录触发安全验证（{risk}），需要用户手动操作")
+                        return "risk"
+                    err = self._detect_login_error(root)
+                    if err:
+                        self.log("error", f"登录失败: {err}")
+                        return "fail"
+                except AdbError:
+                    continue
+            self.log("warning", "登录结果超时未确定")
+            return "fail"
+        except AdbError as e:
+            self.log("error", f"登录流程异常: {e}")
+            return "error"
+
+    # ------------------------------------------------------------------ 登录页判定/工具
+    def _is_login_page(self, root: ET.Element) -> bool:
+        """当前页面是否为登录页（短信/账密均可）。
+        以输入框/获取验证码等登录页专属元素为准——欢迎页虽有"注册/登录"文案，但不是登录页。"""
+        if self.adb.find_elements(root, class_name="EditText"):
+            return True
+        texts = "".join(n.get("text", "") for n in root.iter("node"))
+        return "获取验证码" in texts or "短信验证码登录" in texts
+
+    def _is_account_login_page(self, root: ET.Element) -> bool:
+        """是否为账密登录页：至少两个 EditText（手机号+密码）。"""
+        return len(self.adb.find_elements(root, class_name="EditText")) >= 2
+
+    def _find_account_login_entry(self, root: ET.Element):
+        """切到账密登录的入口（短信页底部文案 '账号密码登录' 等）。"""
+        return self._first(
+            self.adb.find_element(root, text="账号密码登录", text_contains=True),
+            self.adb.find_element(root, content_desc="账号密码登录"))
+
+    def _tap_entry_left(self, node) -> None:
+        """多段链接（'账号密码登录｜注册｜忘记密码…'）点最左段；普通节点点中心。"""
+        b = self._bounds(node)
+        if b is None:
+            self.adb.tap_element(node)
+            return
+        x1, y1, x2, y2 = b
+        text = node.get("text", "")
+        if "｜" in text or "|" in text:
+            self.adb.tap(x1 + int((x2 - x1) * 0.2), (y1 + y2) // 2)
+        else:
+            self.adb.tap((x1 + x2) // 2, (y1 + y2) // 2)
+
+    def _find_login_button(self, root: ET.Element):
+        """登录按钮：优先精确文本"登录"；其次 id 结尾为 login 的按钮
+        （注意：不能用"id 含 login"——tv_login_area_title/tv_login_account 等
+        标签控件 id 也含 login，会误命中）。"""
+        n = self.adb.find_element(root, text="登录")
+        if n is not None:
+            return n
+        for node in root.iter("node"):
+            tail = self._id_tail(node)
+            if tail.endswith("login") or "login_btn" in tail or "btn_login" in tail:
+                if "Text" in node.get("class", "") or "Button" in node.get("class", ""):
+                    return node
+        return self._first(
+            self.adb.find_element(root, content_desc="登录"),
+            None)
+
+    def _detect_risk(self, root: ET.Element) -> str:
+        """检测安全验证（账号风险）界面，返回命中的标记文案；无则返回 ''。
+        注意：不要用 "验证码" 这类宽泛词——登录页底部固定有"短信验证码登录"文案会误判。"""
+        markers = self.ui.get("risk_markers",
+                              ["安全验证", "风险", "滑块", "拖动滑块", "图形验证",
+                               "完成验证", "请完成验证", "滑动验证"])
+        texts = [n.get("text", "") for n in root.iter("node")]
+        joined = "".join(texts)
+        for m in markers:
+            if m in joined:
+                return m
+        return ""
+
+    def _detect_login_error(self, root: ET.Element) -> str:
+        """检测登录失败提示（账号/密码错误等），返回命中文案；无则返回 ''。"""
+        markers = self.ui.get("login_error_markers",
+                              ["密码错误", "账号不存在", "不存在", "错误", "失败", "次数过多"])
+        texts = [n.get("text", "") for n in root.iter("node")]
+        joined = "".join(texts)
+        for m in markers:
+            if m in joined:
+                return m
+        return ""
+
     # ------------------------------------------------------------------ 弹窗处理
     def _dismiss_blockers(self) -> bool:
-        """处理会挡住操作的弹窗：系统录音权限、小天才警告。返回是否处理过。"""
+        """处理会挡住操作的弹窗：系统录音权限、小天才警告、首启隐私协议。返回是否处理过。"""
         focus = self.current_activity()
         try:
             if "permissioncontroller" in focus.lower():
@@ -109,6 +306,16 @@ class Xiaotiancai:
                     time.sleep(1.5)
                     return True
             root = self.adb.dump_ui()
+            # 首启隐私协议弹窗（温馨提示 → 点"同意"；必须先于通用 btn_cancel，
+            # 否则会把"不同意"当成警告弹窗的"取消"点掉）
+            title = self.adb.find_element(root, resource_id="com.xtc.watch:id/tv_title")
+            if title is not None and "温馨提示" in title.get("text", ""):
+                sure = self.adb.find_element(root, resource_id="com.xtc.watch:id/btn_sure")
+                if sure is not None:
+                    self.adb.tap_element(sure)
+                    self.log("info", "已同意隐私协议（首启弹窗）")
+                    time.sleep(1.5)
+                    return True
             btn = self.adb.find_element(root, resource_id=_CANCEL_DIALOG_ID)
             if btn is not None:
                 self.adb.tap_element(btn)

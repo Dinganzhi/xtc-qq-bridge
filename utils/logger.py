@@ -20,7 +20,7 @@ def setup_logger(level: str = "INFO", file: str | None = None,
     except Exception:
         logger.setLevel(logging.INFO)
 
-    fmt = logging.Formatter(_FORMAT, datefmt="%H:%M:%S")
+    fmt = logging.Formatter(_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
 
     if console:
         ch = logging.StreamHandler(sys.stdout)

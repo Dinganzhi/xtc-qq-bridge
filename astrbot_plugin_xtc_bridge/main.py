@@ -73,11 +73,33 @@ class Main(star.Star):
             sender_name = event.get_sender_name() or str(event.get_sender_id())
             now = datetime.now().strftime("%H:%M")
             message = f"[{now}] [{sender_name}] {text}"
-            sender = str(event.get_sender_id())
-            group = str(event.get_group_id() or "")
-            await self._forward_to_python(sender, group, message)
+            await self._forward_to_python(self._base_payload(event, message=message))
         except Exception as e:  # noqa: BLE001
             self.logger.exception(f"[xtc_qq_bridge] 命令处理异常: {e}")
+
+    @filter.command("小天才登录")
+    async def on_xtc_login(self, event: AstrMessageEvent) -> None:
+        """用法：/小天才登录 —— 用配置的手机号+密码登录小天才。"""
+        try:
+            self._platform_ids.add(event.session.platform_id)
+            if not self._is_sender_allowed(event):
+                return
+            await self._forward_to_python(self._base_payload(event, action="login"))
+            event.set_result(event.plain_result("正在登录小天才（手机号+密码）..."))
+        except Exception as e:  # noqa: BLE001
+            self.logger.exception(f"[xtc_qq_bridge] 登录命令处理异常: {e}")
+
+    def _base_payload(self, event: AstrMessageEvent, message: str = "", action: str = "") -> dict:
+        payload = {
+            "source": "astrbot",
+            "user_id": str(event.get_sender_id()),
+            "group_id": str(event.get_group_id() or ""),
+        }
+        if message:
+            payload["message"] = message
+        if action:
+            payload["action"] = action
+        return payload
 
     def _is_sender_allowed(self, event: AstrMessageEvent) -> bool:
         allow_users = self.config.get("allow_senders") or []
@@ -91,17 +113,11 @@ class Main(star.Star):
                 return False
         return True
 
-    async def _forward_to_python(self, sender: str, group: str, message: str) -> None:
+    async def _forward_to_python(self, payload: dict) -> None:
         url = self.config.get(
             "python_callback_url", "http://127.0.0.1:5000/qq_callback"
         )
         token = self.config.get("python_callback_token", "")
-        payload = {
-            "source": "astrbot",
-            "user_id": sender,
-            "group_id": group,
-            "message": message,
-        }
         try:
             await asyncio.to_thread(self._http_post, url, payload, token)
         except Exception as e:  # noqa: BLE001

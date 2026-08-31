@@ -77,20 +77,30 @@ class MessageBridge:
         self.echo = EchoFilter(store_path=store_path)
         self._poll_interval = float((cfg.get("xiaotiancai") or {}).get("check_interval", 2))
         self._heartbeat_interval = float((cfg.get("adb") or {}).get("heartbeat_interval", 10))
+        self._login_check_interval = float(
+            (cfg.get("xiaotiancai") or {}).get("login_check_interval", 600))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
+        self._login_thread: threading.Thread | None = None
+        # 登录待恢复标记：触发安全验证/登录失败后置位；
+        # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
+        self._pending_login_notify = False
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
         self.running = True
         self._thread = threading.Thread(target=self._poll_loop, name="xtc-poll", daemon=True)
         self._thread.start()
+        self._login_thread = threading.Thread(target=self._login_check_loop, name="xtc-login-check", daemon=True)
+        self._login_thread.start()
         self._log("info", f"小天才消息轮询已启动（间隔 {self._poll_interval}s）")
 
     def stop(self) -> None:
         self.running = False
         if self._thread:
             self._thread.join(timeout=5)
+        if self._login_thread:
+            self._login_thread.join(timeout=5)
 
     # ------------------------------------------------------------------ 轮询
     def _poll_loop(self) -> None:
@@ -112,6 +122,11 @@ class MessageBridge:
                 if not self._op_lock.acquire(blocking=False):
                     continue  # 正在发送/导航，跳过本轮，避免 dump 冲突
                 try:
+                    # 恢复检测：安全验证完成后自动确认并通知（无需重启）
+                    if self._pending_login_notify:
+                        if self.xtc.is_logged_in():
+                            self._pending_login_notify = False
+                            self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
                     contact, text = self.xtc.get_latest_message()
                 finally:
                     self._op_lock.release()
@@ -213,6 +228,93 @@ class MessageBridge:
             if not self.xtc.open_chat(contact):
                 return False
             return self.xtc.send_message(text)
+
+    # ------------------------------------------------------------------ 登录
+    def login_xiaotiancai(self) -> str:
+        """执行账密登录（config.yaml → xiaotiancai.login），按结果通知 QQ。"""
+        acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
+        phone = str(acc.get("phone", "")).strip()
+        password = str(acc.get("password", "")).strip()
+        if not phone or not password:
+            self._notify("小天才登录：未配置手机号/密码（config.yaml → xiaotiancai.login.phone/password）")
+            return "error"
+        try:
+            with self._op_lock:
+                status = self.xtc.login(phone, password)
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"自动登录异常: {e}")
+            self._notify("❌ 小天才自动登录出错，请手动检查模拟器")
+            return "error"
+        if status == "risk":
+            self._pending_login_notify = True  # 等待用户手动完成安全验证
+            self._notify("⚠️ 小天才登录触发安全验证，请手动打开模拟器完成验证")
+        elif status == "fail":
+            self._pending_login_notify = True  # 避免每 10 分钟反复重试刷屏
+            self._notify("❌ 小天才自动登录失败（账号或密码错误等），请检查配置或手动登录")
+        elif status == "error":
+            self._notify("❌ 小天才自动登录出错（控件未找到），请运行 tools/dump_ui.py 查看登录页")
+        elif status == "ok":
+            self._log("info", "小天才账密登录成功")
+        elif status == "already":
+            self._log("info", "小天才已登录，跳过")
+        return status
+
+    def _login_check_loop(self) -> None:
+        """每 login_check_interval 秒检测登录态，未登录则自动登录。"""
+        interval = self._login_check_interval
+        last = 0.0
+        while self.running:
+            try:
+                now = time.monotonic()
+                if now - last >= interval:
+                    last = now
+                    if not self._op_lock.acquire(blocking=False):
+                        continue
+                    try:
+                        logged = self.xtc.is_logged_in()
+                    finally:
+                        self._op_lock.release()
+                    if not logged:
+                        if self._pending_login_notify:
+                            # 安全验证/登录失败待处理：等用户手动完成，不反复自动重试
+                            self._log("info", "小天才登录待处理（安全验证/失败），等待用户手动操作，暂不重试")
+                        else:
+                            self._log("info", "检测到小天才未登录，尝试自动登录...")
+                            self.login_xiaotiancai()
+                    else:
+                        if self._pending_login_notify:
+                            self._pending_login_notify = False
+                            self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
+                        else:
+                            self._log("debug", "小天才登录态正常")
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"自动登录检测异常: {e}")
+            time.sleep(10)
+
+    def _notify(self, text: str) -> None:
+        """发送登录相关通知到 QQ（target.notify_qq，缺省用 qq_private 第一个）。"""
+        target = self._notify_target()
+        if not target:
+            self._log("info", f"[通知占位] {text}")
+            return
+        try:
+            ok = self.forwarder.send("private", target, text)
+            if ok:
+                self._log("info", f"[通知] private:{target} ← {text}")
+            else:
+                self._log("error", f"[通知失败] private:{target} ← {text}")
+        except Exception as e:  # noqa: BLE001
+            self._log("error", f"通知发送异常: {e}")
+
+    def _notify_target(self) -> str:
+        t = self.cfg.get("target") or {}
+        v = t.get("notify_qq")
+        if v:
+            return str(v[0]) if isinstance(v, (list, tuple)) else str(v)
+        for mtype, tid in self._qq_targets():
+            if mtype == "private":
+                return tid
+        return ""
 
     def _log(self, level: str, msg: str) -> None:
         if self.logger is None:
