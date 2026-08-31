@@ -27,6 +27,7 @@ target:
     # "小宝": "宝贝"
   default_nickname: ""                           # 未命中映射时的兜底；留空回退 App 原始名
   notify_qq: ""                                  # 登录/异常通知目标 QQ 号（留空则用 qq_private 第一个）
+  confirm_delivery: true                         # 送达确认：转发成功后回复"✅ 消息已转发成功"（双向）
   qq_private: ""                                 # 转发目标 QQ 号：单个 "10001" 或多个 ["10001","10002"]
   qq_group: ""                                   # 转发目标群号：单个或多个（可与 qq_private 并存）
 
@@ -55,7 +56,8 @@ xiaotiancai:
     input_resource_id: "com.xtc.watch:id/et_chat_text_content"
     send_resource_id: "com.xtc.watch:id/tv_send_view"
     send_texts: ["发送"]
-    chat_junk_texts: ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话"]
+    chat_junk_texts: ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话", "试试和宝贝聊天吧", "试试将作业要求发送给宝贝吧"]
+    system_msg_prefixes: ["✅", "❌"]             # 桥接系统提示前缀（送达确认等），读取时跳过不转发
     badge_resource_ids: []
 
 # ---------- 日志 ----------

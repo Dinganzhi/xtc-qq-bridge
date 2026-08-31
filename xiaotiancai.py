@@ -35,7 +35,8 @@ _TIP_IDS = ("tv_weichat_uninstall_hint", "iv_tips_content")
 # 发送失败弹窗标题
 _SEND_FAIL_TITLE = "消息发送"
 
-_DEFAULT_JUNK = ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话"]
+_DEFAULT_JUNK = ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话",
+                 "试试和宝贝聊天吧", "试试将作业要求发送给宝贝吧"]
 
 
 class Xiaotiancai:
@@ -597,6 +598,9 @@ class Xiaotiancai:
                     continue  # 右侧气泡 = 自己发的消息
             if not t:
                 continue
+            # 桥接系统提示（如送达确认 ✅/❌）一律不转发，防止循环
+            if self._is_system_msg(t):
+                continue
             candidates.append((n, t, b[3]))
         if not candidates:
             return (None, None)
@@ -629,8 +633,15 @@ class Xiaotiancai:
         else:
             target = min(rows, key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
         text = target.get("text", "").strip()
+        if self._is_system_msg(text):
+            return (None, None)  # 列表预览是桥接系统提示（送达确认等），不转发
         contact = self._row_contact(target, root)
         return (contact or None, text or None)
+
+    def _is_system_msg(self, text: str) -> bool:
+        """桥接系统提示消息（送达确认等）按前缀识别，防止被当成接收消息转发。"""
+        prefixes = self.ui.get("system_msg_prefixes", ["✅", "❌"])
+        return any(str(text).startswith(p) for p in prefixes)
 
     def _row_contact(self, preview_node, root: ET.Element) -> str:
         """取预览节点同行的联系人名（同父节点的 tv_chat_dialog_name）。"""

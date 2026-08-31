@@ -164,6 +164,7 @@ class MessageBridge:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
             self.echo.mark(text)
             self.echo.mark(message)
+            self._confirm_xtc_delivery()  # 小天才侧送达确认（✅ 已转发到QQ）
 
     def _qq_targets(self) -> list[tuple[str, str]]:
         """转发目标列表 [(type, id)]；qq_private/qq_group 支持单个字符串或列表。"""
@@ -214,9 +215,10 @@ class MessageBridge:
             self._log("info", f"私聊 {qq} 不在白名单（webhook.allow_from），已忽略")
         return ok
 
-    def forward_to_xiaotiancai(self, text: str) -> bool:
+    def forward_to_xiaotiancai(self, text: str, user_id: str = "", group_id: str = "") -> bool:
         """QQ → 小天才：由 webhook 回调触发。发送前先标记回声。
-        全程持有操作锁，轮询线程在此期间暂停（避免 uiautomator dump 冲突）。"""
+        全程持有操作锁，轮询线程在此期间暂停（避免 uiautomator dump 冲突）。
+        送达确认：成功后向 QQ 发送方回复"✅ 消息已转发成功"（config.target.confirm_delivery 控制）。"""
         if not text:
             return False
         self.echo.mark(text)
@@ -225,9 +227,47 @@ class MessageBridge:
             self._log("error", "反向转发需要 config.yaml → target.xtc_contact")
             return False
         with self._op_lock:
-            if not self.xtc.open_chat(contact):
-                return False
-            return self.xtc.send_message(text)
+            ok = self.xtc.open_chat(contact) and self.xtc.send_message(text)
+        if self._confirm_delivery() and (user_id or group_id):
+            if ok:
+                self._send_confirm(user_id, group_id, "✅ 消息已转发成功")
+            else:
+                self._send_confirm(user_id, group_id, "❌ 消息转发失败，请检查模拟器")
+        return ok
+
+    # ------------------------------------------------------------------ 送达确认
+    def _confirm_delivery(self) -> bool:
+        return bool((self.cfg.get("target") or {}).get("confirm_delivery", True))
+
+    def _send_confirm(self, user_id: str, group_id: str, message: str) -> None:
+        """向 QQ 发送方回复送达确认（走插件 /api/forward，原样发送，不做 [时间][昵称] 包装）。"""
+        try:
+            if group_id:
+                ok = self.forwarder.send("group", str(group_id), message)
+            elif user_id:
+                ok = self.forwarder.send("private", str(user_id), message)
+            else:
+                return
+            self._log("info" if ok else "error",
+                      f"[送达确认] {message} → {group_id or user_id}（{'成功' if ok else '失败'}）")
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"送达确认发送异常: {e}")
+
+    def _confirm_xtc_delivery(self) -> None:
+        """小天才消息转发到 QQ 成功后，在小天才聊天内回复确认。
+        确认消息带 ✅ 前缀且为家长侧消息（右侧气泡），读取路径会按前缀过滤，不会循环转发。"""
+        if not self._confirm_delivery():
+            return
+        try:
+            if not self.xtc.is_in_chat():
+                return  # 不在聊天页就不打扰
+            confirm_text = "✅ 已转发到QQ"
+            self.echo.mark(confirm_text)
+            with self._op_lock:
+                self.xtc.send_message(confirm_text)
+            self._log("info", f"[送达确认] 已在小天才聊天回复 {confirm_text}")
+        except Exception as e:  # noqa: BLE001
+            self._log("debug", f"小天才送达确认跳过: {e}")
 
     # ------------------------------------------------------------------ 登录
     def login_xiaotiancai(self) -> str:

@@ -42,6 +42,7 @@ QQ 侧通过 **AstrBot 插件**（常驻 AstrBot 进程）收发，已实现：
 | 接收白名单 | 私聊 / 群聊严格白名单，只有列表内的会话可触发命令 |
 | 昵称映射 | App 联系人名 → 转发到 QQ 时显示的自定义昵称（不用 App 原始姓名） |
 | 消息过滤 | 只转发手表侧消息（按 App 的发送方标注识别），自己发的/UI 文案/网络提示一律不转发 |
+| 送达确认 | 转发成功自动回复「✅ 消息已转发成功」（QQ→小天才 回复发送者；小天才→QQ 在聊天内回复）；确认消息带 ✅/❌ 前缀，不会被再次转发 |
 
 ## 目录结构
 
@@ -97,6 +98,11 @@ python main.py                          # ④ 启动桥接
 | `/小天才登录` | 用 `config.yaml → xiaotiancai.login` 的手机号+密码登录 |
 
 发送者需命中 `webhook.allow_from`（私聊）/ `webhook.allow_groups`（群聊）白名单。
+
+**送达确认**（`target.confirm_delivery`，默认开）：
+- `/小天才` 转发成功 → 回复「✅ 消息已转发成功」；失败 → 「❌ 消息转发失败」。
+- 小天才消息转发到 QQ 成功 → 在小天才聊天内回复「✅ 已转发到QQ」。
+- 确认消息带 `✅/❌` 前缀（`xiaotiancai.ui.system_msg_prefixes`），**不会被当作接收消息再次转发**。
 
 ## 登录与安全验证闭环
 
@@ -189,10 +195,12 @@ python main.py                          # ④ 启动桥接
 | `target.xtc_contact` | 小天才联系人名（打开聊天用） |
 | `target.nicknames` | App 名 → 显示昵称映射（行首 `#` 是注释） |
 | `target.notify_qq` | 登录/异常通知目标（留空用 qq_private 第一个） |
+| `target.confirm_delivery` | 送达确认开关（默认 true：转发成功回复 ✅，失败回复 ❌） |
 | `target.qq_private` / `qq_group` | 转发目标，支持单个或列表，可并存 |
 | `xiaotiancai.login.phone/password` | 账密登录凭据 |
 | `xiaotiancai.login_check_interval` | 自动登录检测间隔（秒，默认 600） |
 | `xiaotiancai.ui.risk_markers` | 安全验证检测标记 |
+| `xiaotiancai.ui.system_msg_prefixes` | 桥接系统提示前缀（✅/❌），读取时跳过不转发 |
 | `webhook.allow_from` / `allow_groups` | 接收白名单（私聊/群聊） |
 
 ## 已知限制

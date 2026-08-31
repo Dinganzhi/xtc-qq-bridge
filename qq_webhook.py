@@ -64,8 +64,11 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
             message = extract_message(data, bridge, logger)
             if message:
                 # 立即返回，ADB 发送放后台线程（ADB 操作可能耗时数秒）
+                user = str(data.get("user_id") or "")
+                group = str(data.get("group_id") or "")
                 threading.Thread(
-                    target=bridge.forward_to_xiaotiancai, args=(message,),
+                    target=bridge.forward_to_xiaotiancai,
+                    args=(message, user, group),
                     daemon=True, name="qq-to-xtc",
                 ).start()
                 self._send(200, b"OK")
