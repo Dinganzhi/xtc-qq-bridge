@@ -1,0 +1,10 @@
+{
+  "http_host": "127.0.0.1",
+  "http_port": 11452,
+  "token": "change-me-bridge-token",
+  "python_callback_url": "http://127.0.0.1:5000/qq_callback",
+  "python_callback_token": "change-me-webhook-token",
+  "allow_senders": [],
+  "allow_groups": [],
+  "platform_id": ""
+}

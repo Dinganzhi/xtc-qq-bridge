@@ -1,0 +1,482 @@
+# -*- coding: utf-8 -*-
+"""小天才 App 操作层：启动 / 登录检测 / 打开聊天 / 发送消息 / 读取最新消息。
+
+UI 适配策略（基于真机实测，com.xtc.watch v 登录后界面）：
+- 聊天窗口 ChatActivity 有两种输入模式：
+    * 语音模式：底部是"按住说话"按钮（chat_record_button），没有 EditText；
+    * 文字模式：点击底部左侧图标 iv_left_img_view（单次点击）切出
+      EditText（et_chat_text_content）+ 发送按钮（tv_send_view，输入内容后才出现）。
+- 聊天窗口判定：看聊天输入栏特征 id（et_chat_text_content / chat_record_button /
+  chat_input），不再用 Activity 名猜（会误判弹窗/接收画面）。
+- 弹窗处理：系统录音权限弹窗（允许前台使用）、小天才"警告"弹窗（点取消）。
+- 读取消息：聊天窗口内取输入栏上方最靠下的一条文本气泡（剔除 UI 文案）；
+  聊天列表取联系人行内的消息预览。
+"""
+from __future__ import annotations
+
+import re
+import time
+import xml.etree.ElementTree as ET
+
+from adb_controller import ADBController, AdbError
+
+# 聊天窗口输入栏的特征 resource-id 末段（出现其一即认为在聊天页）
+_CHAT_IDS = ("et_chat_text_content", "chat_record_button", "chat_input")
+# 语音模式 → 文字模式的切换按钮
+_SWITCH_TO_TEXT_IDS = ("iv_left_img_view", "chat_record_button")
+# 系统录音权限弹窗按钮
+_PERMISSION_ALLOW_ID = (
+    "com.android.permissioncontroller:id/permission_allow_foreground_only_button"
+)
+# 小天才内部警告弹窗"取消"
+_CANCEL_DIALOG_ID = "com.xtc.watch:id/btn_cancel"
+# 网络提示条（会混进聊天文本，读取时排除）
+_TIP_IDS = ("tv_weichat_uninstall_hint", "iv_tips_content")
+# 发送失败弹窗标题
+_SEND_FAIL_TITLE = "消息发送"
+
+_DEFAULT_JUNK = ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话"]
+
+
+class Xiaotiancai:
+    def __init__(self, adb: ADBController, cfg: dict | None = None, logger=None):
+        self.adb = adb
+        cfg = cfg or {}
+        self.package = cfg.get("package", "com.xtc.watch")
+        self.main_activity = cfg.get("main_activity", ".MainActivity")
+        self.ui = cfg.get("ui", {}) or {}
+        self.logger = logger
+        self._warned_not_login = False
+        # 坐标缓存：进入聊天后输入框/发送按钮位置基本固定，避免每次全量 dump
+        self._cache = {"input_xy": None, "send_xy": None, "ts": 0.0}
+
+    def log(self, level: str, msg: str):
+        if self.logger is None:
+            return
+        getattr(self.logger, level, self.logger.info)(msg)
+
+    # ------------------------------------------------------------------ 生命周期
+    def launch(self) -> bool:
+        self.log("info", f"启动小天才 App: {self.package}")
+        try:
+            self.adb.launch_app(self.package, self.main_activity)
+            ok = self.adb.wait_for_activity(self.package, timeout=20)
+            if not ok:
+                self.log("warning", "小天才 App 启动后未检测到前台窗口")
+            return ok
+        except AdbError as e:
+            self.log("error", f"启动失败: {e}")
+            return False
+
+    def current_activity(self) -> str:
+        return self.adb.get_current_focus() or ""
+
+    def is_logged_in(self) -> bool:
+        """通过 Activity 名 + 界面文案判断是否已登录家长账号。"""
+        act = self.current_activity()
+        for marker in ("welcome", "login", "register", "signin"):
+            if marker in act.lower():
+                return False
+        try:
+            root = self.adb.dump_ui()
+        except AdbError:
+            return False
+        texts = [n.get("text", "") for n in root.iter("node")]
+        joined = "".join(texts)
+        for marker in self.ui.get("login_markers", ["注册/登录", "立即登录", "登录"]):
+            if marker in joined:
+                return False
+        return True
+
+    def require_login(self) -> bool:
+        ok = self.is_logged_in()
+        if not ok and not self._warned_not_login:
+            self.log("warning", "小天才 App 未登录家长账号：请在模拟器中完成登录（登录前无法读取/发送消息）")
+            self._warned_not_login = True
+        return ok
+
+    # ------------------------------------------------------------------ 弹窗处理
+    def _dismiss_blockers(self) -> bool:
+        """处理会挡住操作的弹窗：系统录音权限、小天才警告。返回是否处理过。"""
+        focus = self.current_activity()
+        try:
+            if "permissioncontroller" in focus.lower():
+                root = self.adb.dump_ui()
+                btn = self.adb.find_element(root, resource_id=_PERMISSION_ALLOW_ID)
+                if btn is not None:
+                    self.adb.tap_element(btn)
+                    self.log("info", "已允许录音权限（前台使用）")
+                    time.sleep(1.5)
+                    return True
+            root = self.adb.dump_ui()
+            btn = self.adb.find_element(root, resource_id=_CANCEL_DIALOG_ID)
+            if btn is not None:
+                self.adb.tap_element(btn)
+                self.log("info", "已关闭小天才警告弹窗")
+                time.sleep(1.0)
+                return True
+        except AdbError:
+            pass
+        return False
+
+    # ------------------------------------------------------------------ 界面判定
+    def is_in_chat(self) -> bool:
+        """聊天窗口判定。
+        快路径：前台 Activity 以 ChatActivity 结尾（该 App 聊天窗固定类名，快且准）；
+        兜底：按输入栏特征 id 确认（防 Activity 名误判弹窗/接收画面）。"""
+        act = self.current_activity().lower()
+        if act.endswith("chatactivity"):
+            return True
+        try:
+            root = self.adb.dump_ui()
+        except AdbError:
+            return False
+        return self._find_chat_bar(root) is not None
+
+    @staticmethod
+    def _id_tail(node) -> str:
+        rid = node.get("resource-id", "")
+        return rid.split("/")[-1]
+
+    def _find_chat_bar(self, root: ET.Element):
+        """聊天输入栏（任意特征 id 的节点）。"""
+        for n in root.iter("node"):
+            if self._id_tail(n) in _CHAT_IDS:
+                return n
+        return None
+
+    # ------------------------------------------------------------------ 打开聊天
+    @staticmethod
+    def _first(*nodes):
+        """返回第一个非 None 节点（Element 真值判断已弃用，禁止用 or 链）。"""
+        for n in nodes:
+            if n is not None:
+                return n
+        return None
+
+    def open_chat(self, contact: str) -> bool:
+        if not contact:
+            self.log("error", "open_chat 缺少联系人昵称（config.yaml → target.xtc_contact）")
+            return False
+        if self.is_in_chat():
+            return True
+        self._dismiss_blockers()
+        try:
+            # 主页即"微聊"列表：先直接在当前页找联系人，找不到再尝试切 Tab
+            root = self.adb.dump_ui()
+            node = self._find_contact_node(root, contact)
+            if node is None:
+                tab_text = self.ui.get("message_tab_text", "微聊")
+                # 精确匹配，避免命中"消息动态"等含"消息"的入口
+                tab = self._first(
+                    self.adb.find_element(root, text=tab_text),
+                    self.adb.find_element(root, content_desc=tab_text))
+                if tab is not None:
+                    self.adb.tap_element(tab)
+                    time.sleep(1.5)
+                    root = self.adb.dump_ui()
+                    node = self._find_contact_node(root, contact)
+            if node is None:
+                self.log("error", f"在消息列表找不到联系人: {contact}")
+                return False
+            self.adb.tap_element(node)
+
+            # 等待进入聊天；若误入"手表消息"等页面，按返回后重试一次
+            deadline = time.time() + 12
+            retried = False
+            while time.time() < deadline:
+                if self.is_in_chat():
+                    return True
+                act = self.current_activity()
+                if not act.startswith(self.package) or "WatchMsg" in act:
+                    self.adb.keyevent(4)  # 返回
+                    time.sleep(1.0)
+                    root = self.adb.dump_ui()
+                    node = self._find_contact_node(root, contact)
+                    if node is not None:
+                        self.adb.tap_element(node)
+                    retried = True
+                time.sleep(1)
+            self.log("warning", f"点击联系人 {contact} 后未检测到聊天窗口（可能 App 界面有弹窗）")
+            return False
+        except AdbError as e:
+            self.log("error", f"打开聊天失败: {e}")
+            return False
+
+    def _find_contact_node(self, root: ET.Element, contact: str):
+        """在消息列表里找联系人节点：优先精确/包含文本匹配，再按 content-desc。"""
+        return self._first(
+            self.adb.find_element(root, text=contact, text_contains=True),
+            self.adb.find_element(root, content_desc=contact))
+
+    # ------------------------------------------------------------------ 发送消息
+    def send_message(self, text: str) -> bool:
+        try:
+            # 快路径：缓存命中且在聊天页 → 用缓存的输入框/发送按钮坐标，不 dump
+            if self._fast_path_available():
+                ix, iy = self._cache["input_xy"]
+                sx, sy = self._cache["send_xy"]
+                self.adb.tap(ix, iy)
+                time.sleep(1.5)
+                if self.adb.input_text(text):
+                    time.sleep(0.8)
+                    self.adb.tap(sx, sy)
+                    time.sleep(1.0)
+                    if self._send_confirmed(text):
+                        return True
+                self.log("warning", "快路径发送未确认，回退完整流程")
+
+            self._dismiss_blockers()
+            root = self.adb.dump_ui()
+            input_node = self._find_input(root)
+            if input_node is None:
+                # 语音模式没有输入框：单击左侧图标切到文字模式
+                if self._switch_to_text_mode(root):
+                    self.log("info", "已在语音模式，切换到文字输入")
+                    time.sleep(1.5)
+                    root = self.adb.dump_ui()
+                    input_node = self._find_input(root)
+            if input_node is None:
+                self.log("error", "未找到输入框（请确认当前在聊天页）")
+                return False
+            self.adb.tap_element(input_node)
+            time.sleep(1.5)  # 等待软键盘弹出完成，避免输入被吞
+            if not self.adb.input_text(text):
+                return False
+            time.sleep(0.5)
+            root = self.adb.dump_ui()
+            send_node = self._find_send(root)
+            if send_node is None:
+                self.log("warning", "未找到发送按钮，改用回车发送")
+                self.adb.keyevent(66)  # KEYCODE_ENTER
+            else:
+                self.adb.tap_element(send_node)
+            time.sleep(1.0)
+            if not self._send_confirmed(text):
+                self.log("warning", "消息可能未发出（输入框仍保留内容），请检查小天才 App 与手表网络")
+                return False
+            return True
+        except AdbError as e:
+            self.log("error", f"发送消息失败: {e}")
+            return False
+
+    def _send_confirmed(self, text: str) -> bool:
+        """发送后确认：输入框里已不含刚输入的文本 → 视为发出。
+        不做网络提示条判定（历史失败留下的提示条会误报）。"""
+        try:
+            root = self.adb.dump_ui()
+        except AdbError:
+            return True  # dump 失败无法确认，不判失败（避免误报）
+        edit = self._find_input(root)
+        if edit is not None:
+            content = edit.get("text", "")
+            if text and content and text in content:
+                return False  # 文本还留在输入框 = 没发出去
+        return True
+
+    def _switch_to_text_mode(self, root: ET.Element) -> bool:
+        """语音模式 → 文字模式：单击 iv_left_img_view（实测单击即可切换）。"""
+        for n in root.iter("node"):
+            if self._id_tail(n) in _SWITCH_TO_TEXT_IDS:
+                self.adb.tap_element(n)
+                return True
+        return False
+
+    def _fast_path_available(self) -> bool:
+        """快路径可用：缓存未过期 + 确认仍在聊天页（快速 Activity 判断）。"""
+        if self._cache["input_xy"] is None or self._cache["send_xy"] is None:
+            return False
+        if time.monotonic() - self._cache["ts"] > 120:
+            return False
+        return self.is_in_chat()
+
+    def _find_input(self, root: ET.Element):
+        rid = self.ui.get("input_resource_id", "")
+        if rid:
+            n = self.adb.find_element(root, resource_id=rid)
+            if n is not None:
+                self._cache_xy("input_xy", n)
+                return n
+        # 特征 id 优先（实测 et_chat_text_content）
+        for n in root.iter("node"):
+            if self._id_tail(n) == "et_chat_text_content":
+                self._cache_xy("input_xy", n)
+                return n
+        nodes = self.adb.find_elements(root, class_name="EditText")
+        if nodes:
+            # 取最靠下的 EditText，通常是聊天输入框
+            n = max(nodes, key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[3])
+            self._cache_xy("input_xy", n)
+            return n
+        return None
+
+    def _find_send(self, root: ET.Element):
+        rid = self.ui.get("send_resource_id", "")
+        if rid:
+            n = self.adb.find_element(root, resource_id=rid)
+            if n is not None:
+                self._cache_xy("send_xy", n)
+                return n
+        # resource-id 含 send（实测 tv_send_view）
+        for n in root.iter("node"):
+            if "send" in self._id_tail(n).lower() and "Text" in n.get("class", ""):
+                self._cache_xy("send_xy", n)
+                return n
+        # 精确文本"发送"（不能用 text_contains：会命中输入框"发送文字"提示）
+        for t in self.ui.get("send_texts", ["发送"]):
+            n = self._first(
+                self.adb.find_element(root, text=t),
+                self.adb.find_element(root, content_desc=t))
+            if n is not None:
+                self._cache_xy("send_xy", n)
+                return n
+        return None
+
+    def _cache_xy(self, key: str, node) -> None:
+        try:
+            x, y = self.adb.node_center(node)
+            self._cache[key] = (x, y)
+            self._cache["ts"] = time.monotonic()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------ 读取消息
+    def get_latest_message(self):
+        """返回 (contact, text)；无法确定时 (None, None)。不抛异常。"""
+        try:
+            if not self.require_login():
+                return (None, None)
+            root = self.adb.dump_ui()
+            if self.is_in_chat():
+                return self._latest_in_chat(root)
+            return self._latest_from_list(root)
+        except Exception as e:  # noqa: BLE001 读取失败不致命
+            self.log("warning", f"读取消息异常: {e}")
+            return (None, None)
+
+    def _latest_in_chat(self, root: ET.Element):
+        """聊天窗口内：取最新一条"别人发来的"消息。
+
+        识别依据（真机实测）：
+        - 消息气泡 id=chat_msg_item_content（文本为 TextView，表情/语音为 ImageView，text 可能为空）；
+        - content-desc 标注发送方与内容类型：'童武洋发的消息,内容'（手表发，text 为空时从 desc 取）
+          vs '你发的消息,内容'（自己发，跳过）；
+        - desc 无标注时退回启发式（右侧气泡=自己发，UI 文案剔除）。
+        注意：最新消息可能被输入栏遮挡（y 超出输入栏顶部），因此不做输入栏边界裁剪。
+        """
+        screen_w = self.adb.get_screen_size()[0]
+        filter_own = bool(self.ui.get("filter_own_bubbles", True))
+        junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
+        candidates = []
+        for n in root.iter("node"):
+            if self._id_tail(n) != "chat_msg_item_content":
+                continue  # 只关心消息气泡
+            t = n.get("text", "").strip()
+            desc = n.get("content-desc", "")
+            b = self._bounds(n)
+            if b is None:
+                continue
+            if "发的消息" in desc:
+                # App 标注了发送方：'XX发的消息,内容'（别人） / '你发的消息,内容'（自己）
+                if desc.startswith("你发的"):
+                    continue
+                if not t and "," in desc:
+                    t = desc.split(",", 1)[1].strip()  # 表情/语音等从 desc 取内容类型
+            else:
+                # 无标注：退回启发式
+                if t in junk:
+                    continue
+                if filter_own and (b[0] + b[2]) / 2 > screen_w * 0.5:
+                    continue  # 右侧气泡 = 自己发的消息
+            if not t:
+                continue
+            candidates.append((n, t, b[3]))
+        if not candidates:
+            return (None, None)
+        n, t, _y = max(candidates, key=lambda c: c[2])
+        return (None, t)
+
+    def _latest_from_list(self, root: ET.Element):
+        """聊天列表（主页微聊列表）：取最顶部（最新）聊天行的消息预览。
+
+        实测列表行结构：tv_chat_dialog_name（联系人名）+ tv_chat_dialog_last_msg_content（预览）。
+        watch_contact 配置后只取该联系人的行。
+        """
+        preview_tail = "tv_chat_dialog_last_msg_content"
+        watch_contact = self.ui.get("watch_contact", "") or ""
+        rows = []
+        for n in root.iter("node"):
+            if self._id_tail(n) == preview_tail:
+                rows.append(n)
+        if not rows:
+            return (None, None)
+        if watch_contact:
+            target = None
+            for row in rows:
+                contact = self._row_contact(row, root)
+                if contact == watch_contact:
+                    target = row
+                    break
+            if target is None:
+                return (None, None)
+        else:
+            target = min(rows, key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
+        text = target.get("text", "").strip()
+        contact = self._row_contact(target, root)
+        return (contact or None, text or None)
+
+    def _row_contact(self, preview_node, root: ET.Element) -> str:
+        """取预览节点同行的联系人名（同父节点的 tv_chat_dialog_name）。"""
+        parent = self._parent(preview_node, root)
+        if parent is None:
+            return ""
+        for n in parent.iter("node"):
+            if self._id_tail(n) == "tv_chat_dialog_name":
+                return n.get("text", "").strip()
+        return ""
+
+    def _row_ancestor(self, node, root: ET.Element):
+        """向上找“一行”祖先：宽度接近屏宽、高度小于 300px。"""
+        width = self.adb.get_screen_size()[0]
+        cur = node
+        for _ in range(6):
+            parent = self._parent(cur, root)
+            if parent is None:
+                break
+            b = self._bounds(parent)
+            if b and b[2] - b[0] > width * 0.6 and 0 < b[3] - b[1] < 300:
+                return parent
+            cur = parent
+        return None
+
+    @staticmethod
+    def _parent(node, root: ET.Element):
+        for p in root.iter("node"):
+            if node in list(p):
+                return p
+        return None
+
+    # ------------------------------------------------------------------ 未读数
+    def get_unread_count(self):
+        """尽力而为：统计小数字角标数量，返回 int 或 None。"""
+        try:
+            root = self.adb.dump_ui()
+        except AdbError:
+            return None
+        badge_ids = set(self.ui.get("badge_resource_ids", []))
+        count = 0
+        for n in root.iter("node"):
+            if badge_ids and n.get("resource-id", "") in badge_ids:
+                count += 1
+                continue
+            t = n.get("text", "").strip()
+            if re.fullmatch(r"\d{1,3}", t):
+                b = self._bounds(n)
+                if b and 0 < b[2] - b[0] <= 80:  # 角标通常是小尺寸文本
+                    count += 1
+        return count or None
+
+    # ------------------------------------------------------------------ 工具
+    @staticmethod
+    def _bounds(node) -> tuple[int, int, int, int] | None:
+        return ADBController.node_bounds(node) if node is not None else None

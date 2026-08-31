@@ -1,0 +1,42 @@
+{
+  "http_host": {
+    "type": "string",
+    "default": "127.0.0.1",
+    "description": "本地 HTTP 端点监听地址"
+  },
+  "http_port": {
+    "type": "int",
+    "default": 11452,
+    "description": "本地 HTTP 端点端口（与 Python 侧 config.yaml 的 forward.plugin.base_url 一致）"
+  },
+  "token": {
+    "type": "string",
+    "default": "change-me-bridge-token",
+    "description": "本地端点鉴权令牌（与 Python 侧 forward.plugin.token 一致）"
+  },
+  "python_callback_url": {
+    "type": "string",
+    "default": "http://127.0.0.1:5000/qq_callback",
+    "description": "Python 桥脚本 webhook 地址（qq_webhook.py 监听端口）"
+  },
+  "python_callback_token": {
+    "type": "string",
+    "default": "change-me-webhook-token",
+    "description": "回调令牌（与 Python 侧 webhook.token 一致）"
+  },
+  "allow_senders": {
+    "type": "list",
+    "default": [],
+    "description": "仅把这些 QQ 号的消息转发到小天才；留空转发所有"
+  },
+  "allow_groups": {
+    "type": "list",
+    "default": [],
+    "description": "仅把这些群号的消息转发到小天才；留空不过滤群"
+  },
+  "platform_id": {
+    "type": "string",
+    "default": "",
+    "description": "主动发送所用平台 ID（留空自动取最近收到消息的平台；可让机器人执行 /sid 查看）"
+  }
+}

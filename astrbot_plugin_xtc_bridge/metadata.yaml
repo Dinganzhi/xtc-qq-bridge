@@ -1,0 +1,4 @@
+name: xtc_qq_bridge
+desc: 小天才手表消息 ↔ QQ 双向桥接（配合 Python ADB 桥脚本：转发到 QQ + 接收 QQ 消息回调）
+author: xtc-bridge
+version: 1.0.0

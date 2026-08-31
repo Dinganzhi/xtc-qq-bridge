@@ -1,0 +1,68 @@
+# =====================================================================
+#  小天才 ↔ QQ 桥接 · 配置模板
+#  复制为 config.yaml 后按需修改。所有路径/账号/昵称均需按本机实际填写
+#  建议阅读 README.md 后再进行编辑
+# =====================================================================
+
+# ---------- ADB / 模拟器 ----------
+adb:
+  path: ""                                       # 留空自动探测（常见 LDPlayer 目录 → PATH）
+  host: "127.0.0.1"
+  port: 5555                                     # LDPlayer 实例0 的 adb 端口
+  serial: ""                                     # 留空自动选择唯一在线设备
+  heartbeat_interval: 10
+
+# ---------- 转发（QQ 侧） ----------
+forward:
+  mode: "plugin"                                 # plugin=转发到 AstrBot 插件；log=仅打印调试
+  plugin:
+    base_url: "http://127.0.0.1:11452"           # 与插件配置 http_port 一致
+    token: "change-me-bridge-token"              # 与插件配置 token 一致（建议改随机串）
+
+# ---------- 桥接目标 ----------
+target:
+  xtc_contact: ""                                # 小天才 App 里的联系人昵称（如“小宝”）
+  nicknames:                                     # 显示昵称映射：App名 → 转发到QQ时显示的昵称
+                                                 # 行首 # 是注释=不生效；启用时删掉 #
+    # "小宝": "宝贝"
+  default_nickname: ""                           # 未命中映射时的兜底；留空回退 App 原始名
+  qq_private: ""                                 # 转发目标 QQ 号：单个 "10001" 或多个 ["10001","10002"]
+  qq_group: ""                                   # 转发目标群号：单个或多个（可与 qq_private 并存）
+
+# 消息格式（双向）：
+#   小天才 → QQ:  [HH:MM] [本地配置昵称] 消息内容（转发到上面全部目标）
+#   QQ → 小天才:  [HH:MM] [QQ发送人昵称] 消息内容（由插件用 /小天才 <文本> 命令触发，
+#                 且发送者需命中 webhook 白名单）
+
+# ---------- 小天才 App ----------
+xiaotiancai:
+  package: "com.xtc.watch"
+  main_activity: ".MainActivity"
+  check_interval: 2
+  auto_install_adbkeyboard: true                 # 优先用捆绑的 APK，其次在线下载
+  ui:
+    # 登录家长账号后运行 `python tools/dump_ui.py` 查看真实界面，按需修改：
+    message_tab_text: "微聊"                     # 聊天列表 Tab 文案（精确匹配）
+    login_markers: ["注册/登录"]                 # 出现这些文案视为未登录
+    watch_contact: ""                            # 与 target.xtc_contact 相同（列表读取用）
+    input_resource_id: "com.xtc.watch:id/et_chat_text_content"
+    send_resource_id: "com.xtc.watch:id/tv_send_view"
+    send_texts: ["发送"]
+    chat_junk_texts: ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话"]
+    badge_resource_ids: []
+
+# ---------- 日志 ----------
+logging:
+  level: "INFO"
+  file: "logs/bridge.log"
+
+# ---------- 反向回调（QQ → 小天才） ----------
+# 白名单（严格模式）：私聊看 allow_from、群聊看 allow_groups；对应列表为空则该类消息全部拒绝。
+webhook:
+  enabled: true
+  host: "127.0.0.1"
+  port: 5000
+  path: "/qq_callback"
+  token: "change-me-webhook-token"               # 与插件配置 python_callback_token 一致
+  allow_from: []                                 # 私聊白名单：允许触发 /小天才 的 QQ 号
+  allow_groups: []                               # 群聊白名单：允许触发 /小天才 的群号
