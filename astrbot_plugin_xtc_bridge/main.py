@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import urllib.parse
 import urllib.request
@@ -29,15 +30,27 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.command import GreedyStr
 
+# AstrBot < 4.27 的 Star.__init__ 不注入 self.logger，这里做兜底
+_FALLBACK_LOGGER = logging.getLogger("xtc_qq_bridge")
+
 
 class Main(star.Star):
     def __init__(self, context: star.Context, config=None) -> None:
         super().__init__(context)
         self.config = config or {}
+        if not getattr(self, "logger", None):
+            try:
+                self.logger = _FALLBACK_LOGGER
+            except AttributeError:  # 只读属性时保持原样
+                pass
         self._httpd: ThreadingHTTPServer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: list[tuple[str, str, str]] = []  # (target_type, target_id, text)
         self._platform_ids: set[str] = set()  # 最近收到过消息的平台 ID
+
+    def _lg(self):
+        """跨版本安全的日志器访问。"""
+        return getattr(self, "logger", None) or _FALLBACK_LOGGER
 
     # ------------------------------------------------------------------ 生命周期
     async def initialize(self) -> None:
@@ -45,7 +58,7 @@ class Main(star.Star):
         self._loop = asyncio.get_running_loop()
         self._start_http()
         self._flush_pending()
-        self.logger.info(
+        self._lg().info(
             "[xtc_qq_bridge] 插件已启动。本地端点: http://%s:%s/api/forward",
             self.config.get("http_host", "127.0.0.1"),
             self.config.get("http_port", 11452),
@@ -56,7 +69,7 @@ class Main(star.Star):
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
-        self.logger.info("[xtc_qq_bridge] 插件已停止")
+        self._lg().info("[xtc_qq_bridge] 插件已停止")
 
     # ------------------------------------------------------------------ QQ → 小天才（命令）
     @filter.command("小天才")
@@ -75,7 +88,7 @@ class Main(star.Star):
             message = f"[{now}] [{sender_name}] {text}"
             await self._forward_to_python(self._base_payload(event, message=message))
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"[xtc_qq_bridge] 命令处理异常: {e}")
+            self._lg().exception(f"[xtc_qq_bridge] 命令处理异常: {e}")
 
     @filter.command("小天才登录")
     async def on_xtc_login(self, event: AstrMessageEvent) -> None:
@@ -87,7 +100,7 @@ class Main(star.Star):
             await self._forward_to_python(self._base_payload(event, action="login"))
             event.set_result(event.plain_result("正在登录小天才（手机号+密码）..."))
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"[xtc_qq_bridge] 登录命令处理异常: {e}")
+            self._lg().exception(f"[xtc_qq_bridge] 登录命令处理异常: {e}")
 
     def _base_payload(self, event: AstrMessageEvent, message: str = "", action: str = "") -> dict:
         payload = {
@@ -121,7 +134,7 @@ class Main(star.Star):
         try:
             await asyncio.to_thread(self._http_post, url, payload, token)
         except Exception as e:  # noqa: BLE001
-            self.logger.warning(f"[xtc_qq_bridge] 转发到 Python 桥失败: {e}")
+            self._lg().warning(f"[xtc_qq_bridge] 转发到 Python 桥失败: {e}")
 
     @staticmethod
     def _http_post(url: str, payload: dict, token: str) -> None:
@@ -162,7 +175,7 @@ class Main(star.Star):
         if not platform and self._platform_ids:
             platform = next(iter(self._platform_ids))
         if not platform:
-            self.logger.error(
+            self._lg().error(
                 "[xtc_qq_bridge] 无法确定平台 ID：请先让 QQ 给机器人发一条消息，"
                 "或在插件配置里填写 platform_id（可让机器人执行 /sid 查看）"
             )
@@ -173,10 +186,10 @@ class Main(star.Star):
         try:
             ok = await self.context.send_message(session, chain)
             if not ok:
-                self.logger.error(f"[xtc_qq_bridge] 发送失败：未找到平台 {platform}")
+                self._lg().error(f"[xtc_qq_bridge] 发送失败：未找到平台 {platform}")
             return ok
         except Exception as e:  # noqa: BLE001
-            self.logger.exception(f"[xtc_qq_bridge] 发送异常: {e}")
+            self._lg().exception(f"[xtc_qq_bridge] 发送异常: {e}")
             return False
 
 

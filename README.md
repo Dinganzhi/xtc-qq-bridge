@@ -7,17 +7,28 @@
 > 分发，修改，再发布等操作，请遵守Apache-2.0许可证  
 > 对于雷电模拟器9的可用性未知，建议安装雷电模拟器14  
 
-通过 **雷电模拟器 + Python ADB** 控制小天才 App，与 QQ 双向桥接消息。
+通过 **模拟器（雷电推荐 14 / MuMu 等）+ Python ADB** 控制小天才 App，与 QQ 双向桥接消息。
 QQ 侧通过 **AstrBot 插件**（常驻 AstrBot 进程）收发，已实现：
 双向消息桥接、账密自动登录、登录态检测、安全验证提醒与自动恢复。
 
 > 🚀 **安装：双击项目根目录的 `install.bat` 即可一键初始化**（详见下方「快速安装」）。
 
 ```
-小天才 App(雷电模拟器) ──ADB──▶ Python 桥脚本 ──HTTP──▶ AstrBot 插件 ──▶ QQ
+小天才 App(模拟器) ──ADB──▶ Python 桥脚本 ──HTTP──▶ AstrBot 插件 ──▶ QQ
        ▲                                                        │
        └──────────────── 插件转发 QQ 命令（/小天才 等）──────────┘
 ```
+
+## ⚠️ 模拟器注意事项（重要，先读）
+
+| 事项 | 说明 |
+|---|---|
+| **支持的模拟器** | 雷电（推荐 **14**；9 可用性未知）、**MuMu**（15/12/6，adb 自动识别）。**其他模拟器/真机也通用**——只需在 `config.yaml → adb.path` 指定 adb（或加入 PATH）、`adb.port` 填对，**无需改源码** |
+| **必须开启「ADB 调试」** | 雷电：设置 → 其他设置；MuMu：设置 → 其他/高级 → ADB 调试。不开的话 `adb devices` 为空，桥接无法连接 |
+| **adb 端口** | 默认 **5555**（雷电、MuMu 都是；MuMu 另有 16384 亦可用）。其他模拟器按实际情况改 `adb.port` |
+| **同时装多个模拟器** | 自动探测会优先命中雷电。**请务必在 `adb.path` 显式指定**要用的那个（否则桥接操作的是被自动选中的模拟器） |
+| **模拟器镜像差异** | 已做防御式处理：LDPlayer14(Android 14) 无 `cmd clipboard`（自动走 ADBKeyBoard）、`ime set` 不生效（自动双写 settings）等，一般无需干预 |
+| **小天才 App 需自行安装** | 每个模拟器都要装小天才 App；界面控件 id 与模拟器无关（同一 APK），雷电上实测的适配在 MuMu 等上通用 |
 
 ## 功能总览
 
@@ -71,7 +82,7 @@ python tools\selftest.py               # ① 环境自检（adb 发现/连接/UI
 python main.py --check                 # ② 或使用 --check
 ```
 
-然后在雷电模拟器中登录小天才家长账号（也可用 `/小天才登录` 自动登录），再：
+然后在模拟器中登录小天才家长账号（也可用 `/小天才登录` 自动登录），再：
 
 ```bash
 python tools\dump_ui.py --filter 消息   # ③ 查看界面控件，按需调整 config.yaml → xiaotiancai.ui
@@ -151,8 +162,8 @@ python main.py                          # ④ 启动桥接
 | # | 步骤 | 说明 |
 |---|---|---|
 | 1 | 安装 **Python 3.10+** | 勾选 Add to PATH |
-| 2 | 安装**雷电模拟器** + 小天才 App | adb 端口 5555 |
-| 3 | 安装 **AstrBot** 并启动一次 | 桌面版或 pip 版均可，启动生成 `~\.astrbot` |
+| 2 | 安装**雷电模拟器（推荐 14）或 MuMu（或其他模拟器/真机）** + 小天才 App | 均需开启 ADB 调试；adb 端口默认 **5555**（MuMu 另有 16384 亦可用）；其他模拟器在 `config.yaml → adb.path/port` 指定 |
+| 3 | 安装 **AstrBot** 并启动一次 | 桌面版或 pip 版均可（v4.26+ 已兼容），启动生成 `~\.astrbot` |
 | 4 | 双击 **`install.bat`** | 装 pyyaml、复制插件、从模板生成 config.yaml 和插件配置 |
 | 5 | 编辑 **`config.yaml`** | QQ 号、联系人、昵称、账密、token（与插件配置一致） |
 | 6 | AstrBot WebUI | 启用插件；配置 NapCat 适配器、登录 QQ |
@@ -173,7 +184,7 @@ python main.py                          # ④ 启动桥接
 
 | 配置项 | 说明 |
 |---|---|
-| `adb.path` | adb.exe 路径，留空自动探测（LDPlayer 目录 → PATH） |
+| `adb.path` | adb.exe 路径；留空自动探测（雷电/MuMu 目录 → PATH）。多模拟器并存时必须显式指定 |
 | `forward.mode` | `plugin`=走 AstrBot 插件；`log`=仅打印调试 |
 | `target.xtc_contact` | 小天才联系人名（打开聊天用） |
 | `target.nicknames` | App 名 → 显示昵称映射（行首 `#` 是注释） |
@@ -186,7 +197,7 @@ python main.py                          # ④ 启动桥接
 
 ## 已知限制
 
-- 仅支持 Windows（雷电模拟器限制）；需小天才家长账号。
+- 仅支持 **Windows**（本项目依赖的模拟器均为 Windows 平台）；需小天才家长账号。
 - 手表发**语音消息**无法转文字，转发为"语音"占位通知。
 - Python 3.14 下 pyyaml 若无轮子，配置可写为 JSON 格式（loader 自动降级）。
 - 轮询间隔默认 2s，去重 LRU 200 条/120s，回声过滤 60s（文件持久化，多实例/重启共享），

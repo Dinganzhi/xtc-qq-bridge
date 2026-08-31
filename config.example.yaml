@@ -6,9 +6,9 @@
 
 # ---------- ADB / 模拟器 ----------
 adb:
-  path: ""                                       # 留空自动探测（常见 LDPlayer 目录 → PATH）
+  path: ""                                       # 留空自动探测（LDPlayer / MuMu 目录 → PATH）
   host: "127.0.0.1"
-  port: 5555                                     # LDPlayer 实例0 的 adb 端口
+  port: 5555                                     # 雷电/MuMu 实例0 的 adb 端口（MuMu 另有 16384 亦可用）
   serial: ""                                     # 留空自动选择唯一在线设备
   heartbeat_interval: 10
 

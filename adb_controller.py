@@ -36,6 +36,15 @@ _LDPLAYER_DIRS = [
     "D:\\LDPlayer\\LDPlayer14", "D:\\LDPlayer\\LDPlayer9",
     "C:\\LDPlayer\\LDPlayer14", "C:\\LDPlayer\\LDPlayer9",
 ]
+# MuMu 模拟器 adb 位置（MuMu 15: nx_main\adb.exe；MuMu 12: shell\adb.exe；MuMu 6: vmonitor\bin）
+_MUMU_ADB_CANDIDATES = [
+    "D:\\Program Files\\Netease\\MuMu\\nx_main\\adb.exe",
+    "D:\\Program Files\\Netease\\MuMu\\emulator\\nemu\\vmonitor\\bin\\adb_server.exe",
+    "D:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\adb.exe",
+    "D:\\Program Files\\Netease\\MuMuPlayer-12.0\\vmonitor\\bin\\adb_server.exe",
+    "C:\\Program Files\\Netease\\MuMu\\nx_main\\adb.exe",
+    "C:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\adb.exe",
+]
 
 ADBKEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
 # APK 现在托管在 GitHub Releases（v2.5-dev，文件名 keyboardservice-debug.apk）。
@@ -59,6 +68,9 @@ def find_adb(explicit: str = "") -> str:
         p = Path(d) / "adb.exe"
         if p.exists():
             return str(p)
+    for p in _MUMU_ADB_CANDIDATES:
+        if os.path.exists(p):
+            return p
     w = shutil.which("adb")
     if w:
         return w
@@ -126,7 +138,12 @@ class ADBController:
     def _pick_serial(self) -> str:
         serials = self.devices()
         if not serials:
-            raise AdbError("没有在线设备：请先启动雷电模拟器（并确认 ADB 调试已开启）")
+            raise AdbError("没有在线设备：请先启动模拟器（并确认 ADB 调试已开启）")
+        # 优先 adb server 原生注册的 emulator-XXXX（MuMu/雷电都会出现
+        # emulator-5554 与 127.0.0.1:5555 之类的重复连接，选原生即可）
+        for s in serials:
+            if s.startswith("emulator-"):
+                return s
         if len(serials) > 1:
             raise AdbError(f"检测到多个在线设备 {serials}，请在 config.yaml 的 adb.serial 指定一个")
         return serials[0]
@@ -136,7 +153,11 @@ class ADBController:
             if self.serial:
                 out, _ = self._run(["get-state"], timeout=10)
                 return out.strip().lower() == "device"
-            return bool(self.devices())
+            serials = self.devices()
+            if serials:
+                self.serial = self._pick_serial()  # 自动选定设备，避免后续命令多设备报错
+                return True
+            return False
         except AdbError:
             return False
 
@@ -317,6 +338,11 @@ class ADBController:
         if not text:
             return True
         if self._adbkeyboard_ready():
+            # 必须确保 ADBKeyBoard 是当前（默认）输入法，否则广播无人接收
+            if not self._adbkeyboard_active():
+                self.logger.info("ADBKeyBoard 不是当前输入法，正在切换...")
+                self.set_default_ime(ADBKEYBOARD_IME)
+                time.sleep(1.0)
             self.shell(f"am broadcast -a ADB_INPUT_TEXT --es msg {self._sh_quote(text)}")
             return True
         if self._clipboard_ready():
@@ -342,6 +368,14 @@ class ADBController:
                 self._adbkeyboard_ok = False
         return self._adbkeyboard_ok
 
+    def _adbkeyboard_active(self) -> bool:
+        """ADBKeyBoard 是否为当前默认输入法（仅启用不够——广播需要它是活动 IME）。"""
+        try:
+            out = self.shell("settings get secure default_input_method")
+            return ADBKEYBOARD_IME in out
+        except AdbError:
+            return False
+
     def _clipboard_ready(self) -> bool:
         if self._clipboard_ok is None:
             if self.android_sdk() < 29:
@@ -362,17 +396,22 @@ class ADBController:
         self.shell(f"ime enable {ime_id}")
 
     def set_default_ime(self, ime_id: str) -> None:
-        self.shell(f"ime set {ime_id}")
+        """设为默认输入法：ime set + 直接写 settings（部分镜像 ime set 不生效）。"""
+        try:
+            self.shell(f"ime set {ime_id}")
+        except AdbError:
+            pass
+        self.shell(f"settings put secure default_input_method {ime_id}")
 
     def install_adbkeyboard(self, apk_path: str = "") -> bool:
-        """安装并启用 ADBKeyBoard（若已启用直接返回 True）。失败返回 False，不抛出。
+        """安装并启用 ADBKeyBoard（若已启用则确保其为默认输入法）。失败返回 False，不抛出。
         APK 来源优先级：本地捆绑包 → 在线下载。"""
         if self._adbkeyboard_ready():
+            if not self._adbkeyboard_active():
+                self.set_default_ime(ADBKEYBOARD_IME)
             return True
         if not apk_path:
             apk_path = self._find_bundled_apk()
-        if not apk_path:
-            apk_path = self._download_adbkeyboard()
         if not apk_path:
             apk_path = self._download_adbkeyboard()
         if not apk_path:

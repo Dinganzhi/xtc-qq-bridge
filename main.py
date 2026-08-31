@@ -71,8 +71,8 @@ def main() -> None:
     xtc.launch()
 
     if not xtc.is_logged_in():
-        log.warning("小天才 App 未登录家长账号——请先在模拟器中完成登录"
-                    "（登录前读取/发送均不可用）")
+        log.warning("小天才 App 未登录——将自动尝试账密登录"
+                    "（已配置 xiaotiancai.login 时；否则请手动登录）")
 
     xc_cfg = cfg.get("xiaotiancai") or {}
     if xc_cfg.get("auto_install_adbkeyboard", True) and not args.no_adbkeyboard:

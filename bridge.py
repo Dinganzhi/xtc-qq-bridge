@@ -260,9 +260,11 @@ class MessageBridge:
         return status
 
     def _login_check_loop(self) -> None:
-        """每 login_check_interval 秒检测登录态，未登录则自动登录。"""
+        """检测登录态，未登录则自动登录。
+        首次启动：等 App 稳定后（约 5s）立即检测一次，之后每 login_check_interval 秒一次。"""
         interval = self._login_check_interval
-        last = 0.0
+        time.sleep(5)  # 等 App 启动稳定，避免误判未登录
+        last = float("-inf")  # 首次循环立即触发检测
         while self.running:
             try:
                 now = time.monotonic()
