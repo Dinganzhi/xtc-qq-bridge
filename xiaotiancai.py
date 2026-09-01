@@ -294,6 +294,10 @@ class Xiaotiancai:
         return ""
 
     # ------------------------------------------------------------------ 弹窗处理
+    def dismiss_blockers(self) -> bool:
+        """公开别名：处理会挡住操作的弹窗。"""
+        return self._dismiss_blockers()
+
     def _dismiss_blockers(self) -> bool:
         """处理会挡住操作的弹窗：系统录音权限、小天才警告、首启隐私协议。返回是否处理过。"""
         focus = self.current_activity()
@@ -548,16 +552,40 @@ class Xiaotiancai:
         except Exception:  # noqa: BLE001
             pass
 
+    # ------------------------------------------------------------------ 界面初始化/恢复
+    def ensure_input_clean(self) -> str:
+        """确保文字模式（有输入框），并清空输入框内容。返回状态描述。"""
+        try:
+            root = self.adb.dump_ui()
+            edit = self._find_input(root)
+            if edit is None:
+                if self._switch_to_text_mode(root):
+                    time.sleep(1.5)
+                    root = self.adb.dump_ui()
+                    edit = self._find_input(root)
+            if edit is None:
+                return "未找到输入框（可能不在聊天页或界面异常）"
+            self.adb.tap_element(edit)
+            time.sleep(1.2)
+            for _ in range(40):
+                self.adb.keyevent(67)  # 清空可能残留的文字
+            return "文字模式已就绪，输入框已清空"
+        except AdbError as e:
+            return f"输入框处理失败: {e}"
+
     # ------------------------------------------------------------------ 读取消息
     def get_latest_message(self):
-        """返回 (contact, text, time_label)；无法确定时 (None, None, "")。不抛异常。"""
+        """返回 (contact, text, time_label)；无法确定时 (None, None, "")。不抛异常。
+
+        只在聊天窗口内读取——列表预览无法可靠判断发送方（家长侧手动发送的消息
+        也会出现在预览里），会被误当成对方消息转发。轮询层负责确保聊天窗口已打开。"""
         try:
             if not self.require_login():
                 return (None, None, "")
             root = self.adb.dump_ui()
             if self.is_in_chat():
                 return self._latest_in_chat(root)
-            return self._latest_from_list(root)
+            return (None, None, "")  # 不在聊天页不读列表（防误转发家长侧消息）
         except Exception as e:  # noqa: BLE001 读取失败不致命
             self.log("warning", f"读取消息异常: {e}")
             return (None, None, "")
@@ -578,11 +606,18 @@ class Xiaotiancai:
         junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
         # 收集日期标签（按 y 排序，供气泡取最近上方标签）
         dates = []
+        # 发送失败提示条（网络异常等）：下方带该提示的气泡 = 未送达，跳过
+        fail_hints = []
         for n in root.iter("node"):
-            if self._id_tail(n) == "tv_chat_msg_item_date":
+            tail = self._id_tail(n)
+            if tail == "tv_chat_msg_item_date":
                 b = self._bounds(n)
                 if b and n.get("text", "").strip():
                     dates.append((b[1], b[3], n.get("text", "").strip()))
+            elif tail in ("tv_weichat_uninstall_hint", "iv_tips_content"):
+                b = self._bounds(n)
+                if b:
+                    fail_hints.append((b[1], b[3]))
         candidates = []
         for n in root.iter("node"):
             if self._id_tail(n) != "chat_msg_item_content":
@@ -591,6 +626,9 @@ class Xiaotiancai:
             desc = n.get("content-desc", "")
             b = self._bounds(n)
             if b is None:
+                continue
+            # 下方带"发送失败"提示的气泡 = 未送达（手动发送失败等），跳过
+            if any(fh_top - 60 <= b[3] <= fh_top + 30 for fh_top, _ in fail_hints):
                 continue
             center_x = (b[0] + b[2]) / 2
             if "发的消息" in desc:

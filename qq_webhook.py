@@ -74,7 +74,7 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                 ).start()
                 self._send(200, b"OK")
             elif data.get("action") == "login":
-                # /小天才登录 命令：执行账密登录（后台线程），结果回传插件引用+@ 回复
+                # /小天才 登录 命令：执行账密登录（后台线程），结果回传插件引用+@ 回复
                 user = str(data.get("user_id") or "")
                 group = str(data.get("group_id") or "")
                 if bridge.qq_sender_allowed(user, group):
@@ -82,6 +82,29 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                     threading.Thread(
                         target=bridge.login_xiaotiancai, args=(request_id,),
                         daemon=True, name="xtc-login",
+                    ).start()
+                    self._send(200, b"OK")
+                else:
+                    self._send(200, b"IGNORED")
+            elif data.get("action") == "auto_login":
+                # /小天才 自动登录：切换自动登录检测开关
+                user = str(data.get("user_id") or "")
+                group = str(data.get("group_id") or "")
+                if bridge.qq_sender_allowed(user, group):
+                    request_id = str(data.get("request_id") or "")
+                    bridge.toggle_auto_login(request_id)
+                    self._send(200, b"OK")
+                else:
+                    self._send(200, b"IGNORED")
+            elif data.get("action") == "init":
+                # /小天才 初始化：检测并恢复界面状态
+                user = str(data.get("user_id") or "")
+                group = str(data.get("group_id") or "")
+                if bridge.qq_sender_allowed(user, group):
+                    request_id = str(data.get("request_id") or "")
+                    threading.Thread(
+                        target=bridge.init_xiaotiancai, args=(request_id,),
+                        daemon=True, name="xtc-init",
                     ).start()
                     self._send(200, b"OK")
                 else:

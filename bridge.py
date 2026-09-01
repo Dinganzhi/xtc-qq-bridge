@@ -8,6 +8,7 @@ webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 from __future__ import annotations
 
 import os
+import queue
 import re
 import threading
 import time
@@ -97,6 +98,14 @@ class MessageBridge:
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
         self._pending_login_notify = False
+        # FIFO 任务队列：QQ→小天才 发送 / 登录 由单工作线程串行执行，
+        # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
+        self._job_queue: queue.Queue = queue.Queue()
+        self._job_thread: threading.Thread | None = None
+        self._last_chat_open = 0.0  # 聊天窗口重开冷却（避免频繁打扰用户导航）
+        # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
+        self._auto_login_enabled = bool(
+            (cfg.get("xiaotiancai") or {}).get("auto_login", True))
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -105,6 +114,8 @@ class MessageBridge:
         self._thread.start()
         self._login_thread = threading.Thread(target=self._login_check_loop, name="xtc-login-check", daemon=True)
         self._login_thread.start()
+        self._job_thread = threading.Thread(target=self._job_worker, name="xtc-jobs", daemon=True)
+        self._job_thread.start()
         self._log("info", f"小天才消息轮询已启动（间隔 {self._poll_interval}s）")
 
     def stop(self) -> None:
@@ -113,6 +124,31 @@ class MessageBridge:
             self._thread.join(timeout=5)
         if self._login_thread:
             self._login_thread.join(timeout=5)
+        if self._job_thread:
+            self._job_thread.join(timeout=5)
+
+    # ------------------------------------------------------------------ 任务队列（FIFO，保证顺序）
+    def _job_worker(self) -> None:
+        while self.running:
+            try:
+                job = self._job_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                kind = job[0]
+                if kind == "send":
+                    _, text, user_id, group_id, request_id = job
+                    self._do_send_job(text, user_id, group_id, request_id)
+                elif kind == "login":
+                    _, request_id = job
+                    self._do_login_job(request_id)
+                elif kind == "init":
+                    _, request_id = job
+                    self._do_init_job(request_id)
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"任务处理异常: {e}")
+            finally:
+                self._job_queue.task_done()
 
     # ------------------------------------------------------------------ 轮询
     def _poll_loop(self) -> None:
@@ -139,6 +175,13 @@ class MessageBridge:
                         if self.xtc.is_logged_in():
                             self._pending_login_notify = False
                             self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
+                    # 确保在聊天页读取（列表预览无法判断发送方，会把家长侧消息误当对方消息）；
+                    # 离开聊天页后最多每 30s 重开一次，避免频繁打断用户
+                    if not self.xtc.is_in_chat():
+                        xtc_contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+                        if xtc_contact and time.monotonic() - self._last_chat_open >= 30:
+                            self._last_chat_open = time.monotonic()
+                            self.xtc.open_chat(xtc_contact)
                     contact, text, time_label = self.xtc.get_latest_message()
                 finally:
                     self._op_lock.release()
@@ -253,17 +296,19 @@ class MessageBridge:
 
     def forward_to_xiaotiancai(self, text: str, user_id: str = "",
                                group_id: str = "", request_id: str = "") -> bool:
-        """QQ → 小天才：由 webhook 回调触发。发送前先标记回声。
-        全程持有操作锁，轮询线程在此期间暂停（避免 uiautomator dump 冲突）。
-        送达确认（confirm_delivery 控制）：结果回传给插件在原会话引用+@ 回复发送人，
-        格式「发送成功/发送失败：[日期时间] [QQ昵称] 内容」；无 request_id 时降级为直接发送。"""
+        """QQ → 小天才：入队（FIFO 保证多消息按顺序处理），由单工作线程串行执行。"""
         if not text:
             return False
+        self._job_queue.put(("send", text, user_id, group_id, request_id))
+        return True
+
+    def _do_send_job(self, text: str, user_id: str, group_id: str, request_id: str) -> None:
+        """实际执行 QQ→小天才 发送 + 送达确认（工作线程内，按入队顺序）。"""
         self.echo.mark(text)
         contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
         if not contact:
             self._log("error", "反向转发需要 config.yaml → target.xtc_contact")
-            return False
+            return
         with self._op_lock:
             ok = self.xtc.open_chat(contact) and self.xtc.send_message(text)
         if ok:
@@ -280,7 +325,6 @@ class MessageBridge:
                     self._log("warning", f"送达确认回传异常: {e}")
             else:
                 self._send_confirm(user_id, group_id, result_msg)
-        return ok
 
     # ------------------------------------------------------------------ 送达确认
     def _confirm_delivery(self) -> bool:
@@ -318,22 +362,26 @@ class MessageBridge:
 
     # ------------------------------------------------------------------ 登录
     def login_xiaotiancai(self, request_id: str = "") -> str:
-        """执行账密登录（config.yaml → xiaotiancai.login）。
+        """执行账密登录（入队，由工作线程串行执行，保证与其他发送任务的顺序）。
         有 request_id 时把结果回传给插件（原会话引用+@ 回复发送人）；否则走 _notify。"""
+        self._job_queue.put(("login", request_id))
+        return "queued"
+
+    def _do_login_job(self, request_id: str) -> None:
         acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
         phone = str(acc.get("phone", "")).strip()
         password = str(acc.get("password", "")).strip()
         if not phone or not password:
             msg = "未配置手机号/密码（config.yaml → xiaotiancai.login.phone/password）"
             self._login_reply(request_id, "小天才登录：" + msg)
-            return "error"
+            return
         try:
             with self._op_lock:
                 status = self.xtc.login(phone, password)
         except Exception as e:  # noqa: BLE001
             self._log("error", f"自动登录异常: {e}")
             self._login_reply(request_id, "小天才自动登录出错，请手动检查模拟器")
-            return "error"
+            return
         if status == "risk":
             self._pending_login_notify = True  # 等待用户手动完成安全验证
             self._login_reply(request_id, "需要安全验证：请手动打开模拟器完成验证")
@@ -348,7 +396,6 @@ class MessageBridge:
             self._login_reply(request_id, "小天才登录成功")
         elif status == "already":
             self._login_reply(request_id, "小天才已登录，无需重复登录")
-        return status
 
     def _login_reply(self, request_id: str, message: str) -> None:
         """登录结果回复：有 request_id 回传插件（引用+@）；否则 _notify 兜底。"""
@@ -362,8 +409,75 @@ class MessageBridge:
         else:
             self._notify("小天才登录：" + message)
 
+    # ------------------------------------------------------------------ 自动登录开关 / 初始化
+    def toggle_auto_login(self, request_id: str = "") -> str:
+        """/小天才 自动登录：切换自动登录检测开关，结果回传插件。"""
+        self._auto_login_enabled = not self._auto_login_enabled
+        state = "已开启（每 10 分钟检测，未登录自动登录）" if self._auto_login_enabled else "已关闭"
+        msg = f"自动登录检测{state}"
+        if request_id:
+            try:
+                self.forwarder.reply_result(request_id, msg)
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"自动登录开关回传异常: {e}")
+        else:
+            self._notify("小天才" + msg)
+        self._log("info", f"[自动登录] {msg}")
+        return msg
+
+    def init_xiaotiancai(self, request_id: str = "") -> str:
+        """/小天才 初始化：入队执行界面状态检测与恢复。"""
+        self._job_queue.put(("init", request_id))
+        return "queued"
+
+    def _do_init_job(self, request_id: str) -> None:
+        """检测并恢复界面状态：启动 → 弹窗 → 登录态 → 聊天页 → 文字模式 → 清空输入框。"""
+        msgs: list[str] = []
+        try:
+            with self._op_lock:
+                launched = self.xtc.launch()
+                msgs.append("启动" + ("OK" if launched else "失败"))
+                self.xtc.dismiss_blockers()
+                if self.xtc.is_logged_in():
+                    msgs.append("已登录")
+                else:
+                    acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
+                    phone = str(acc.get("phone", "")).strip()
+                    password = str(acc.get("password", "")).strip()
+                    if phone and password:
+                        status = self.xtc.login(phone, password)
+                        msgs.append("登录：" + self._login_status_text(status))
+                    else:
+                        msgs.append("未登录（未配置账密，请手动登录）")
+                contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+                if contact and self.xtc.open_chat(contact):
+                    msgs.append("已进入聊天")
+                msgs.append(self.xtc.ensure_input_clean())
+            reply = "初始化完成：" + "，".join(msgs)
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"初始化异常: {e}")
+            reply = "初始化失败：" + str(e)
+        self._log("info", f"[初始化] {reply}")
+        if request_id:
+            try:
+                self.forwarder.reply_result(request_id, reply)
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"初始化回传异常: {e}")
+        else:
+            self._notify(reply)
+
+    @staticmethod
+    def _login_status_text(status: str) -> str:
+        return {
+            "already": "已登录",
+            "ok": "成功",
+            "risk": "需安全验证（请手动完成）",
+            "fail": "失败（账号或密码错误等）",
+            "error": "出错（控件未找到）",
+        }.get(status, status)
+
     def _login_check_loop(self) -> None:
-        """检测登录态，未登录则自动登录。
+        """检测登录态，未登录则自动登录（可被 /小天才 自动登录 关闭）。
         首次启动：等 App 稳定后（约 5s）立即检测一次，之后每 login_check_interval 秒一次。"""
         interval = self._login_check_interval
         time.sleep(5)  # 等 App 启动稳定，避免误判未登录
@@ -373,6 +487,10 @@ class MessageBridge:
                 now = time.monotonic()
                 if now - last >= interval:
                     last = now
+                    if not self._auto_login_enabled:
+                        self._log("debug", "自动登录检测已关闭，跳过")
+                        time.sleep(10)
+                        continue
                     if not self._op_lock.acquire(blocking=False):
                         continue
                     try:

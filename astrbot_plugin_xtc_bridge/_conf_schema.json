@@ -38,5 +38,10 @@
     "type": "string",
     "default": "",
     "description": "主动发送所用平台 ID（留空自动取最近收到消息的平台；可让机器人执行 /sid 查看）"
+  },
+  "command_mode": {
+    "type": "bool",
+    "default": true,
+    "description": "命令模式：true=仅 /小天才 命令触发转发；false=群/私聊所有新消息都转发到小天才"
   }
 }
