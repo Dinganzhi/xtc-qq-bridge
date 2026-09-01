@@ -133,3 +133,72 @@ class EchoFilter:
                     os.remove(self._store_path)
                 except OSError:
                     pass
+
+
+class HistoryFilter:
+    """长期已处理消息表（跨重启、多实例共享）。
+
+    把"已经转发/已发送过"的消息按内容哈希记录到本地文件，TTL 默认 7 天。
+    用于：重启后不会再转发历史消息、同一消息不会隔段时间被重复转发（死循环）。
+    seen() 只查不记，mark() 记录。
+    """
+
+    def __init__(self, store_path: str | None = None, ttl: float = 7 * 24 * 3600,
+                 capacity: int = 2000):
+        self.ttl = ttl
+        self.capacity = capacity
+        self._data: OrderedDict[str, float] = OrderedDict()
+        self._lock = threading.Lock()
+        self._store_path = store_path
+        if store_path:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            if not os.path.exists(self._store_path):
+                return
+            with open(self._store_path, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            now = time.monotonic()
+            for key, ts in items:
+                if now - ts <= self.ttl:
+                    self._data[key] = ts
+        except Exception:  # noqa: BLE001
+            self._data.clear()
+
+    def _save(self) -> None:
+        if not self._store_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._store_path) or ".", exist_ok=True)
+            tmp = self._store_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump([[k, ts] for k, ts in self._data.items()], f, ensure_ascii=False)
+            os.replace(tmp, self._store_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _purge(self, now: float) -> None:
+        expired = [k for k, ts in self._data.items() if now - ts > self.ttl]
+        for k in expired:
+            del self._data[k]
+        while len(self._data) > self.capacity:
+            self._data.popitem(last=False)
+
+    def seen(self, *parts) -> bool:
+        now = time.monotonic()
+        key = _hash(*[normalize(p) for p in parts])
+        with self._lock:
+            self._purge(now)
+            return key in self._data
+
+    def mark(self, *parts) -> None:
+        if not any(parts):
+            return
+        now = time.monotonic()
+        key = _hash(*[normalize(p) for p in parts])
+        with self._lock:
+            self._data[key] = now
+            self._data.move_to_end(key)
+            self._purge(now)
+            self._save()

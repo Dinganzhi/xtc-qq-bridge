@@ -84,7 +84,7 @@ class Main(star.Star):
                 event.set_result(event.plain_result("用法：/小天才 <文本>（把消息发到小天才手表）"))
                 return
             sender_name = event.get_sender_name() or str(event.get_sender_id())
-            now = datetime.now().strftime("%H:%M")
+            now = datetime.now().strftime("%m-%d %H:%M")
             message = f"[{now}] [{sender_name}] {text}"
             await self._forward_to_python(self._base_payload(event, message=message))
         except Exception as e:  # noqa: BLE001

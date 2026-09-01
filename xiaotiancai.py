@@ -550,31 +550,39 @@ class Xiaotiancai:
 
     # ------------------------------------------------------------------ 读取消息
     def get_latest_message(self):
-        """返回 (contact, text)；无法确定时 (None, None)。不抛异常。"""
+        """返回 (contact, text, time_label)；无法确定时 (None, None, "")。不抛异常。"""
         try:
             if not self.require_login():
-                return (None, None)
+                return (None, None, "")
             root = self.adb.dump_ui()
             if self.is_in_chat():
                 return self._latest_in_chat(root)
             return self._latest_from_list(root)
         except Exception as e:  # noqa: BLE001 读取失败不致命
             self.log("warning", f"读取消息异常: {e}")
-            return (None, None)
+            return (None, None, "")
 
     def _latest_in_chat(self, root: ET.Element):
-        """聊天窗口内：取最新一条"别人发来的"消息。
+        """聊天窗口内：取最新一条"别人发来的"消息，返回 (contact, text, time_label)。
 
         识别依据（真机实测）：
         - 消息气泡 id=chat_msg_item_content（文本为 TextView，表情/语音为 ImageView，text 可能为空）；
-        - content-desc 标注发送方与内容类型：'童武洋发的消息,内容'（手表发，text 为空时从 desc 取）
-          vs '你发的消息,内容'（自己发，跳过）；
-        - desc 无标注时退回启发式（右侧气泡=自己发，UI 文案剔除）。
+        - content-desc 标注发送方：'童武洋发的消息,内容'（手表发） vs '你发的消息,内容'（自己发，跳过）；
+        - **双重判断**：desc 标注为主，气泡左右位置为辅（自己发=右侧、别人发=左侧），
+          desc 缺失时按位置判断（右侧=自己发跳过）；
+        - 时间标签取气泡上方最近的日期节点（tv_chat_msg_item_date，如 "06:56" / "昨天 23:42"）。
         注意：最新消息可能被输入栏遮挡（y 超出输入栏顶部），因此不做输入栏边界裁剪。
         """
         screen_w = self.adb.get_screen_size()[0]
         filter_own = bool(self.ui.get("filter_own_bubbles", True))
         junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
+        # 收集日期标签（按 y 排序，供气泡取最近上方标签）
+        dates = []
+        for n in root.iter("node"):
+            if self._id_tail(n) == "tv_chat_msg_item_date":
+                b = self._bounds(n)
+                if b and n.get("text", "").strip():
+                    dates.append((b[1], b[3], n.get("text", "").strip()))
         candidates = []
         for n in root.iter("node"):
             if self._id_tail(n) != "chat_msg_item_content":
@@ -584,6 +592,7 @@ class Xiaotiancai:
             b = self._bounds(n)
             if b is None:
                 continue
+            center_x = (b[0] + b[2]) / 2
             if "发的消息" in desc:
                 # App 标注了发送方：'XX发的消息,内容'（别人） / '你发的消息,内容'（自己）
                 if desc.startswith("你发的"):
@@ -591,10 +600,10 @@ class Xiaotiancai:
                 if not t and "," in desc:
                     t = desc.split(",", 1)[1].strip()  # 表情/语音等从 desc 取内容类型
             else:
-                # 无标注：退回启发式
+                # 无标注：按左右位置判断（自己发=右侧跳过）
                 if t in junk:
                     continue
-                if filter_own and (b[0] + b[2]) / 2 > screen_w * 0.5:
+                if filter_own and center_x > screen_w * 0.55:
                     continue  # 右侧气泡 = 自己发的消息
             if not t:
                 continue
@@ -603,15 +612,24 @@ class Xiaotiancai:
                 continue
             candidates.append((n, t, b[3]))
         if not candidates:
-            return (None, None)
-        n, t, _y = max(candidates, key=lambda c: c[2])
-        return (None, t)
+            return (None, None, "")
+        n, t, y_bottom = max(candidates, key=lambda c: c[2])
+        # 取气泡上方最近的日期标签作为时间
+        time_label = ""
+        bubble_top = (self._bounds(n) or (0, 0, 0, 0))[1]
+        # dates 按 y 升序；取"最靠下且仍在气泡上方"的标签 = 最近的上方标签
+        # （注意不能用第一个满足的——那是最上面的标签，会取到更早消息的时间）
+        for d_top, d_bottom, d_text in reversed(dates):
+            if d_bottom <= bubble_top + 5:  # 标签在气泡上方
+                time_label = d_text
+                break
+        return (None, t, time_label)
 
     def _latest_from_list(self, root: ET.Element):
-        """聊天列表（主页微聊列表）：取最顶部（最新）聊天行的消息预览。
+        """聊天列表（主页微聊列表）：取最顶部（最新）聊天行的消息预览，返回 (contact, text, time_label)。
 
         实测列表行结构：tv_chat_dialog_name（联系人名）+ tv_chat_dialog_last_msg_content（预览）。
-        watch_contact 配置后只取该联系人的行。
+        watch_contact 配置后只取该联系人的行。时间取行内时间标签（如 "06:56" / "昨天 23:42"）。
         """
         preview_tail = "tv_chat_dialog_last_msg_content"
         watch_contact = self.ui.get("watch_contact", "") or ""
@@ -620,7 +638,7 @@ class Xiaotiancai:
             if self._id_tail(n) == preview_tail:
                 rows.append(n)
         if not rows:
-            return (None, None)
+            return (None, None, "")
         if watch_contact:
             target = None
             for row in rows:
@@ -629,14 +647,28 @@ class Xiaotiancai:
                     target = row
                     break
             if target is None:
-                return (None, None)
+                return (None, None, "")
         else:
             target = min(rows, key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
         text = target.get("text", "").strip()
         if self._is_system_msg(text):
-            return (None, None)  # 列表预览是桥接系统提示（送达确认等），不转发
+            return (None, None, "")  # 列表预览是桥接系统提示（送达确认等），不转发
         contact = self._row_contact(target, root)
-        return (contact or None, text or None)
+        time_label = self._row_time(target, root)
+        return (contact or None, text or None, time_label)
+
+    def _row_time(self, preview_node, root: ET.Element) -> str:
+        """取预览节点所在行的日期/时间标签（如 "06:56"、"昨天 23:42"、"8月30日"）。"""
+        parent = self._parent(preview_node, root)
+        if parent is None:
+            return ""
+        for n in parent.iter("node"):
+            t = n.get("text", "").strip()
+            if not t or t == preview_node.get("text", ""):
+                continue
+            if ":" in t or "昨天" in t or "前天" in t or "日" in t or "月" in t:
+                return t
+        return ""
 
     def _is_system_msg(self, text: str) -> bool:
         """桥接系统提示消息（送达确认等）按前缀识别，防止被当成接收消息转发。"""

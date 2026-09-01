@@ -8,12 +8,13 @@ webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from utils.deduplicate import Deduplicator, EchoFilter
+from utils.deduplicate import Deduplicator, EchoFilter, HistoryFilter
 
 
 def make_forwarder(cfg: dict, logger=None):
@@ -75,6 +76,9 @@ class MessageBridge:
         # 回声状态写入文件：多实例/重启后共享，防止重复转发
         store_path = str(Path(__file__).resolve().parent / "data" / "echo_cache.json")
         self.echo = EchoFilter(store_path=store_path)
+        # 长期已处理消息表（7 天持久化）：跨重启/多实例去重，杜绝死循环重复转发
+        self.history = HistoryFilter(
+            store_path=str(Path(__file__).resolve().parent / "data" / "history_cache.json"))
         self._poll_interval = float((cfg.get("xiaotiancai") or {}).get("check_interval", 2))
         self._heartbeat_interval = float((cfg.get("adb") or {}).get("heartbeat_interval", 10))
         self._login_check_interval = float(
@@ -127,27 +131,31 @@ class MessageBridge:
                         if self.xtc.is_logged_in():
                             self._pending_login_notify = False
                             self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
-                    contact, text = self.xtc.get_latest_message()
+                    contact, text, time_label = self.xtc.get_latest_message()
                 finally:
                     self._op_lock.release()
                 if text:
                     key = ("xtc", contact or "", text)
-                    if not self.dedup.seen(key) and not self.echo.is_echo(text):
-                        self._forward(contact, text)
+                    if not self.history.seen("xtc", contact or "", text) \
+                            and not self.dedup.seen(key) and not self.echo.is_echo(text):
+                        self._forward(contact, text, time_label)
                         self.dedup.mark(key)
+                        self.history.mark("xtc", contact or "", text)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             time.sleep(self._poll_interval)
 
-    def _forward(self, contact, text: str) -> None:
+    def _forward(self, contact, text: str, time_label: str = "") -> None:
         targets = self._qq_targets()
         if not targets:
             self._log("info", f"[占位] 收到小天才消息（未配置 QQ 目标，仅打印）: {text}")
             return
-        # 转发格式：[时间] [本地配置昵称] 消息内容（昵称不用 App 里的原始姓名）
-        now = datetime.now().strftime("%H:%M")
+        # 转发格式：[日期时间] [本地配置昵称] 消息内容。
+        # 时间优先取小天才 App 内该消息的日期标签（如 "昨天 23:42"、"8月30日"）；
+        # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
+        time_str = self._format_xtc_time(time_label)
         nickname = self._display_name(contact)
-        message = f"[{now}] [{nickname}] {text}"
+        message = f"[{time_str}] [{nickname}] {text}"
         ok_all = True
         for target_type, target_id in targets:
             try:
@@ -164,7 +172,20 @@ class MessageBridge:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
             self.echo.mark(text)
             self.echo.mark(message)
+            self.history.mark("xtc", contact or "", text)
             self._confirm_xtc_delivery()  # 小天才侧送达确认（✅ 已转发到QQ）
+
+    def _format_xtc_time(self, time_label: str) -> str:
+        """把 App 内的时间标签转成 [日期时间] 格式：
+        - '06:56'（当天）→ '08-31 06:56'（补当天日期）
+        - '昨天 23:42' / '8月30日 23:42' → 原样
+        - 空 → 当前时间 'MM-DD HH:MM'"""
+        label = (time_label or "").strip()
+        if not label:
+            return datetime.now().strftime("%m-%d %H:%M")
+        if re.fullmatch(r"\d{1,2}:\d{2}", label):
+            return datetime.now().strftime("%m-%d") + " " + label
+        return label
 
     def _qq_targets(self) -> list[tuple[str, str]]:
         """转发目标列表 [(type, id)]；qq_private/qq_group 支持单个字符串或列表。"""
@@ -228,6 +249,9 @@ class MessageBridge:
             return False
         with self._op_lock:
             ok = self.xtc.open_chat(contact) and self.xtc.send_message(text)
+        if ok:
+            # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
+            self.history.mark("qq2xtc", text)
         if self._confirm_delivery() and (user_id or group_id):
             if ok:
                 self._send_confirm(user_id, group_id, "✅ 消息已转发成功")
