@@ -43,6 +43,11 @@ class LogForwarder:
             print(f"[转发-占位] {target_type}:{target_id} ← {message}")
         return True
 
+    def reply_result(self, request_id: str, message: str) -> bool:
+        if self.logger:
+            self.logger.info(f"[占位-回传] {request_id}: {message}")
+        return True
+
 
 class PluginForwarder:
     def __init__(self, client, logger=None):
@@ -61,6 +66,9 @@ class PluginForwarder:
                 )
                 self._last_err_log = now
         return ok
+
+    def reply_result(self, request_id: str, message: str) -> bool:
+        return self.client.reply_result(request_id, message)
 
 
 class MessageBridge:
@@ -138,18 +146,25 @@ class MessageBridge:
                     key = ("xtc", contact or "", text)
                     if not self.history.seen("xtc", contact or "", text) \
                             and not self.dedup.seen(key) and not self.echo.is_echo(text):
-                        self._forward(contact, text, time_label)
-                        self.dedup.mark(key)
-                        self.history.mark("xtc", contact or "", text)
+                        try:
+                            ok = self._forward(contact, text, time_label)
+                        except Exception as e:  # noqa: BLE001
+                            self._log("warning", f"转发异常: {e}")
+                            ok = False
+                        if ok:
+                            # 只有转发成功才记入长期历史（7 天），避免失败后永不重试
+                            self.history.mark("xtc", contact or "", text)
+                        self.dedup.mark(key)  # 无论成败都短期去重（120s），失败会自动重试
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             time.sleep(self._poll_interval)
 
-    def _forward(self, contact, text: str, time_label: str = "") -> None:
+    def _forward(self, contact, text: str, time_label: str = "") -> bool:
+        """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。"""
         targets = self._qq_targets()
         if not targets:
             self._log("info", f"[占位] 收到小天才消息（未配置 QQ 目标，仅打印）: {text}")
-            return
+            return True
         # 转发格式：[日期时间] [本地配置昵称] 消息内容。
         # 时间优先取小天才 App 内该消息的日期标签（如 "昨天 23:42"、"8月30日"）；
         # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
@@ -172,8 +187,8 @@ class MessageBridge:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
             self.echo.mark(text)
             self.echo.mark(message)
-            self.history.mark("xtc", contact or "", text)
-            self._confirm_xtc_delivery()  # 小天才侧送达确认（✅ 已转发到QQ）
+            self._confirm_xtc_delivery(message)  # 小天才侧送达确认（发送成功：<内容>）
+        return ok_all
 
     def _format_xtc_time(self, time_label: str) -> str:
         """把 App 内的时间标签转成 [日期时间] 格式：
@@ -236,10 +251,12 @@ class MessageBridge:
             self._log("info", f"私聊 {qq} 不在白名单（webhook.allow_from），已忽略")
         return ok
 
-    def forward_to_xiaotiancai(self, text: str, user_id: str = "", group_id: str = "") -> bool:
+    def forward_to_xiaotiancai(self, text: str, user_id: str = "",
+                               group_id: str = "", request_id: str = "") -> bool:
         """QQ → 小天才：由 webhook 回调触发。发送前先标记回声。
         全程持有操作锁，轮询线程在此期间暂停（避免 uiautomator dump 冲突）。
-        送达确认：成功后向 QQ 发送方回复"✅ 消息已转发成功"（config.target.confirm_delivery 控制）。"""
+        送达确认（confirm_delivery 控制）：结果回传给插件在原会话引用+@ 回复发送人，
+        格式「发送成功/发送失败：[日期时间] [QQ昵称] 内容」；无 request_id 时降级为直接发送。"""
         if not text:
             return False
         self.echo.mark(text)
@@ -253,10 +270,16 @@ class MessageBridge:
             # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
             self.history.mark("qq2xtc", text)
         if self._confirm_delivery() and (user_id or group_id):
-            if ok:
-                self._send_confirm(user_id, group_id, "✅ 消息已转发成功")
+            result_msg = ("发送成功：" if ok else "发送失败：") + text
+            if request_id:
+                try:
+                    ok_r = self.forwarder.reply_result(request_id, result_msg)
+                    self._log("info" if ok_r else "error",
+                              f"[送达确认] {result_msg}（引用+@ 回传{'成功' if ok_r else '失败'}）")
+                except Exception as e:  # noqa: BLE001
+                    self._log("warning", f"送达确认回传异常: {e}")
             else:
-                self._send_confirm(user_id, group_id, "❌ 消息转发失败，请检查模拟器")
+                self._send_confirm(user_id, group_id, result_msg)
         return ok
 
     # ------------------------------------------------------------------ 送达确认
@@ -264,7 +287,7 @@ class MessageBridge:
         return bool((self.cfg.get("target") or {}).get("confirm_delivery", True))
 
     def _send_confirm(self, user_id: str, group_id: str, message: str) -> None:
-        """向 QQ 发送方回复送达确认（走插件 /api/forward，原样发送，不做 [时间][昵称] 包装）。"""
+        """向 QQ 发送方发送送达确认（无 request_id 时的降级路径，走插件 /api/forward）。"""
         try:
             if group_id:
                 ok = self.forwarder.send("group", str(group_id), message)
@@ -277,15 +300,15 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"送达确认发送异常: {e}")
 
-    def _confirm_xtc_delivery(self) -> None:
-        """小天才消息转发到 QQ 成功后，在小天才聊天内回复确认。
-        确认消息带 ✅ 前缀且为家长侧消息（右侧气泡），读取路径会按前缀过滤，不会循环转发。"""
+    def _confirm_xtc_delivery(self, message: str) -> None:
+        """小天才消息转发到 QQ 成功后，在小天才聊天内回复「发送成功：<转发内容>」。
+        确认消息以"发送成功"开头且为家长侧消息（右侧气泡），读取路径按前缀过滤，不会循环转发。"""
         if not self._confirm_delivery():
             return
         try:
             if not self.xtc.is_in_chat():
                 return  # 不在聊天页就不打扰
-            confirm_text = "✅ 已转发到QQ"
+            confirm_text = "发送成功：" + message
             self.echo.mark(confirm_text)
             with self._op_lock:
                 self.xtc.send_message(confirm_text)
@@ -294,34 +317,50 @@ class MessageBridge:
             self._log("debug", f"小天才送达确认跳过: {e}")
 
     # ------------------------------------------------------------------ 登录
-    def login_xiaotiancai(self) -> str:
-        """执行账密登录（config.yaml → xiaotiancai.login），按结果通知 QQ。"""
+    def login_xiaotiancai(self, request_id: str = "") -> str:
+        """执行账密登录（config.yaml → xiaotiancai.login）。
+        有 request_id 时把结果回传给插件（原会话引用+@ 回复发送人）；否则走 _notify。"""
         acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
         phone = str(acc.get("phone", "")).strip()
         password = str(acc.get("password", "")).strip()
         if not phone or not password:
-            self._notify("小天才登录：未配置手机号/密码（config.yaml → xiaotiancai.login.phone/password）")
+            msg = "未配置手机号/密码（config.yaml → xiaotiancai.login.phone/password）"
+            self._login_reply(request_id, "小天才登录：" + msg)
             return "error"
         try:
             with self._op_lock:
                 status = self.xtc.login(phone, password)
         except Exception as e:  # noqa: BLE001
             self._log("error", f"自动登录异常: {e}")
-            self._notify("❌ 小天才自动登录出错，请手动检查模拟器")
+            self._login_reply(request_id, "小天才自动登录出错，请手动检查模拟器")
             return "error"
         if status == "risk":
             self._pending_login_notify = True  # 等待用户手动完成安全验证
+            self._login_reply(request_id, "需要安全验证：请手动打开模拟器完成验证")
             self._notify("⚠️ 小天才登录触发安全验证，请手动打开模拟器完成验证")
         elif status == "fail":
             self._pending_login_notify = True  # 避免每 10 分钟反复重试刷屏
-            self._notify("❌ 小天才自动登录失败（账号或密码错误等），请检查配置或手动登录")
+            self._login_reply(request_id, "登录失败（账号或密码错误等），请检查配置或手动登录")
+            self._notify("❌ 小天才自动登录失败（账号或密码错误等）")
         elif status == "error":
-            self._notify("❌ 小天才自动登录出错（控件未找到），请运行 tools/dump_ui.py 查看登录页")
+            self._login_reply(request_id, "登录出错（控件未找到），请运行 tools/dump_ui.py 查看登录页")
         elif status == "ok":
-            self._log("info", "小天才账密登录成功")
+            self._login_reply(request_id, "小天才登录成功")
         elif status == "already":
-            self._log("info", "小天才已登录，跳过")
+            self._login_reply(request_id, "小天才已登录，无需重复登录")
         return status
+
+    def _login_reply(self, request_id: str, message: str) -> None:
+        """登录结果回复：有 request_id 回传插件（引用+@）；否则 _notify 兜底。"""
+        if request_id:
+            try:
+                ok = self.forwarder.reply_result(request_id, message)
+                self._log("info" if ok else "error",
+                          f"[登录结果] {message}（回传{'成功' if ok else '失败'}）")
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"登录结果回传异常: {e}")
+        else:
+            self._notify("小天才登录：" + message)
 
     def _login_check_loop(self) -> None:
         """检测登录态，未登录则自动登录。

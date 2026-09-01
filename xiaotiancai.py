@@ -672,7 +672,7 @@ class Xiaotiancai:
 
     def _is_system_msg(self, text: str) -> bool:
         """桥接系统提示消息（送达确认等）按前缀识别，防止被当成接收消息转发。"""
-        prefixes = self.ui.get("system_msg_prefixes", ["✅", "❌"])
+        prefixes = self.ui.get("system_msg_prefixes", ["发送成功", "发送失败", "✅", "❌"])
         return any(str(text).startswith(p) for p in prefixes)
 
     def _row_contact(self, preview_node, root: ET.Element) -> str:

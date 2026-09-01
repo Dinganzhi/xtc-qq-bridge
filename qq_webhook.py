@@ -66,20 +66,22 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                 # 立即返回，ADB 发送放后台线程（ADB 操作可能耗时数秒）
                 user = str(data.get("user_id") or "")
                 group = str(data.get("group_id") or "")
+                request_id = str(data.get("request_id") or "")
                 threading.Thread(
                     target=bridge.forward_to_xiaotiancai,
-                    args=(message, user, group),
+                    args=(message, user, group, request_id),
                     daemon=True, name="qq-to-xtc",
                 ).start()
                 self._send(200, b"OK")
             elif data.get("action") == "login":
-                # /小天才登录 命令：执行账密登录（后台线程）
+                # /小天才登录 命令：执行账密登录（后台线程），结果回传插件引用+@ 回复
                 user = str(data.get("user_id") or "")
                 group = str(data.get("group_id") or "")
                 if bridge.qq_sender_allowed(user, group):
+                    request_id = str(data.get("request_id") or "")
                     threading.Thread(
-                        target=bridge.login_xiaotiancai, daemon=True,
-                        name="xtc-login",
+                        target=bridge.login_xiaotiancai, args=(request_id,),
+                        daemon=True, name="xtc-login",
                     ).start()
                     self._send(200, b"OK")
                 else:

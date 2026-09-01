@@ -57,7 +57,7 @@ xiaotiancai:
     send_resource_id: "com.xtc.watch:id/tv_send_view"
     send_texts: ["发送"]
     chat_junk_texts: ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话", "试试和宝贝聊天吧", "试试将作业要求发送给宝贝吧"]
-    system_msg_prefixes: ["✅", "❌"]             # 桥接系统提示前缀（送达确认等），读取时跳过不转发
+    system_msg_prefixes: ["发送成功", "发送失败", "✅", "❌"]   # 桥接系统提示前缀（送达确认等），读取时跳过不转发
     badge_resource_ids: []
 
 # ---------- 日志 ----------

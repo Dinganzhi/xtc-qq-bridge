@@ -49,3 +49,17 @@ class PluginClient:
 
     def send_group(self, group_id, message: str) -> bool:
         return self.send("group", group_id, message)
+
+    def reply_result(self, request_id: str, message: str) -> bool:
+        """把命令处理结果回传给插件（插件据此在原会话引用+@ 回复发送人）。"""
+        payload = {"request_id": request_id, "message": message}
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self.base_url + "/api/result", data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Bridge-Token": self.token})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status == 200
+        except Exception:  # noqa: BLE001
+            return False

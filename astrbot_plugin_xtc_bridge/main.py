@@ -47,6 +47,8 @@ class Main(star.Star):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: list[tuple[str, str, str]] = []  # (target_type, target_id, text)
         self._platform_ids: set[str] = set()  # 最近收到过消息的平台 ID
+        # 待回传结果：request_id -> Future；/api/result 到达后由原事件引用+@ 回复发送人
+        self._pending_replies: dict[str, asyncio.Future] = {}
 
     def _lg(self):
         """跨版本安全的日志器访问。"""
@@ -74,10 +76,12 @@ class Main(star.Star):
     # ------------------------------------------------------------------ QQ → 小天才（命令）
     @filter.command("小天才")
     async def on_xtc_command(self, event: AstrMessageEvent, text: GreedyStr) -> None:
-        """用法：/小天才 <文本> —— 把文本发到小天才手表。"""
+        """用法：/小天才 <文本> —— 把文本发到小天才手表。
+        发送后挂起等待桥接结果，再用原事件回复（自动继承 AstrBot 的引用+@ 设置）。"""
         try:
             self._platform_ids.add(event.session.platform_id)
             if not self._is_sender_allowed(event):
+                event.set_result(event.plain_result("⛔ 无权限执行此命令"))
                 return
             text = (str(text) if text else "").strip()
             if not text:
@@ -86,19 +90,64 @@ class Main(star.Star):
             sender_name = event.get_sender_name() or str(event.get_sender_id())
             now = datetime.now().strftime("%m-%d %H:%M")
             message = f"[{now}] [{sender_name}] {text}"
-            await self._forward_to_python(self._base_payload(event, message=message))
+            req_id = self._new_request_id()
+            payload = self._base_payload(event, message=message)
+            payload["request_id"] = req_id
+            await self._forward_to_python(payload)
+            # 等待桥接结果（最长 90s），然后引用+@ 回复
+            fut = asyncio.get_running_loop().create_future()
+            self._pending_replies[req_id] = fut
+            try:
+                result = await asyncio.wait_for(fut, timeout=90)
+            except asyncio.TimeoutError:
+                result = None
+            finally:
+                self._pending_replies.pop(req_id, None)
+            if result:
+                event.set_result(event.plain_result(result))
         except Exception as e:  # noqa: BLE001
             self._lg().exception(f"[xtc_qq_bridge] 命令处理异常: {e}")
 
+    @staticmethod
+    def _new_request_id() -> str:
+        import uuid
+        return uuid.uuid4().hex[:12]
+
+    def _resolve_request(self, request_id: str, result: str) -> None:
+        """HTTP 线程调用：把桥接结果交给挂起的命令处理器。"""
+        if self._loop is not None and self._loop.is_running():
+            fut = self._pending_replies.get(request_id)
+            if fut is not None and not fut.done():
+                self._loop.call_soon_threadsafe(fut.set_result, result)
+
     @filter.command("小天才登录")
     async def on_xtc_login(self, event: AstrMessageEvent) -> None:
-        """用法：/小天才登录 —— 用配置的手机号+密码登录小天才。"""
+        """用法：/小天才登录 —— 用配置的手机号+密码登录小天才。
+        先回复"正在登录..."，登录结果由桥回传后引用+@ 回复成功/失败。"""
         try:
             self._platform_ids.add(event.session.platform_id)
             if not self._is_sender_allowed(event):
+                event.set_result(event.plain_result("⛔ 无权限执行此命令"))
                 return
-            await self._forward_to_python(self._base_payload(event, action="login"))
-            event.set_result(event.plain_result("正在登录小天才（手机号+密码）..."))
+            # 先发"请稍候"反馈（event.send 不占用最终回复）
+            try:
+                await event.send(MessageChain().message("正在登录小天才（手机号+密码）..."))
+            except Exception:  # noqa: BLE001 部分平台不支持中途发送
+                pass
+            req_id = self._new_request_id()
+            payload = self._base_payload(event, action="login")
+            payload["request_id"] = req_id
+            await self._forward_to_python(payload)
+            fut = asyncio.get_running_loop().create_future()
+            self._pending_replies[req_id] = fut
+            try:
+                result = await asyncio.wait_for(fut, timeout=120)
+            except asyncio.TimeoutError:
+                result = None
+            finally:
+                self._pending_replies.pop(req_id, None)
+            if result:
+                event.set_result(event.plain_result(result))
         except Exception as e:  # noqa: BLE001
             self._lg().exception(f"[xtc_qq_bridge] 登录命令处理异常: {e}")
 
@@ -115,14 +164,17 @@ class Main(star.Star):
         return payload
 
     def _is_sender_allowed(self, event: AstrMessageEvent) -> bool:
-        allow_users = self.config.get("allow_senders") or []
-        if allow_users:
-            if str(event.get_sender_id()) not in {str(u) for u in allow_users}:
+        """群消息按群白名单（allow_groups）判断，私聊按用户白名单（allow_senders）判断；
+        对应列表为空 = 不限制（最终闸门在桥侧 webhook 白名单）。"""
+        gid = str(event.get_group_id() or "")
+        uid = str(event.get_sender_id())
+        if gid:
+            allow_groups = self.config.get("allow_groups") or []
+            if allow_groups and gid not in {str(g) for g in allow_groups}:
                 return False
-        allow_groups = self.config.get("allow_groups") or []
-        if allow_groups:
-            gid = str(event.get_group_id() or "")
-            if gid and gid not in {str(g) for g in allow_groups}:
+        else:
+            allow_users = self.config.get("allow_senders") or []
+            if allow_users and uid not in {str(u) for u in allow_users}:
                 return False
         return True
 
@@ -197,6 +249,7 @@ class _HttpHandler(BaseHTTPRequestHandler):
     """本地端点：
     GET  /api/ping                → 健康检查
     POST /api/forward             → 转发消息 {target_type, target_id, message}
+    POST /api/result              → 桥接结果回传 {request_id, message}（引用+@ 回复发送人）
     """
 
     plugin: Main | None = None
@@ -218,18 +271,41 @@ class _HttpHandler(BaseHTTPRequestHandler):
         else:
             self._json({"ok": False, "error": "not found"}, 404)
 
-    def do_POST(self) -> None:
-        if urllib.parse.urlparse(self.path).path.rstrip("/") != "/api/forward":
-            self._json({"ok": False, "error": "not found"}, 404)
-            return
+    def _auth(self) -> bool:
         expected = self.plugin.config.get("token", "") if self.plugin else ""
-        if expected and self.headers.get("X-Bridge-Token", "") != expected:
-            self._json({"ok": False, "error": "unauthorized"}, 401)
-            return
+        return not expected or self.headers.get("X-Bridge-Token", "") == expected
+
+    def _read_json(self) -> dict | None:
         try:
             n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n) or b"{}")
+            return json.loads(self.rfile.read(n) or b"{}")
         except Exception:  # noqa: BLE001
+            return None
+
+    def do_POST(self) -> None:
+        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        if path == "/api/result":
+            if not self._auth():
+                self._json({"ok": False, "error": "unauthorized"}, 401)
+                return
+            body = self._read_json()
+            if body is None:
+                self._json({"ok": False, "error": "bad json"}, 400)
+                return
+            request_id = body.get("request_id", "")
+            message = body.get("message", "")
+            if self.plugin is not None and request_id:
+                self.plugin._resolve_request(str(request_id), str(message))
+            self._json({"ok": True})
+            return
+        if path != "/api/forward":
+            self._json({"ok": False, "error": "not found"}, 404)
+            return
+        if not self._auth():
+            self._json({"ok": False, "error": "unauthorized"}, 401)
+            return
+        body = self._read_json()
+        if body is None:
             self._json({"ok": False, "error": "bad json"}, 400)
             return
         target_type = body.get("target_type", "private")
