@@ -24,6 +24,20 @@
 |---|---|
 | `/小天才 <文本>` | 把文本发到小天才手表（插件格式化为 `[时间] [QQ昵称] 文本` 后转发给 Python 桥） |
 | `/小天才登录` | 用 Python 侧 `config.yaml → xiaotiancai.login` 的手机号+密码登录小天才（回复"正在登录..."） |
+| `/小天才 历史消息 <条数>` | 让 Python 桥读取小天才最近对话（1-100，默认 20），结果引用+@ 回复 |
+
+## QQ 活动记录与查询端点（xtc 侧「搜索 / 在线人数 / 提醒」数据源）
+
+- 插件**无论命令模式开/关**，都会记录收到的 QQ 消息活动（时间/私聊群聊/会话/QQ号/昵称，
+  内存环形缓冲，最多 2000 条）；
+- 另暴露三个本地端点给 Python 桥（xtc 侧命令在小天才聊天里触发后调用）：
+  - `POST /api/qq_search`  `{keyword, allow_from[], allow_groups[], limit}` → 白名单内按昵称搜人
+    （好友/群成员经 NapCat `get_friend_list` / `get_group_member_list` / `get_group_info` 实时拉取，
+    附活动记录里的最后消息时间）；
+  - `POST /api/qq_online`  `{minutes, allow_from[], allow_groups[]}` → 最近 N 分钟白名单会话发言去重人数；
+  - `POST /api/qq_remind`  `{group_id, qq_id, text}` → 向群发送 `@QQID`（可带内容）。
+- 这些查询通过 aiocqhttp 适配器的 `bot.call_action(...)` 调 OneBot v11 API；
+  需要 NapCat 在线且机器人至少收到过一条消息（用于学习平台 ID）。
 
 ## 工作原理
 

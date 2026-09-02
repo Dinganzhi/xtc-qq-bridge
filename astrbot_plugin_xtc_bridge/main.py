@@ -20,8 +20,10 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,6 +40,7 @@ _USAGE = ("用法：\n"
           "/小天才 登录          手动登录小天才\n"
           "/小天才 自动登录      开启/关闭十分钟自动登录检测\n"
           "/小天才 初始化        检测并恢复界面状态（登录/聊天/输入框）\n"
+          "/小天才 历史消息 <条数>  查看小天才最近对话记录（1-100，默认20）\n"
           "/小天才 命令模式      切换命令模式（开=仅命令转发；关=所有新消息都转发）")
 
 
@@ -56,6 +59,9 @@ class Main(star.Star):
         self._platform_ids: set[str] = set()  # 最近收到过消息的平台 ID
         # 待回传结果：request_id -> Future；/api/result 到达后由原事件引用+@ 回复发送人
         self._pending_replies: dict[str, asyncio.Future] = {}
+        # QQ 活动记录（在线人数/搜索 的"最后消息时间"数据源）：(ts, kind, session_id, user_id, name)
+        # 任何 QQ 消息事件都会记录（含命令模式开启时），查询时按白名单范围过滤。
+        self._activity: deque = deque(maxlen=2000)
 
     def _lg(self):
         """跨版本安全的日志器访问。"""
@@ -87,7 +93,7 @@ class Main(star.Star):
         try:
             self._platform_ids.add(event.session.platform_id)
             if not self._is_sender_allowed(event):
-                event.set_result(event.plain_result("⛔ 无权限执行此命令"))
+                event.set_result(event.plain_result("无权限执行此命令（不在白名单）"))
                 return
             raw = (str(args) if args else "").strip()
             if not raw:
@@ -106,6 +112,8 @@ class Main(star.Star):
                 await self._toggle_flow(event, "auto_login")
             elif sub == "初始化":
                 await self._toggle_flow(event, "init")
+            elif sub in ("历史消息", "history"):
+                await self._history_flow(event, rest)
             elif sub == "命令模式":
                 self._toggle_command_mode(event)
             else:
@@ -122,9 +130,11 @@ class Main(star.Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent) -> None:
         try:
-            if self.config.get("command_mode", True):
-                return  # 命令模式开启：只处理命令
             self._platform_ids.add(event.session.platform_id)
+            # 无论命令模式开/关，都记录 QQ 活动（xtc 侧 搜索/在线人数 的数据源）
+            self._record_activity(event)
+            if self.config.get("command_mode", True):
+                return  # 命令模式开启：只处理命令（活动记录不受影响）
             if not self._is_sender_allowed(event):
                 return
             text = (event.message_str or "").strip()
@@ -136,6 +146,20 @@ class Main(star.Star):
             await self._forward_to_python(self._base_payload(event, message=message))
         except Exception as e:  # noqa: BLE001
             self._lg().exception(f"[xtc_qq_bridge] 全量转发异常: {e}")
+
+    def _record_activity(self, event: AstrMessageEvent) -> None:
+        """记录一条 QQ 消息活动：(时间, 私聊/群聊, 会话ID, 用户ID, 昵称)。"""
+        try:
+            uid = str(event.get_sender_id() or "")
+            if not uid:
+                return
+            gid = str(event.get_group_id() or "")
+            kind = "group" if gid else "private"
+            sid = gid if gid else uid
+            name = (event.get_sender_name() or "").strip() or uid
+            self._activity.append((time.time(), kind, sid, uid, name))
+        except Exception:  # noqa: BLE001 记录失败不影响主流程
+            pass
 
     # ------------------------------------------------------------------ 各子命令实现
     async def _send_flow(self, event: AstrMessageEvent, content: str) -> None:
@@ -163,6 +187,23 @@ class Main(star.Star):
         if result:
             event.set_result(event.plain_result(result))
 
+    async def _history_flow(self, event: AstrMessageEvent, args: str) -> None:
+        """/小天才 历史消息 <条数>：让桥接读取小天才最近对话并回传（引用+@ 回复）。"""
+        count = 20
+        if args:
+            try:
+                count = int(args)
+            except ValueError:
+                event.set_result(event.plain_result("用法：/小天才 历史消息 <条数>（1-100，默认20）"))
+                return
+        if not 1 <= count <= 100:
+            event.set_result(event.plain_result("条数需在 1-100 之间"))
+            return
+        result = await self._post_and_wait(event, action="history",
+                                           extra={"history_count": count}, timeout=150)
+        if result:
+            event.set_result(event.plain_result(result))
+
     def _toggle_command_mode(self, event: AstrMessageEvent) -> None:
         """/小天才 命令模式：本地切换（写回插件配置）。"""
         new_val = not bool(self.config.get("command_mode", True))
@@ -176,11 +217,15 @@ class Main(star.Star):
         event.set_result(event.plain_result(f"命令模式已{state}"))
 
     async def _post_and_wait(self, event: AstrMessageEvent, message: str = "",
-                             action: str = "", timeout: float = 90) -> str | None:
-        """POST 到桥接并挂起等待 /api/result 回传（引用+@ 回复用）。"""
+                             action: str = "", timeout: float = 90,
+                             extra: dict | None = None) -> str | None:
+        """POST 到桥接并挂起等待 /api/result 回传（引用+@ 回复用）。
+        extra: 额外字段（如 history_count）合并进 payload。"""
         req_id = self._new_request_id()
         payload = self._base_payload(event, message=message, action=action)
         payload["request_id"] = req_id
+        if extra:
+            payload.update(extra)
         await self._forward_to_python(payload)
         fut = asyncio.get_running_loop().create_future()
         self._pending_replies[req_id] = fut
@@ -298,12 +343,186 @@ class Main(star.Star):
             self._lg().exception(f"[xtc_qq_bridge] 发送异常: {e}")
             return False
 
+    # ------------------------------------------------------------------ QQ 数据服务（xtc 侧命令用）
+    # 说明：通过 aiocqhttp 适配器实例的 .bot（CQHttp）调 OneBot v11 API。
+    # 插件在事件里记录活动日志；桥接在小天才聊天里执行 搜索/在线人数/提醒 时
+    # 通过本地 HTTP 端点访问这些数据。所有调用在主事件循环执行并限时。
+
+    def _pick_platform_id(self) -> str:
+        pid = (self.config.get("platform_id") or "").strip()
+        if not pid and self._platform_ids:
+            pid = next(iter(self._platform_ids))
+        return pid
+
+    def _get_bot(self):
+        """取 aiocqhttp 适配器实例上的 CQHttp bot（None = 未就绪）。"""
+        pid = self._pick_platform_id()
+        if not pid:
+            return None
+        try:
+            inst = self.context.get_platform_inst(pid)
+        except Exception:  # noqa: BLE001
+            return None
+        if inst is None:
+            return None
+        return getattr(inst, "bot", None)
+
+    def _run_qq_query(self, coro_factory, timeout: float = 30.0) -> dict:
+        """HTTP 线程调用：把异步查询投递到主事件循环并等待结果。"""
+        if self._loop is None or not self._loop.is_running():
+            return {"ok": False, "error": "插件尚未初始化（AstrBot 事件循环未就绪）"}
+        fut = asyncio.run_coroutine_threadsafe(coro_factory(), self._loop)
+        try:
+            result = fut.result(timeout=timeout)
+            return result if isinstance(result, dict) else {"ok": False, "error": "返回类型错误"}
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "QQ 查询超时"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"QQ 查询异常: {e}"}
+
+    def qq_search_request(self, keyword: str, allow_from: list, allow_groups: list,
+                          limit: int) -> dict:
+        return self._run_qq_query(
+            lambda: self._qq_search_async(keyword, allow_from, allow_groups, limit))
+
+    def qq_online_request(self, minutes: int, allow_from: list, allow_groups: list) -> dict:
+        return self._run_qq_query(
+            lambda: self._qq_online_async(minutes, allow_from, allow_groups))
+
+    def qq_remind_request(self, group_id: str, qq_id: str, text: str) -> dict:
+        return self._run_qq_query(
+            lambda: self._qq_remind_async(group_id, qq_id, text), timeout=20.0)
+
+    def _last_ts(self, kind: str, session_id: str, user_id: str) -> float | None:
+        """活动日志里某用户在某会话的最后发言时间（秒）。"""
+        for ts, k, sid, uid, _name in reversed(self._activity):
+            if k == kind and sid == session_id and uid == user_id:
+                return ts
+        return None
+
+    async def _qq_search_async(self, keyword: str, allow_from: list, allow_groups: list,
+                               limit: int) -> dict:
+        bot = self._get_bot()
+        if bot is None:
+            return {"ok": False, "error": "未获取到 QQ 平台（请先让 QQ 给机器人发一条消息）"}
+        kw = (keyword or "").strip().lower()
+        if not kw:
+            return {"ok": False, "error": "缺少昵称关键词"}
+        people: list[dict] = []
+
+        async def call(action: str, **params) -> list | dict:
+            try:
+                return await asyncio.wait_for(
+                    bot.call_action(action, **params), timeout=15)
+            except Exception:  # noqa: BLE001
+                return []
+
+        # 私聊范围 = 白名单好友
+        if allow_from:
+            friends = await call("get_friend_list")
+            for f in friends or []:
+                uid = str((f or {}).get("user_id") or "")
+                if not uid or uid not in set(allow_from):
+                    continue
+                name = ((f or {}).get("remark") or (f or {}).get("nickname") or "").strip()
+                if not name or kw not in name.lower():
+                    continue
+                ts = self._last_ts("private", uid, uid)
+                people.append({"scope": "private", "session_id": uid, "session_name": "",
+                               "qq": uid, "name": name, "last_ts": ts})
+                if len(people) >= limit:
+                    break
+        # 群聊范围 = 白名单群的成员
+        for gid in allow_groups:
+            if len(people) >= limit:
+                break
+            gname = ""
+            info = await call("get_group_info", group_id=int(gid))
+            if isinstance(info, dict):
+                gname = (info.get("group_name") or "").strip()
+            members = await call("get_group_member_list", group_id=int(gid))
+            for m in members or []:
+                if len(people) >= limit:
+                    break
+                uid = str((m or {}).get("user_id") or "")
+                if not uid:
+                    continue
+                name = ((m or {}).get("card") or (m or {}).get("nickname") or "").strip()
+                if not name or kw not in name.lower():
+                    continue
+                ts = self._last_ts("group", str(gid), uid)
+                people.append({"scope": "group", "session_id": str(gid),
+                               "session_name": gname, "qq": uid, "name": name, "last_ts": ts})
+        return {"ok": True, "people": people, "limit": limit}
+
+    async def _qq_online_async(self, minutes: int, allow_from: list,
+                               allow_groups: list) -> dict:
+        bot = self._get_bot()
+        window = time.time() - max(1, min(int(minutes), 60)) * 60
+        allow_from_set = set(allow_from)
+        allow_groups_set = set(allow_groups)
+        active_uids: set[str] = set()
+        private_uids: set[str] = set()
+        group_uids: dict[str, set[str]] = {g: set() for g in allow_groups_set}
+        for ts, kind, sid, uid, _name in self._activity:
+            if ts < window:
+                continue
+            if kind == "private":
+                if uid in allow_from_set:
+                    active_uids.add(uid)
+                    private_uids.add(uid)
+            elif kind == "group" and sid in allow_groups_set:
+                active_uids.add(uid)
+                group_uids.setdefault(sid, set()).add(uid)
+        sessions: list[dict] = []
+        if private_uids:
+            sessions.append({"kind": "private", "session_id": "", "session_name": "",
+                             "count": len(private_uids)})
+        for gid in allow_groups:
+            uids = group_uids.get(gid) or set()
+            if not uids:
+                continue
+            gname = str(gid)
+            if bot is not None:
+                try:
+                    info = await asyncio.wait_for(
+                        bot.call_action("get_group_info", group_id=int(gid)), timeout=8)
+                    if isinstance(info, dict) and info.get("group_name"):
+                        gname = str(info["group_name"])
+                except Exception:  # noqa: BLE001 拿不到群名就用群号
+                    pass
+            sessions.append({"kind": "group", "session_id": str(gid),
+                             "session_name": gname, "count": len(uids)})
+        return {"ok": True, "total": len(active_uids), "sessions": sessions}
+
+    async def _qq_remind_async(self, group_id: str, qq_id: str, text: str) -> dict:
+        """在群内 @ 提醒（不校验成员身份，交由 NapCat 返回错误）。"""
+        if not (str(group_id).isdigit() and str(qq_id).isdigit()):
+            return {"ok": False, "error": "群号与QQID必须为数字"}
+        platform = self._pick_platform_id()
+        if not platform:
+            return {"ok": False, "error": "未获取到 QQ 平台（请先让 QQ 给机器人发一条消息）"}
+        session = f"{platform}:GroupMessage:{group_id}"
+        try:
+            chain = MessageChain().at("", qq_id)
+            if (text or "").strip():
+                chain.message(text)
+            ok = await self.context.send_message(session, chain)
+            if ok:
+                return {"ok": True}
+            return {"ok": False, "error": "发送失败（群号错误或机器人不在该群？）"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"发送异常: {e}"}
+
 
 class _HttpHandler(BaseHTTPRequestHandler):
     """本地端点：
     GET  /api/ping                → 健康检查
     POST /api/forward             → 转发消息 {target_type, target_id, message}（等待实际结果）
     POST /api/result              → 桥接结果回传 {request_id, message}（引用+@ 回复发送人）
+    POST /api/qq_search           → xtc 侧「搜索」：白名单私聊/群聊按昵称搜人
+    POST /api/qq_online           → xtc 侧「在线人数」：最近N分钟白名单会话发言人数
+    POST /api/qq_remind           → xtc 侧「提醒」：在群内 @ 某 QQ 用户
     """
 
     plugin: Main | None = None
@@ -352,7 +571,8 @@ class _HttpHandler(BaseHTTPRequestHandler):
                 self.plugin._resolve_request(str(request_id), str(message))
             self._json({"ok": True})
             return
-        if path != "/api/forward":
+        if path != "/api/forward" and path not in (
+                "/api/qq_search", "/api/qq_online", "/api/qq_remind"):
             self._json({"ok": False, "error": "not found"}, 404)
             return
         if not self._auth():
@@ -361,6 +581,31 @@ class _HttpHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             self._json({"ok": False, "error": "bad json"}, 400)
+            return
+        if self.plugin is None:
+            self._json({"ok": False, "error": "plugin not ready"}, 500)
+            return
+        if path == "/api/qq_search":
+            result = self.plugin.qq_search_request(
+                str(body.get("keyword", "")),
+                body.get("allow_from") or [],
+                body.get("allow_groups") or [],
+                int(body.get("limit") or 30))
+            self._json(result)
+            return
+        if path == "/api/qq_online":
+            result = self.plugin.qq_online_request(
+                int(body.get("minutes") or 10),
+                body.get("allow_from") or [],
+                body.get("allow_groups") or [])
+            self._json(result)
+            return
+        if path == "/api/qq_remind":
+            result = self.plugin.qq_remind_request(
+                str(body.get("group_id", "")),
+                str(body.get("qq_id", "")),
+                str(body.get("text", "")))
+            self._json(result)
             return
         target_type = body.get("target_type", "private")
         target_id = str(body.get("target_id", ""))

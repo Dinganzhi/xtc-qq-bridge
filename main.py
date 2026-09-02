@@ -66,6 +66,17 @@ def main() -> None:
     log.info(f"ADB 就绪: {adb.serial} | Android {adb.android_version()} "
              f"| 屏幕 {adb.get_screen_size()}")
 
+    # 关闭窗口/转场/属性动画：持续动画会让 uiautomator dump 一直 "could not get
+    # idle state"（静默失败并读到旧文件），关闭后 dump 才能稳定工作。
+    if (adb_cfg.get("disable_animations", True)):
+        for key in ("window_animation_scale", "transition_animation_scale",
+                    "animator_duration_scale"):
+            try:
+                adb.shell(f"settings put global {key} 0")
+            except Exception:  # noqa: BLE001 个别镜像不允许写设置，忽略
+                pass
+        log.info("已关闭系统动画（uiautomator dump 稳定性）")
+
     from xiaotiancai import Xiaotiancai
     xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=log)
     xtc.launch()

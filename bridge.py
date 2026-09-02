@@ -12,10 +12,11 @@ import queue
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from utils.deduplicate import Deduplicator, EchoFilter, HistoryFilter
+from msg_log import MessageLog
 
 
 def make_forwarder(cfg: dict, logger=None):
@@ -49,6 +50,16 @@ class LogForwarder:
             self.logger.info(f"[占位-回传] {request_id}: {message}")
         return True
 
+    # xtc 侧命令需要的 QQ 数据查询：log 模式无 QQ 数据源，一律返回 None
+    def qq_search(self, keyword, allow_from, allow_groups, limit=30):
+        return None
+
+    def qq_online(self, minutes, allow_from, allow_groups):
+        return None
+
+    def qq_remind(self, group_id, qq_id, text=""):
+        return None
+
 
 class PluginForwarder:
     def __init__(self, client, logger=None):
@@ -71,6 +82,15 @@ class PluginForwarder:
     def reply_result(self, request_id: str, message: str) -> bool:
         return self.client.reply_result(request_id, message)
 
+    def qq_search(self, keyword, allow_from, allow_groups, limit=30):
+        return self.client.qq_search(keyword, allow_from, allow_groups, limit)
+
+    def qq_online(self, minutes, allow_from, allow_groups):
+        return self.client.qq_online(minutes, allow_from, allow_groups)
+
+    def qq_remind(self, group_id, qq_id, text=""):
+        return self.client.qq_remind(group_id, qq_id, text)
+
 
 class MessageBridge:
     def __init__(self, cfg: dict, adb, xtc, forwarder, logger=None):
@@ -88,6 +108,9 @@ class MessageBridge:
         # 长期已处理消息表（7 天持久化）：跨重启/多实例去重，杜绝死循环重复转发
         self.history = HistoryFilter(
             store_path=str(Path(__file__).resolve().parent / "data" / "history_cache.json"))
+        # 本地消息库（/小天才 历史消息 数据源）：记录真实对话，文件持久化
+        self.msgs = MessageLog(
+            path=str(Path(__file__).resolve().parent / "data" / "msg_log.json"))
         self._poll_interval = float((cfg.get("xiaotiancai") or {}).get("check_interval", 2))
         self._heartbeat_interval = float((cfg.get("adb") or {}).get("heartbeat_interval", 10))
         self._login_check_interval = float(
@@ -106,6 +129,13 @@ class MessageBridge:
         # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
         self._auto_login_enabled = bool(
             (cfg.get("xiaotiancai") or {}).get("auto_login", True))
+        # xtc 侧命令（在小天才聊天里直接输入，由本桥程序解析执行，与 QQ 命令隔离）：
+        # 命令前缀。命令去重：_cmd_pending=已入队未完成（防重复入队），
+        # _cmd_handled=执行成功的时间戳表（5 分钟内不重复执行，之后允许再次输入）。
+        self._xtc_cmd_prefix = str(
+            (cfg.get("xiaotiancai") or {}).get("cmd_prefix", "/小天才")).strip()
+        self._cmd_pending: set[str] = set()
+        self._cmd_handled: dict[str, float] = {}
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -145,6 +175,22 @@ class MessageBridge:
                 elif kind == "init":
                     _, request_id = job
                     self._do_init_job(request_id)
+                elif kind == "history":
+                    # 小天才历史消息：count + 回传方式（request_id 或写入小天才聊天）
+                    _, count, request_id, into_chat = job
+                    self._do_history_job(count, request_id, into_chat)
+                elif kind == "cmd":
+                    # xtc 侧命令（在小天才聊天里输入的 /小天才 xxx，手表侧或家长侧均可）
+                    _, text = job
+                    ok = self._do_cmd_job(text)
+                    self._cmd_pending.discard(text)
+                    if ok:
+                        self._cmd_handled[text] = time.monotonic()
+                        if len(self._cmd_handled) > 100:  # 修剪上限
+                            for k in sorted(self._cmd_handled,
+                                            key=self._cmd_handled.get)[:50]:
+                                del self._cmd_handled[k]
+                    # 回复失败：不加 handled，下一轮轮询自动重试
             except Exception as e:  # noqa: BLE001
                 self._log("warning", f"任务处理异常: {e}")
             finally:
@@ -174,7 +220,7 @@ class MessageBridge:
                     if self._pending_login_notify:
                         if self.xtc.is_logged_in():
                             self._pending_login_notify = False
-                            self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
+                            self._notify("小天才已重新登录（安全验证完成），桥接继续运行")
                     # 确保在聊天页读取（列表预览无法判断发送方，会把家长侧消息误当对方消息）；
                     # 离开聊天页后最多每 30s 重开一次，避免频繁打断用户
                     if not self.xtc.is_in_chat():
@@ -182,13 +228,32 @@ class MessageBridge:
                         if xtc_contact and time.monotonic() - self._last_chat_open >= 30:
                             self._last_chat_open = time.monotonic()
                             self.xtc.open_chat(xtc_contact)
-                    contact, text, time_label = self.xtc.get_latest_message()
+                    contact, text, time_label, own_text, own_recent = \
+                        self.xtc.get_latest_message()
                 finally:
                     self._op_lock.release()
-                if text:
+                is_cmd_text = bool(self._xtc_cmd_prefix and text
+                                   and text.startswith(self._xtc_cmd_prefix))
+                # xtc 侧命令（/小天才 …）：手表侧或家长侧输入均可。
+                # 1) 手表侧（对方发来）的命令 → 执行，不转发、不入消息库
+                if is_cmd_text:
+                    self._maybe_xtc_cmd(text)
+                # 2) 家长侧输入的命令：可能被送达确认等新消息盖过（不再是"最新一条"），
+                #    扫最近若干条自己发的消息
+                elif own_recent:
+                    for t in own_recent:
+                        if self._xtc_cmd_prefix and t.startswith(self._xtc_cmd_prefix):
+                            self._maybe_xtc_cmd(t)
+                            break
+                # 普通手表消息 → 转发（命令已被上面拦截，绝不转发/入库）
+                if text and not is_cmd_text:
                     key = ("xtc", contact or "", text)
                     if not self.history.seen("xtc", contact or "", text) \
                             and not self.dedup.seen(key) and not self.echo.is_echo(text):
+                        # 本地消息库归档（发送成功等系统提示已被读取层过滤，
+                        # 时间优先取 App 时间标签解析出的真实时刻）
+                        ts = self._label_epoch(time_label)
+                        self.msgs.append("xtc", contact or "", text, t=ts)
                         try:
                             ok = self._forward(contact, text, time_label)
                         except Exception as e:  # noqa: BLE001
@@ -314,7 +379,12 @@ class MessageBridge:
         if ok:
             # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
             self.history.mark("qq2xtc", text)
-        if self._confirm_delivery() and (user_id or group_id):
+            self._archive_qq_send(text)
+        # 命令类文本（/小天才 …）的"结果"由命令任务自己写回小天才聊天，
+        # 不再向 QQ 发"发送成功"确认，避免误导。
+        is_cmd_text = bool(self._xtc_cmd_prefix
+                           and text.startswith(self._xtc_cmd_prefix))
+        if self._confirm_delivery() and (user_id or group_id) and not is_cmd_text:
             result_msg = ("发送成功：" if ok else "发送失败：") + text
             if request_id:
                 try:
@@ -327,6 +397,24 @@ class MessageBridge:
                 self._send_confirm(user_id, group_id, result_msg)
 
     # ------------------------------------------------------------------ 送达确认
+    def _archive_qq_send(self, text: str) -> None:
+        """QQ → 小天才 发送成功后归档到本地消息库。
+        - 发送的整条消息是插件格式 `[MM-DD HH:MM] [QQ昵称] 内容` → 拆出昵称与内容；
+        - 命令文本（/小天才 …）与系统提示不入库。"""
+        m = re.match(r"^\[(\d{2}-\d{2} \d{2}:\d{2})\] \[(.+?)\] (.*)$", text)
+        if m:
+            sender, content = m.group(2), m.group(3)
+        else:
+            sender, content = "QQ", text
+        content = (content or "").strip()
+        if not content:
+            return
+        if any(content.startswith(p) for p in self._system_msg_prefixes()):
+            return
+        if self._xtc_cmd_prefix and content.startswith(self._xtc_cmd_prefix):
+            return
+        self.msgs.append("qq", sender, content)
+
     def _confirm_delivery(self) -> bool:
         return bool((self.cfg.get("target") or {}).get("confirm_delivery", True))
 
@@ -385,11 +473,11 @@ class MessageBridge:
         if status == "risk":
             self._pending_login_notify = True  # 等待用户手动完成安全验证
             self._login_reply(request_id, "需要安全验证：请手动打开模拟器完成验证")
-            self._notify("⚠️ 小天才登录触发安全验证，请手动打开模拟器完成验证")
+            self._notify("小天才登录触发安全验证，请手动打开模拟器完成验证")
         elif status == "fail":
             self._pending_login_notify = True  # 避免每 10 分钟反复重试刷屏
             self._login_reply(request_id, "登录失败（账号或密码错误等），请检查配置或手动登录")
-            self._notify("❌ 小天才自动登录失败（账号或密码错误等）")
+            self._notify("小天才自动登录失败（账号或密码错误等）")
         elif status == "error":
             self._login_reply(request_id, "登录出错（控件未找到），请运行 tools/dump_ui.py 查看登录页")
         elif status == "ok":
@@ -431,13 +519,23 @@ class MessageBridge:
         return "queued"
 
     def _do_init_job(self, request_id: str) -> None:
-        """检测并恢复界面状态：启动 → 弹窗 → 登录态 → 聊天页 → 文字模式 → 清空输入框。"""
+        """检测并恢复界面状态：启动 → 清理弹窗 → 登录态 → 聊天页 → 文字模式 → 清空输入框。
+        每步前都清理弹窗（settle），失败自动重试，弹窗不会中断整个初始化。"""
         msgs: list[str] = []
         try:
             with self._op_lock:
-                launched = self.xtc.launch()
+                # 1) 启动（弹窗清理 + 重试）
+                launched = False
+                for _ in range(2):
+                    self.xtc.settle()
+                    if self.xtc.launch():
+                        launched = True
+                        break
+                    time.sleep(2.0)
                 msgs.append("启动" + ("OK" if launched else "失败"))
-                self.xtc.dismiss_blockers()
+                time.sleep(2.0)
+                self.xtc.settle()
+                # 2) 登录态
                 if self.xtc.is_logged_in():
                     msgs.append("已登录")
                 else:
@@ -449,10 +547,29 @@ class MessageBridge:
                         msgs.append("登录：" + self._login_status_text(status))
                     else:
                         msgs.append("未登录（未配置账密，请手动登录）")
+                # 3) 进入聊天页（带重试 + 弹窗清理）
                 contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
-                if contact and self.xtc.open_chat(contact):
-                    msgs.append("已进入聊天")
-                msgs.append(self.xtc.ensure_input_clean())
+                chat_ok = False
+                if contact:
+                    for _ in range(3):
+                        if self.xtc.is_in_chat():
+                            chat_ok = True
+                            break
+                        self.xtc.settle()
+                        if self.xtc.open_chat(contact):
+                            chat_ok = True
+                            break
+                        time.sleep(1.5)
+                msgs.append("已进入聊天" if chat_ok else ("未进入聊天" if contact else "未配置联系人"))
+                # 4) 文字模式 + 清空输入框（带重试）
+                clean = ""
+                for _ in range(3):
+                    clean = self.xtc.ensure_input_clean()
+                    if "已清空" in clean or "已就绪" in clean:
+                        break
+                    self.xtc.settle()
+                    time.sleep(1.5)
+                msgs.append(clean or "输入框处理失败")
             reply = "初始化完成：" + "，".join(msgs)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"初始化异常: {e}")
@@ -465,6 +582,335 @@ class MessageBridge:
                 self._log("warning", f"初始化回传异常: {e}")
         else:
             self._notify(reply)
+
+    # ------------------------------------------------------------------ 小天才历史消息（QQ 与 xtc 侧共用）
+    def fetch_xtc_history(self, count: int = 20, request_id: str = "",
+                          into_chat: bool = False) -> str:
+        """读取小天才最近对话历史（入队，由工作线程串行执行，保证与发送顺序）。
+        - QQ 侧：request_id 回传插件，插件在原会话引用+@ 回复；
+        - xtc 侧：into_chat=True 时结果写进小天才聊天。
+        返回 'queued'。count 自动夹到 1..100。"""
+        try:
+            count = max(1, min(int(count), 100))
+        except (TypeError, ValueError):
+            count = 20
+        self._job_queue.put(("history", count, request_id or "", bool(into_chat)))
+        return "queued"
+
+    def _do_history_job(self, count: int, request_id: str, into_chat: bool) -> None:
+        """工作线程内：读本地消息库 → 格式化回传（不滚动界面，不依赖聊天页状态）。"""
+        entries = self.msgs.recent(count)
+        if not entries:
+            reply = ("小天才历史消息：暂无本地消息记录"
+                     "（消息库自桥接启用后自动积累真实对话）")
+        else:
+            reply = self._format_history_text(entries, count,
+                                              max_chars=900 if into_chat else 3800)
+        self._log("info", f"[历史消息] 本地消息库 {len(entries)} 条，回传方式: "
+                          f"{'写入小天才聊天' if into_chat else 'QQ'}")
+        if into_chat:
+            self._reply_into_xtc(reply)
+        elif request_id:
+            try:
+                ok = self.forwarder.reply_result(request_id, reply)
+                self._log("info" if ok else "error",
+                          f"[历史消息回传] {reply[:120]}...（{'成功' if ok else '失败'}）")
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"历史消息回传异常: {e}")
+        else:
+            self._notify("小天才历史消息：\n" + reply)
+
+    def _format_history_text(self, entries: list[dict], count: int,
+                             max_chars: int = 3800) -> str:
+        """把本地消息库条目格式化为文本。行格式：[MM-DD HH:MM] 发送方: 内容。
+        - 日期用明确数字（昨天/前天 等已由归档时间戳换算成具体日期，如 09-01）；
+        - 跳过系统提示（发送成功/发送失败）与命令文本（防御性过滤）；
+        - 超长从最旧截断。"""
+        sys_prefixes = self._system_msg_prefixes()
+        lines: list[str] = []
+        for e in entries:
+            text = (e.get("text") or "").strip()
+            if not text:
+                continue
+            if any(text.startswith(p) for p in sys_prefixes):
+                continue
+            if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
+                continue
+            sender = (e.get("sender") or "").strip()
+            if e.get("kind") == "xtc":
+                sender = self._display_name(sender)
+            try:
+                dt = datetime.fromtimestamp(float(e.get("t") or 0))
+            except (TypeError, ValueError, OSError):
+                dt = datetime.now()
+            lines.append(f"[{dt:%m-%d} {dt:%H:%M}] {sender}: {text}")
+        if not lines:
+            return "小天才历史消息：暂无本地消息记录"
+        dropped = 0
+        while len(lines) > 1 and sum(len(l) for l in lines) > max_chars:
+            lines.pop(0)
+            dropped += 1
+        header = f"小天才历史消息（最近 {len(lines)} 条"
+        if dropped:
+            header += f"，省略更早 {dropped} 条"
+        header += "）："
+        return header + "\n" + "\n".join(lines)
+
+    def _system_msg_prefixes(self) -> list:
+        ui = ((self.cfg.get("xiaotiancai") or {}).get("ui") or {})
+        return ui.get("system_msg_prefixes", ["发送成功", "发送失败", "✅", "❌"])
+
+    def _label_epoch(self, time_label: str, now: datetime | None = None) -> float | None:
+        """把 App 时间标签解析成时间戳（本地消息库归档用）：
+        'HH:MM'→今天；'昨天 HH:MM'/'前天 HH:MM'→对应日期；'M月D日 HH:MM'→该日期。
+        解析失败返回 None（归档时用当前时间兜底）。显示层用时间戳输出明确日期，
+        不再出现"昨天/前天"字样。"""
+        label = (time_label or "").strip()
+        if not label:
+            return None
+        now = now or datetime.now()
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", label)
+        if m:
+            return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                               second=0, microsecond=0).timestamp()
+        m = re.fullmatch(r"(昨天|前天)\s*(\d{1,2}):(\d{2})", label)
+        if m:
+            days_back = 1 if m.group(1) == "昨天" else 2
+            return (now - timedelta(days=days_back)).replace(
+                hour=int(m.group(2)), minute=int(m.group(3)),
+                second=0, microsecond=0).timestamp()
+        m = re.search(r"(\d{1,2})月(\d{1,2})日", label)
+        if m:
+            tm = re.search(r"(\d{1,2}):(\d{2})", label)
+            try:
+                return now.replace(month=int(m.group(1)), day=int(m.group(2)),
+                                   hour=int(tm.group(1)) if tm else 0,
+                                   minute=int(tm.group(2)) if tm else 0,
+                                   second=0, microsecond=0).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    # ------------------------------------------------------------------ xtc 侧命令（在小天才聊天输入，由本桥执行）
+    # 排版模仿 QQ 帮助信息（用法：+ 逐行命令 + 对齐说明）；聊天输入支持换行，
+    # 会按多行原样发送。
+    _XTC_USAGE = ("用法（在小天才聊天里直接输入）：\n"
+                  "/小天才 搜索 <昵称>          白名单QQ私聊/群聊中找人（附最后消息时间）\n"
+                  "/小天才 在线人数 <分钟>      最近N分钟白名单QQ会话发言人数（1-60）\n"
+                  "/小天才 提醒 <群号> <QQID> [内容]    在指定QQ群内@提醒该用户\n"
+                  "/小天才 历史消息 <条数>      查看最近对话记录（1-100，默认20）")
+
+    def _xtc_usage(self) -> str:
+        return self._XTC_USAGE
+
+    def _maybe_xtc_cmd(self, text: str) -> None:
+        """命令去重入队（手表侧/家长侧输入共用）。
+        - pending：已入队未完成 → 不再重复入队；
+        - handled：执行成功 5 分钟内不重复执行（避免命令仍是最新消息时反复触发）；
+          5 分钟后用户再次输入相同命令可重新执行。
+        回复失败不入 handled，下一轮轮询自动重试。"""
+        now = time.monotonic()
+        if text in self._cmd_pending:
+            return
+        hts = self._cmd_handled.get(text, 0)
+        if hts and now - hts < 300:
+            return
+        # 清理过期的 handled
+        stale = [k for k, ts in self._cmd_handled.items() if now - ts >= 300]
+        for k in stale:
+            del self._cmd_handled[k]
+        self._cmd_pending.add(text)
+        self._log("info", f"[xtc命令] 收到: {text}")
+        self._job_queue.put(("cmd", text))
+
+    def _do_cmd_job(self, text: str) -> bool:
+        """执行 xtc 侧命令。返回是否成功回复（失败时调用方复位去重，允许下轮重试）。
+        语法错误 / 无法识别的子命令 / 缺参数 → 一律回复完整帮助列表。"""
+        raw = (text or "").strip()
+        if not self._xtc_cmd_prefix or not raw.startswith(self._xtc_cmd_prefix):
+            return True  # 非命令消息不应到任务里（轮询已过滤）
+        rest = raw[len(self._xtc_cmd_prefix):].strip()
+        if not rest or rest in ("帮助", "help", "-h", "?"):
+            return self._reply_into_xtc(self._xtc_usage())
+        sub, _, args = rest.partition(" ")
+        sub = sub.strip()
+        args = args.strip()
+        reply = None
+        try:
+            if sub in ("历史消息", "history"):
+                reply = self._cmd_history(args)      # None = 已同步执行并写回聊天
+            elif sub in ("搜索", "search"):
+                reply = self._cmd_search(args)
+            elif sub in ("在线人数", "online"):
+                reply = self._cmd_online(args)
+            elif sub in ("提醒", "remind"):
+                reply = self._cmd_remind(args)
+            else:
+                reply = self._xtc_usage()            # 无法识别 → 帮助列表
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"xtc 命令执行异常: {e}")
+            reply = self._xtc_usage()
+        if reply is None:
+            return True
+        return self._reply_into_xtc(reply)
+
+    def _cmd_history(self, args: str):
+        """返回 None=已执行（写回聊天）；str=帮助列表（参数错误时）。"""
+        if args:
+            try:
+                n = int(args)
+            except ValueError:
+                return self._xtc_usage()
+            if not 1 <= n <= 100:
+                return self._xtc_usage()
+        else:
+            n = 20
+        # 已处于工作线程：直接同步执行历史读取任务（结果写入小天才聊天）
+        self._do_history_job(n, "", into_chat=True)
+        return None
+
+    def _cmd_search(self, args: str) -> str:
+        if not args:
+            return self._xtc_usage()
+        allow_from, allow_groups = self._qq_scope()
+        try:
+            resp = self.forwarder.qq_search(args, allow_from, allow_groups)
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"QQ 搜索调用异常: {e}")
+            resp = None
+        if not resp:
+            return "QQ 搜索失败：AstrBot 插件未连接（请确认 AstrBot 与插件已运行）"
+        if not resp.get("ok"):
+            return f"QQ 搜索失败：{resp.get('error') or '未知错误'}"
+        people = resp.get("people") or []
+        if not people:
+            return f"未找到昵称含「{args}」的人（白名单私聊/群聊）"
+        now = time.time()
+        lines = ["搜索结果："]
+        for p in people:
+            name = p.get("name") or p.get("qq") or "?"
+            qq = p.get("qq") or ""
+            if p.get("scope") == "group":
+                head = f"群聊 {p.get('session_name') or p.get('session_id')}(群{p.get('session_id')}) {name}(QQ{qq})"
+            else:
+                head = f"私聊 {name}(QQ{qq})"
+            ts = p.get("last_ts")
+            if ts:
+                try:
+                    lines.append(f"{head}：上次发送 {self._fmt_dt(ts)}，距现在 {self._fmt_ago(ts, now)}")
+                except Exception:  # noqa: BLE001
+                    lines.append(f"{head}：上次发送时间未知")
+            else:
+                lines.append(f"{head}：未发送过任何消息")
+        limit = int((resp.get("limit") or 0) or 0)
+        if limit and len(people) >= limit:
+            lines.append(f"（结果过多，仅显示前 {limit} 条）")
+        return "\n".join(lines)
+
+    def _cmd_online(self, args: str) -> str:
+        try:
+            minutes = int(args or "")
+        except ValueError:
+            return self._xtc_usage()
+        if not 1 <= minutes <= 60:
+            return self._xtc_usage()
+        allow_from, allow_groups = self._qq_scope()
+        try:
+            resp = self.forwarder.qq_online(minutes, allow_from, allow_groups)
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"QQ 在线人数调用异常: {e}")
+            resp = None
+        if not resp:
+            return "在线人数查询失败：AstrBot 插件未连接（请确认 AstrBot 与插件已运行）"
+        if not resp.get("ok"):
+            return f"在线人数查询失败：{resp.get('error') or '未知错误'}"
+        total = int(resp.get("total") or 0)
+        lines = [f"在线人数（最近 {minutes} 分钟，白名单QQ会话）：{total} 人"]
+        for s in resp.get("sessions") or []:
+            if s.get("kind") == "private":
+                lines.append(f"私聊：{s.get('count')} 人")
+            else:
+                sid = s.get("session_id") or ""
+                name = s.get("session_name") or sid
+                lines.append(f"群聊 {name}({sid})：{s.get('count')} 人")
+        return "\n".join(lines)
+
+    def _cmd_remind(self, args: str) -> str:
+        parts = args.split(None, 2) if args else []
+        if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            return self._xtc_usage()  # 参数缺失/非数字 → 帮助列表
+        group_id, qq_id = parts[0], parts[1]
+        content = parts[2] if len(parts) > 2 else ""
+        allow_from, allow_groups = self._qq_scope()
+        if group_id not in allow_groups:
+            return f"群 {group_id} 不在白名单（webhook.allow_groups），无法提醒"
+        try:
+            resp = self.forwarder.qq_remind(group_id, qq_id, content)
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"QQ 提醒调用异常: {e}")
+            resp = None
+        if not resp:
+            return "提醒失败：AstrBot 插件未连接（请确认 AstrBot 与插件已运行）"
+        if resp.get("ok"):
+            return f"已提醒 QQ{qq_id}（群 {group_id}）" + (f"：{content}" if content else "")
+        return f"提醒失败：{resp.get('error') or '未知错误'}"
+
+    # ------------------------------------------------------------------ xtc 命令辅助
+    def _reply_into_xtc(self, text: str) -> bool:
+        """把命令结果写进小天才聊天（家长侧消息，转发路径按"自己发的"忽略，不会回传 QQ）。
+        实测聊天输入支持换行：多行文本（帮助列表/历史消息等）按原样作为一条消息发送，
+        与 QQ 帮助信息的排版一致；超长截断。"""
+        msg = (text or "").strip()
+        if not msg:
+            return False
+        if len(msg) > 900:
+            msg = msg[:900] + "（过长截断）"
+        contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+        if not contact:
+            self._log("error", "回复小天才需要 config.yaml → target.xtc_contact")
+            return False
+        with self._op_lock:
+            if not self.xtc.is_in_chat():
+                self.xtc.dismiss_blockers()
+                if not self.xtc.open_chat(contact):
+                    self._log("error", "命令结果写入失败：无法进入小天才聊天窗口")
+                    return False
+            self.echo.mark(msg)  # 本桥发出的消息，防止（理论上）被读回
+            try:
+                ok = self.xtc.send_message(msg)
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"命令结果写入异常: {e}")
+                ok = False
+        if ok:
+            self._log("info", f"[xtc命令回复] {msg[:150]!r}...")
+        else:
+            self._log("error", "[xtc命令回复] 发送失败（请检查小天才聊天窗口状态）")
+        return ok
+
+    def _qq_scope(self) -> tuple[list[str], list[str]]:
+        """白名单范围：webhook.allow_from（私聊）+ allow_groups（群聊）。"""
+        wh = self.cfg.get("webhook") or {}
+        allow_from = [str(x) for x in (wh.get("allow_from") or [])]
+        allow_groups = [str(x) for x in (wh.get("allow_groups") or [])]
+        return allow_from, allow_groups
+
+    @staticmethod
+    def _fmt_dt(ts) -> str:
+        return datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+
+    @staticmethod
+    def _fmt_ago(ts, now: float | None = None) -> str:
+        now = time.time() if now is None else now
+        sec = max(0, now - float(ts))
+        if sec < 60:
+            return "刚刚"
+        m = int(sec // 60)
+        if m < 60:
+            return f"{m} 分钟"
+        h = int(m // 60)
+        if h < 24:
+            return f"{h} 小时"
+        return f"{int(h // 24)} 天"
 
     @staticmethod
     def _login_status_text(status: str) -> str:
@@ -507,7 +953,7 @@ class MessageBridge:
                     else:
                         if self._pending_login_notify:
                             self._pending_login_notify = False
-                            self._notify("✅ 小天才已重新登录（安全验证完成），桥接继续运行")
+                            self._notify("小天才已重新登录（安全验证完成），桥接继续运行")
                         else:
                             self._log("debug", "小天才登录态正常")
             except Exception as e:  # noqa: BLE001

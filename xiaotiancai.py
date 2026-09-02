@@ -295,11 +295,26 @@ class Xiaotiancai:
 
     # ------------------------------------------------------------------ 弹窗处理
     def dismiss_blockers(self) -> bool:
-        """公开别名：处理会挡住操作的弹窗。"""
-        return self._dismiss_blockers()
+        """公开别名：多轮清理所有可识别的弹窗/遮挡，直到界面干净。"""
+        return self.settle()
+
+    def settle(self, max_passes: int = 6) -> bool:
+        """多轮弹窗清理：权限/隐私协议/警告/通用对话框按钮/BACK 兜底。
+        任何一轮处理了内容就继续下一轮，直到界面干净或达到轮数上限。"""
+        handled_any = False
+        for _ in range(max_passes):
+            if self._dismiss_blockers():
+                handled_any = True
+                time.sleep(0.8)
+                continue
+            break
+        return handled_any
 
     def _dismiss_blockers(self) -> bool:
-        """处理会挡住操作的弹窗：系统录音权限、小天才警告、首启隐私协议。返回是否处理过。"""
+        """处理单轮可识别的弹窗/遮挡，返回是否处理过。
+        覆盖：系统权限 / 首启隐私协议 / 通话面板弹层 / 小天才警告 /
+        通用对话框文本按钮 / 弹窗窗口 BACK 兜底。
+        注意：普通页面的 NAF 节点（图片等）不算遮挡，绝不能按 BACK（会把 App 退到桌面）。"""
         focus = self.current_activity()
         try:
             if "permissioncontroller" in focus.lower():
@@ -308,27 +323,75 @@ class Xiaotiancai:
                 if btn is not None:
                     self.adb.tap_element(btn)
                     self.log("info", "已允许录音权限（前台使用）")
-                    time.sleep(1.5)
                     return True
+                # 允许失败的兜底：允许一次 / 允许（部分镜像按钮不同）
+                btn = self.adb.find_element(
+                    root, resource_id="com.android.permissioncontroller:id/permission_allow_button")
+                if btn is not None:
+                    self.adb.tap_element(btn)
+                    self.log("info", "已允许录音权限")
+                    return True
+                return False
             root = self.adb.dump_ui()
-            # 首启隐私协议弹窗（温馨提示 → 点"同意"；必须先于通用 btn_cancel，
-            # 否则会把"不同意"当成警告弹窗的"取消"点掉）
+            # 通话面板弹层（视频通话/拨打电话 + 取消；聊天/联系人页 "+" 菜单误触出现）
+            texts_all = "".join((n.get("text") or "") for n in root.iter("node"))
+            if "视频通话" in texts_all and "拨打电话" in texts_all:
+                cancel = (self.adb.find_element(
+                    root, resource_id="com.xtc.watch:id/tv_cancel")
+                    or self.adb.find_element(root, text="取消"))
+                if cancel is not None:
+                    self.adb.tap_element(cancel)
+                    self.log("info", "已关闭通话面板弹层")
+                    return True
+            # 首启隐私协议弹窗（温馨提示 → 点"同意"；必须先于通用取消按钮）
             title = self.adb.find_element(root, resource_id="com.xtc.watch:id/tv_title")
             if title is not None and "温馨提示" in title.get("text", ""):
                 sure = self.adb.find_element(root, resource_id="com.xtc.watch:id/btn_sure")
                 if sure is not None:
                     self.adb.tap_element(sure)
                     self.log("info", "已同意隐私协议（首启弹窗）")
-                    time.sleep(1.5)
                     return True
+            # 小天才警告弹窗（取消 / 确认）：先取取消，没有则取确认/确定
             btn = self.adb.find_element(root, resource_id=_CANCEL_DIALOG_ID)
             if btn is not None:
                 self.adb.tap_element(btn)
-                self.log("info", "已关闭小天才警告弹窗")
-                time.sleep(1.0)
+                self.log("info", "已关闭小天才弹窗")
+                return True
+            # 通用对话框文本按钮（按需取确认类或取消类，避免误关）
+            clicked = self._tap_any_dialog_button(root)
+            if clicked:
+                return True
+            # BACK 兜底：仅当前台是独立弹窗/对话框窗口时（如 PopupWindow），
+            # 普通 Activity 页面即使有 NAF 节点也不按返回，防止 App 退到桌面。
+            if "PopupWindow" in focus or "Dialog" in focus:
+                self.adb.keyevent(4)
+                self.log("info", "检测到弹窗窗口，按返回键关闭")
                 return True
         except AdbError:
             pass
+        return False
+
+    def _tap_any_dialog_button(self, root: ET.Element) -> bool:
+        """点通用对话框按钮。优先确认类（同意/确定/知道了/好的），其次取消类。
+        仅当界面存在"对话框特征"（有多个按钮文本）时才动作，避免误点正常界面按钮。"""
+        texts = [n.get("text", "").strip() for n in root.iter("node") if n.get("text", "").strip()]
+        confirm_keys = ("同意", "确定", "知道了", "好的", "确认", "允许")
+        cancel_keys = ("取消", "关闭", "不同意", "暂不", "以后再说")
+        hit = [t for t in texts if t in confirm_keys or t in cancel_keys]
+        if len(hit) < 2 and not any("温馨提示" in t or "警告" in t or "提示" in t for t in texts):
+            return False  # 非对话框场景不动作
+        for key in confirm_keys:
+            n = self.adb.find_element(root, text=key)
+            if n is not None:
+                self.adb.tap_element(n)
+                self.log("info", f"已点击对话框按钮: {key}")
+                return True
+        for key in cancel_keys:
+            n = self.adb.find_element(root, text=key)
+            if n is not None:
+                self.adb.tap_element(n)
+                self.log("info", f"已点击对话框按钮: {key}")
+                return True
         return False
 
     # ------------------------------------------------------------------ 界面判定
@@ -573,22 +636,48 @@ class Xiaotiancai:
         except AdbError as e:
             return f"输入框处理失败: {e}"
 
+    def keyboard_visible(self) -> bool:
+        """软键盘是否弹出（dumpsys input_method 判断）。"""
+        try:
+            return "mInputShown=true" in (self.adb.shell("dumpsys input_method") or "")
+        except AdbError:
+            return False
+
+    def close_keyboard(self) -> bool:
+        """收起软键盘（若可见）。返回是否执行了收起动作。"""
+        try:
+            if self.keyboard_visible():
+                self.adb.keyevent(4)
+                time.sleep(0.8)
+                return True
+        except AdbError:
+            pass
+        return False
+
     # ------------------------------------------------------------------ 读取消息
     def get_latest_message(self):
-        """返回 (contact, text, time_label)；无法确定时 (None, None, "")。不抛异常。
+        """返回 (contact, text, time_label, own_text, own_recent)；无法确定时
+        (None, None, "", "", [])。
+
+        own_text = 最新一条"自己发的"消息文本；own_recent = 最近若干条自己发的消息
+        （新→旧，供 xtc 侧命令检测；命令可能被送达确认等新消息盖过，需扫最近几条）。
+        复用同一次 dump，避免命令轮询额外开 uiautomator dump。不抛异常。
 
         只在聊天窗口内读取——列表预览无法可靠判断发送方（家长侧手动发送的消息
         也会出现在预览里），会被误当成对方消息转发。轮询层负责确保聊天窗口已打开。"""
         try:
             if not self.require_login():
-                return (None, None, "")
+                return (None, None, "", "", [])
             root = self.adb.dump_ui()
             if self.is_in_chat():
-                return self._latest_in_chat(root)
-            return (None, None, "")  # 不在聊天页不读列表（防误转发家长侧消息）
+                contact, text, time_label = self._latest_in_chat(root)
+                own_recent = self._own_texts_in_chat(root)
+                return (contact, text, time_label,
+                        own_recent[0] if own_recent else "", own_recent)
+            return (None, None, "", "", [])  # 不在聊天页不读列表（防误转发家长侧消息）
         except Exception as e:  # noqa: BLE001 读取失败不致命
             self.log("warning", f"读取消息异常: {e}")
-            return (None, None, "")
+            return (None, None, "", "", [])
 
     def _latest_in_chat(self, root: ET.Element):
         """聊天窗口内：取最新一条"别人发来的"消息，返回 (contact, text, time_label)。
@@ -662,6 +751,151 @@ class Xiaotiancai:
                 time_label = d_text
                 break
         return (None, t, time_label)
+
+    # ------------------------------------------------------------------ 历史消息 / 命令轮询
+    def _chat_bubbles(self, root: ET.Element, include_own: bool = False) -> list[dict]:
+        """解析一次 UI dump 的聊天消息气泡，按屏幕从上到下（旧→新）排序。
+
+        识别逻辑与 _latest_in_chat 一致（气泡 id=chat_msg_item_content）：
+        - content-desc 标注发送方（'XX发的消息'/'你发的消息'）优先；无标注按左右位置
+          （右侧=自己发）；
+        - 下方带发送失败提示（网络异常）的气泡剔除；
+        - 垃圾 UI 文案 / 桥接系统提示（发送成功 等前缀）剔除；
+        - include_own=False 时跳过自己发的消息。
+        返回 [{text, is_own, contact, time_label, y_bottom}]。
+        """
+        screen_w = self.adb.get_screen_size()[0]
+        filter_own = bool(self.ui.get("filter_own_bubbles", True))
+        junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
+        dates: list[tuple[int, int, str]] = []
+        fail_hints: list[tuple[int, int]] = []
+        for n in root.iter("node"):
+            tail = self._id_tail(n)
+            if tail == "tv_chat_msg_item_date":
+                b = self._bounds(n)
+                if b and n.get("text", "").strip():
+                    dates.append((b[1], b[3], n.get("text", "").strip()))
+            elif tail in _TIP_IDS:
+                b = self._bounds(n)
+                if b:
+                    fail_hints.append((b[1], b[3]))
+        out: list[dict] = []
+        for n in root.iter("node"):
+            if self._id_tail(n) != "chat_msg_item_content":
+                continue
+            t = (n.get("text", "") or "").strip()
+            desc = (n.get("content-desc", "") or "").strip()
+            b = self._bounds(n)
+            if b is None:
+                continue
+            if any(fh_top - 60 <= b[3] <= fh_top + 30 for fh_top, _ in fail_hints):
+                continue  # 气泡下方是发送失败提示 = 未送达
+            center_x = (b[0] + b[2]) / 2
+            is_own = False
+            contact = ""
+            if "发的消息" in desc:
+                if desc.startswith("你发的"):
+                    is_own = True
+                else:
+                    contact = desc.split("发的消息", 1)[0].strip()
+                if not t and "," in desc:
+                    t = desc.split(",", 1)[1].strip()  # 表情/语音等从 desc 取类型
+            else:
+                # 无标注：右侧气泡 = 自己发的消息
+                is_own = filter_own and center_x > screen_w * 0.55
+            if not t or t in junk:
+                continue
+            if self._is_system_msg(t):
+                continue
+            if is_own and not include_own:
+                continue
+            time_label = ""
+            for d_top, d_bottom, d_text in reversed(dates):  # 取气泡上方最近的日期标签
+                if d_bottom <= b[1] + 5:
+                    time_label = d_text
+                    break
+            out.append({"text": t, "is_own": is_own, "contact": contact,
+                        "time_label": time_label, "y_bottom": b[3]})
+        out.sort(key=lambda it: it["y_bottom"])
+        return out
+
+    def _latest_own_in_chat(self, root: ET.Element) -> str:
+        """聊天页内最新一条"自己发的"消息文本（系统/垃圾已过滤）；无则 ""。"""
+        own = self._own_texts_in_chat(root)
+        return own[0] if own else ""
+
+    def _own_texts_in_chat(self, root: ET.Element, limit: int = 8) -> list[str]:
+        """聊天页内最近若干条"自己发的"消息文本（新→旧，系统/垃圾已过滤）。
+        命令可能被送达确认等后续消息盖过（不再是"最新一条"），检测时扫最近几条。"""
+        items = self._chat_bubbles(root, include_own=True)
+        return [it["text"] for it in reversed(items) if it["is_own"]][:max(1, limit)]
+
+    def get_chat_history(self, count: int = 20,
+                         skip_own_prefixes: tuple = ()) -> list[dict]:
+        """聊天窗口内向上滚动，读取最近 count 条对话消息（不含系统/送达确认等）。
+
+        返回 list[dict]，按时间从旧到新：
+          {text, is_own, contact, time_label}
+        - contact: 对方（手表侧）发送方名字；无标注为 ""
+        - is_own:   是否家长侧（自己）发的消息（含从 QQ 转发进来的消息）
+        - time_label: 气泡上方的 App 日期标签（如 "06:56" / "昨天 23:42"）
+        skip_own_prefixes: 自己发的、以这些前缀开头的消息（如 xtc 命令）不计入历史。
+        滚动到顶部或连续两屏无新消息即停止。必须在聊天页调用（调用方保证），
+        键盘需已收起（否则滚动区域被遮挡）。失败返回 []。
+        """
+        try:
+            count = max(1, min(int(count), 100))
+        except (TypeError, ValueError):
+            count = 20
+        prefixes = tuple(p for p in (skip_own_prefixes or ()) if p)
+
+        def skipped(it: dict) -> bool:
+            return bool(it["is_own"] and prefixes
+                        and it["text"].startswith(prefixes))
+        try:
+            screen_h = self.adb.get_screen_size()[1]
+            x = self.adb.get_screen_size()[0] // 2
+        except AdbError:
+            return []
+        # 去重只按 (文本, 发送方) —— 时间标签会随滚动移出屏幕而消失，
+        # 若把标签并入 key，同一条消息跨屏会被重复统计。
+        seen_prev: set[tuple[str, bool]] = set()
+        oldest_first: list[dict] = []  # 时间从旧到新（更旧的新内容整体排在前面）
+        empty_streak = 0
+        max_screens = min(40, 2 + count)
+        try:
+            for _ in range(max_screens):
+                root = self.adb.dump_ui()
+                items = self._chat_bubbles(root, include_own=True)
+                new_items: list[dict] = []
+                for it in items:
+                    if skipped(it):
+                        continue
+                    key = (it["text"], it["is_own"])
+                    if key in seen_prev:
+                        continue
+                    new_items.append(it)
+                for it in items:
+                    if skipped(it):
+                        continue
+                    seen_prev.add((it["text"], it["is_own"]))
+                if new_items:
+                    # 向下翻页 = 露出更早内容（从屏幕上方进入）→ 整体比已收集内容更旧
+                    oldest_first[0:0] = new_items
+                    empty_streak = 0
+                    if len(oldest_first) >= count:
+                        break
+                else:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        break  # 已到顶部 / 没有更多历史
+                # 真机实测：手指自屏幕中上滑到下方 = 看更早消息
+                self.adb.swipe(x, int(screen_h * 0.25), x, int(screen_h * 0.85), 350)
+                time.sleep(1.0)
+            return oldest_first[-count:]
+        except Exception as e:  # noqa: BLE001 读取历史失败不致命
+            self.log("warning", f"读取历史消息异常: {e}")
+            return oldest_first[-count:]
 
     def _latest_from_list(self, root: ET.Element):
         """聊天列表（主页微聊列表）：取最顶部（最新）聊天行的消息预览，返回 (contact, text, time_label)。

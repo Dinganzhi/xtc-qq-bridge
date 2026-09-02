@@ -89,6 +89,10 @@ class ADBController:
         self._sdk: int | None = None
         self._clipboard_ok: bool | None = None
         self._adbkeyboard_ok: bool | None = None
+        # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 ≠ input 物理坐标）
+        self._rotation: int = 0
+        self._rotation_ts: float = 0.0
+        self._phys: tuple[int, int] | None = None
         # uiautomator 同一时间只允许一个连接：跨线程串行化 dump，
         # 避免轮询线程与发送线程同时 dump 导致 "already registered"。
         self._dump_lock = threading.Lock()
@@ -192,12 +196,42 @@ class ADBController:
     def android_version(self) -> str:
         return self.getprop("ro.build.version.release")
 
+    def _phys_size(self) -> tuple[int, int]:
+        """物理屏幕尺寸（wm size 报告值，如 1920x1080）。"""
+        if self._phys is None:
+            try:
+                out = self.shell("wm size")
+                m = re.search(r"(\d+)x(\d+)", out)
+                if m:
+                    self._phys = int(m.group(1)), int(m.group(2))
+            except AdbError:
+                pass
+            if self._phys is None:
+                self._phys = 1920, 1080
+        return self._phys
+
+    def _current_rotation(self) -> int:
+        """当前显示旋转：0/90/180/270（缓存 3 秒，dumpsys 查询较慢）。"""
+        now = time.monotonic()
+        if now - self._rotation_ts < 3.0:
+            return self._rotation
+        try:
+            out = self.shell("dumpsys window displays", timeout=20)
+            m = re.search(r"mCurrentRotation=ROTATION_(\d+)", out)
+            self._rotation = int(m.group(1)) if m else 0
+        except (AdbError, AttributeError, ValueError):
+            self._rotation = 0
+        self._rotation_ts = now
+        return self._rotation
+
     def get_screen_size(self) -> tuple[int, int]:
-        out = self.shell("wm size")
-        m = re.search(r"(\d+)x(\d+)", out)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-        raise AdbError(f"无法获取屏幕尺寸: {out.strip()}")
+        """当前应用的逻辑屏幕尺寸（宽, 高）——uiautomator bounds 与 input 坐标所在空间。
+
+        模拟器被旋转成竖屏（ROTATION_90/270）时逻辑尺寸与物理尺寸互换，
+        例如物理 1920x1080 → 逻辑 1080x1920。发送/读取的左右判定与滑动
+        计算都应使用逻辑尺寸。"""
+        pw, ph = self._phys_size()
+        return (pw, ph) if self._current_rotation() in (0, 180) else (ph, pw)
 
     def get_current_focus(self) -> str:
         """返回当前前台组件，如 'com.xtc.watch/com.xtc.watch.MainActivity'；无则 ''。"""
@@ -213,6 +247,8 @@ class ADBController:
         return ""
 
     # ------------------------------------------------------------------ 操作
+    # 注：`input tap/swipe` 与 uiautomator bounds 处于同一逻辑坐标系
+    # （旋转竖屏时二者同步变成 1080x1920），因此直接透传，不需要坐标变换。
     def tap(self, x: int | float, y: int | float) -> None:
         self.shell(f"input tap {int(x)} {int(y)}")
 
@@ -263,16 +299,26 @@ class ADBController:
             return self._dump_ui_locked(retries, delay)
 
     def _dump_ui_locked(self, retries: int, delay: float) -> ET.Element:
+        """dump 当前窗口 UI 为 XML。每次用唯一文件名，先删后写再删，
+        避免 uiautomator 静默失败（rc=0、错误进 stderr，如桌面动画导致的
+        "could not get idle state"）时读到上一次的旧文件。"""
         last: Exception | None = None
         for i in range(retries):
+            path = f"/sdcard/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
             try:
-                self.shell("uiautomator dump /sdcard/xtc_dump.xml", timeout=60)
-                out = self.shell("cat /sdcard/xtc_dump.xml", timeout=30)
-                if out.strip():
+                self.shell(f"rm -f {path}")
+                self.shell(f"uiautomator dump {path} 2>&1", timeout=60)
+                out = self.shell(f"cat {path}", timeout=30)
+                self.shell(f"rm -f {path}")
+                if out.strip().lstrip().startswith("<?xml"):
                     return ET.fromstring(out)
-                last = AdbError("dump 输出为空")
+                last = AdbError("dump 输出为空或非 XML（界面未空闲？）")
             except (AdbError, ET.ParseError) as e:
                 last = e
+                try:
+                    self.shell(f"rm -f {path}")
+                except AdbError:
+                    pass
             if i < retries - 1:
                 time.sleep(delay)
         raise AdbError(f"UI dump 失败: {last}")

@@ -109,6 +109,24 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                     self._send(200, b"OK")
                 else:
                     self._send(200, b"IGNORED")
+            elif data.get("action") == "history":
+                # /小天才 历史消息 <条数>：读取小天才最近对话并回传
+                user = str(data.get("user_id") or "")
+                group = str(data.get("group_id") or "")
+                if bridge.qq_sender_allowed(user, group):
+                    request_id = str(data.get("request_id") or "")
+                    try:
+                        count = int(data.get("history_count") or 20)
+                    except (TypeError, ValueError):
+                        count = 20
+                    threading.Thread(
+                        target=bridge.fetch_xtc_history,
+                        args=(count, request_id, False),
+                        daemon=True, name="xtc-history",
+                    ).start()
+                    self._send(200, b"OK")
+                else:
+                    self._send(200, b"IGNORED")
             else:
                 self._send(200, b"IGNORED")
 
