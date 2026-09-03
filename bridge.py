@@ -7,6 +7,7 @@ webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -130,12 +131,16 @@ class MessageBridge:
         self._auto_login_enabled = bool(
             (cfg.get("xiaotiancai") or {}).get("auto_login", True))
         # xtc 侧命令（在小天才聊天里直接输入，由本桥程序解析执行，与 QQ 命令隔离）：
-        # 命令前缀。命令去重：_cmd_pending=已入队未完成（防重复入队），
-        # _cmd_handled=执行成功的时间戳表（5 分钟内不重复执行，之后允许再次输入）。
+        # 命令前缀。去重按"身份 (侧, 文本, 时间标签)"：已执行过的命令（文件持久化）
+        # 不再重复执行——即使消息仍是"最新一条"或桥接重启，也不会反复发帮助；
+        # 用户再次输入相同命令（新消息/新时间标签）仍可执行。
         self._xtc_cmd_prefix = str(
             (cfg.get("xiaotiancai") or {}).get("cmd_prefix", "/小天才")).strip()
-        self._cmd_pending: set[str] = set()
-        self._cmd_handled: dict[str, float] = {}
+        self._cmd_pending: dict[str, tuple[str, str]] = {}  # text -> (side, label)
+        self._cmd_done: set[tuple[str, str, str]] = set()
+        self._cmd_done_file = str(Path(__file__).resolve().parent / "data" / "xtc_cmd_done.json")
+        self._cmd_lock = threading.Lock()
+        self._load_cmd_done()
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -182,15 +187,12 @@ class MessageBridge:
                 elif kind == "cmd":
                     # xtc 侧命令（在小天才聊天里输入的 /小天才 xxx，手表侧或家长侧均可）
                     _, text = job
+                    ident = self._cmd_pending.pop(text, None)
                     ok = self._do_cmd_job(text)
-                    self._cmd_pending.discard(text)
-                    if ok:
-                        self._cmd_handled[text] = time.monotonic()
-                        if len(self._cmd_handled) > 100:  # 修剪上限
-                            for k in sorted(self._cmd_handled,
-                                            key=self._cmd_handled.get)[:50]:
-                                del self._cmd_handled[k]
-                    # 回复失败：不加 handled，下一轮轮询自动重试
+                    if ok and ident is not None:
+                        # 执行成功 → 标记为已完成（持久化），同一条消息不再重复执行
+                        self._cmd_done_add(ident[0], text, ident[1])
+                    # 回复失败：不标记，下一轮轮询自动重试
             except Exception as e:  # noqa: BLE001
                 self._log("warning", f"任务处理异常: {e}")
             finally:
@@ -237,14 +239,17 @@ class MessageBridge:
                 # xtc 侧命令（/小天才 …）：手表侧或家长侧输入均可。
                 # 1) 手表侧（对方发来）的命令 → 执行，不转发、不入消息库
                 if is_cmd_text:
-                    self._maybe_xtc_cmd(text)
+                    self._maybe_xtc_cmd("watch", text, time_label)
                 # 2) 家长侧输入的命令：可能被送达确认等新消息盖过（不再是"最新一条"），
-                #    扫最近若干条自己发的消息
+                #    扫最近若干条自己发的消息；跳过桥接自己转发过去的旧命令文本
                 elif own_recent:
-                    for t in own_recent:
-                        if self._xtc_cmd_prefix and t.startswith(self._xtc_cmd_prefix):
-                            self._maybe_xtc_cmd(t)
-                            break
+                    for t, lbl in own_recent:
+                        if not (self._xtc_cmd_prefix and t.startswith(self._xtc_cmd_prefix)):
+                            continue
+                        if self.history.seen("qq2xtc", t):
+                            continue  # 曾经由桥接转发进聊天的文本，不视为新输入的命令
+                        self._maybe_xtc_cmd("own", t, lbl)
+                        break
                 # 普通手表消息 → 转发（命令已被上面拦截，绝不转发/入库）
                 if text and not is_cmd_text:
                     key = ("xtc", contact or "", text)
@@ -703,23 +708,48 @@ class MessageBridge:
     def _xtc_usage(self) -> str:
         return self._XTC_USAGE
 
-    def _maybe_xtc_cmd(self, text: str) -> None:
+    # ------------------------------------------------------------------ 命令去重（身份持久化）
+    def _load_cmd_done(self) -> None:
+        """读取已执行命令身份 (side, text, time_label)。"""
+        try:
+            data = json.loads(Path(self._cmd_done_file).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self._cmd_done = {tuple(x) for x in data if isinstance(x, list) and len(x) == 3}
+        except Exception:  # noqa: BLE001 文件缺失/损坏不致命
+            self._cmd_done = set()
+
+    def _cmd_done_has(self, side: str, text: str, label: str) -> bool:
+        with self._cmd_lock:
+            return (side, text, label) in self._cmd_done
+
+    def _cmd_done_add(self, side: str, text: str, label: str) -> None:
+        with self._cmd_lock:
+            self._cmd_done.add((side, text, label))
+            if len(self._cmd_done) > 300:  # 修剪上限
+                self._cmd_done = set(list(self._cmd_done)[-300:])
+            try:
+                Path(self._cmd_done_file).parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._cmd_done_file + ".tmp"
+                Path(tmp).write_text(
+                    json.dumps([list(x) for x in self._cmd_done], ensure_ascii=False),
+                    encoding="utf-8")
+                Path(tmp).replace(self._cmd_done_file)
+            except Exception:  # noqa: BLE001 写盘失败不影响运行
+                pass
+
+    def _maybe_xtc_cmd(self, side: str, text: str, time_label: str) -> None:
         """命令去重入队（手表侧/家长侧输入共用）。
         - pending：已入队未完成 → 不再重复入队；
-        - handled：执行成功 5 分钟内不重复执行（避免命令仍是最新消息时反复触发）；
-          5 分钟后用户再次输入相同命令可重新执行。
-        回复失败不入 handled，下一轮轮询自动重试。"""
-        now = time.monotonic()
+        - done：执行成功且身份相同（侧+文本+时间标签）→ 不再执行（持久化），
+          因此"消息仍是最新一条"或桥接重启都不会反复触发；
+          用户再次输入相同命令（新消息/新时间标签）仍可执行。
+        回复失败不标记 done，下一轮轮询自动重试。"""
         if text in self._cmd_pending:
             return
-        hts = self._cmd_handled.get(text, 0)
-        if hts and now - hts < 300:
+        label = (time_label or "").strip()
+        if self._cmd_done_has(side, text, label):
             return
-        # 清理过期的 handled
-        stale = [k for k, ts in self._cmd_handled.items() if now - ts >= 300]
-        for k in stale:
-            del self._cmd_handled[k]
-        self._cmd_pending.add(text)
+        self._cmd_pending[text] = (side, label)
         self._log("info", f"[xtc命令] 收到: {text}")
         self._job_queue.put(("cmd", text))
 

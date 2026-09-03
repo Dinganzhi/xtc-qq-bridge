@@ -131,6 +131,9 @@ class Main(star.Star):
     async def on_all_message(self, event: AstrMessageEvent) -> None:
         try:
             self._platform_ids.add(event.session.platform_id)
+            # 机器人自己发出去的消息（NapCat 可能回环）不处理：不转发、不记录活动
+            if self._is_self_message(event):
+                return
             # 无论命令模式开/关，都记录 QQ 活动（xtc 侧 搜索/在线人数 的数据源）
             self._record_activity(event)
             if self.config.get("command_mode", True):
@@ -140,12 +143,42 @@ class Main(star.Star):
             text = (event.message_str or "").strip()
             if not text or text.startswith("/"):
                 return  # 跳过命令本身（命令走 on_xtc_command）
+            if self._looks_like_cmd(text):
+                return  # @机器人/无斜杠形式的命令文本（如"小天才 命令模式"）不转发
             sender_name = event.get_sender_name() or str(event.get_sender_id())
             now = datetime.now().strftime("%m-%d %H:%M")
             message = f"[{now}] [{sender_name}] {text}"
             await self._forward_to_python(self._base_payload(event, message=message))
         except Exception as e:  # noqa: BLE001
             self._lg().exception(f"[xtc_qq_bridge] 全量转发异常: {e}")
+
+    def _is_self_message(self, event: AstrMessageEvent) -> bool:
+        """消息是否机器人自己发出（部分平台会回环自己发过的消息）。"""
+        try:
+            self_id = event.get_self_id()
+            return bool(self_id) and str(event.get_sender_id() or "") == str(self_id)
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _looks_like_cmd(text: str) -> bool:
+        """判断 QQ 文本是否形如对小天才机器人的命令调用（含去斜杠 / @提及 形式），
+        用于防止命令文本在命令模式关闭时被当作普通消息转发。"""
+        t = text.strip()
+        while t.startswith("/"):
+            t = t[1:].lstrip()
+        if t.startswith("@") and " " in t:  # 去掉开头的 @机器人
+            t = t.split(" ", 1)[1].strip()
+        parts = t.split()
+        if not parts or parts[0] != "小天才":
+            return False
+        subs = {"发送", "登录", "自动登录", "初始化", "命令模式", "历史消息",
+                "搜索", "在线人数", "提醒", "帮助", "小天才登录", "help", "发送登录"}
+        if len(parts) == 1:
+            return True  # 单独"小天才"= 帮助
+        if parts[1] in subs:
+            return True
+        return False
 
     def _record_activity(self, event: AstrMessageEvent) -> None:
         """记录一条 QQ 消息活动：(时间, 私聊/群聊, 会话ID, 用户ID, 昵称)。"""
@@ -188,7 +221,11 @@ class Main(star.Star):
             event.set_result(event.plain_result(result))
 
     async def _history_flow(self, event: AstrMessageEvent, args: str) -> None:
-        """/小天才 历史消息 <条数>：让桥接读取小天才最近对话并回传（引用+@ 回复）。"""
+        """/小天才 历史消息 <条数>：让桥接读取小天才最近对话并回传。
+
+        短内容（≤1300 字符）用引用+@ 回复；超长内容直接以纯文本发送到原会话——
+        AstrBot 会把超过 forward_threshold(默认1500) 的纯文本回复包成"合并转发
+        Node"（uin=机器人自己），NapCat 会报错或把内容"发给机器人自己"。"""
         count = 20
         if args:
             try:
@@ -201,8 +238,26 @@ class Main(star.Star):
             return
         result = await self._post_and_wait(event, action="history",
                                            extra={"history_count": count}, timeout=150)
-        if result:
+        if not result:
+            return
+        if len(result) > 1300:
+            await self._send_plain_to_session(event, result)
+        else:
             event.set_result(event.plain_result(result))
+
+    async def _send_plain_to_session(self, event: AstrMessageEvent, text: str) -> None:
+        """直接向事件所在会话发送纯文本（绕过 result_decorate 的合并转发转换）。"""
+        platform = event.session.platform_id
+        if event.get_group_id():
+            session = f"{platform}:GroupMessage:{event.get_group_id()}"
+        else:
+            session = f"{platform}:FriendMessage:{event.get_sender_id()}"
+        try:
+            ok = await self.context.send_message(session, MessageChain().message(text))
+            if not ok:
+                self._lg().error("[xtc_qq_bridge] 历史消息纯文本发送失败（会话/平台不可用）")
+        except Exception as e:  # noqa: BLE001
+            self._lg().exception(f"[xtc_qq_bridge] 历史消息纯文本发送异常: {e}")
 
     def _toggle_command_mode(self, event: AstrMessageEvent) -> None:
         """/小天才 命令模式：本地切换（写回插件配置）。"""

@@ -659,9 +659,10 @@ class Xiaotiancai:
         """返回 (contact, text, time_label, own_text, own_recent)；无法确定时
         (None, None, "", "", [])。
 
-        own_text = 最新一条"自己发的"消息文本；own_recent = 最近若干条自己发的消息
-        （新→旧，供 xtc 侧命令检测；命令可能被送达确认等新消息盖过，需扫最近几条）。
-        复用同一次 dump，避免命令轮询额外开 uiautomator dump。不抛异常。
+        own_text = 最新一条"自己发的"消息文本；
+        own_recent = 最近若干条自己发的消息 [(text, time_label)]（新→旧，供 xtc 侧
+        命令检测；命令可能被送达确认等新消息盖过，需扫最近几条；时间标签用于区分
+        同文本的再次输入）。复用同一次 dump，避免额外开 uiautomator dump。不抛异常。
 
         只在聊天窗口内读取——列表预览无法可靠判断发送方（家长侧手动发送的消息
         也会出现在预览里），会被误当成对方消息转发。轮询层负责确保聊天窗口已打开。"""
@@ -673,7 +674,7 @@ class Xiaotiancai:
                 contact, text, time_label = self._latest_in_chat(root)
                 own_recent = self._own_texts_in_chat(root)
                 return (contact, text, time_label,
-                        own_recent[0] if own_recent else "", own_recent)
+                        own_recent[0][0] if own_recent else "", own_recent)
             return (None, None, "", "", [])  # 不在聊天页不读列表（防误转发家长侧消息）
         except Exception as e:  # noqa: BLE001 读取失败不致命
             self.log("warning", f"读取消息异常: {e}")
@@ -822,13 +823,15 @@ class Xiaotiancai:
     def _latest_own_in_chat(self, root: ET.Element) -> str:
         """聊天页内最新一条"自己发的"消息文本（系统/垃圾已过滤）；无则 ""。"""
         own = self._own_texts_in_chat(root)
-        return own[0] if own else ""
+        return own[0][0] if own else ""
 
-    def _own_texts_in_chat(self, root: ET.Element, limit: int = 8) -> list[str]:
-        """聊天页内最近若干条"自己发的"消息文本（新→旧，系统/垃圾已过滤）。
-        命令可能被送达确认等后续消息盖过（不再是"最新一条"），检测时扫最近几条。"""
+    def _own_texts_in_chat(self, root: ET.Element, limit: int = 8) -> list[tuple[str, str]]:
+        """聊天页内最近若干条"自己发的"消息（新→旧，系统/垃圾已过滤）。
+        返回 [(text, time_label)]。命令可能被送达确认等后续消息盖过（不再是
+        "最新一条"），检测时扫最近几条；时间标签用于区分同文本的再次输入。"""
         items = self._chat_bubbles(root, include_own=True)
-        return [it["text"] for it in reversed(items) if it["is_own"]][:max(1, limit)]
+        return [(it["text"], it["time_label"]) for it in reversed(items)
+                if it["is_own"]][:max(1, limit)]
 
     def get_chat_history(self, count: int = 20,
                          skip_own_prefixes: tuple = ()) -> list[dict]:
