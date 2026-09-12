@@ -473,12 +473,12 @@ class MessageBridge:
                 status = self.xtc.login(phone, password)
         except Exception as e:  # noqa: BLE001
             self._log("error", f"自动登录异常: {e}")
-            self._login_reply(request_id, "小天才自动登录出错，请手动检查模拟器")
+            self._login_reply(request_id, "小天才自动登录出错，请手动检查目标 Android 环境")
             return
         if status == "risk":
             self._pending_login_notify = True  # 等待用户手动完成安全验证
-            self._login_reply(request_id, "需要安全验证：请手动打开模拟器完成验证")
-            self._notify("小天才登录触发安全验证，请手动打开模拟器完成验证")
+            self._login_reply(request_id, "需要安全验证：请手动打开小天才 App 所在窗口完成验证")
+            self._notify("小天才登录触发安全验证，请手动打开对应窗口完成验证")
         elif status == "fail":
             self._pending_login_notify = True  # 避免每 10 分钟反复重试刷屏
             self._login_reply(request_id, "登录失败（账号或密码错误等），请检查配置或手动登录")

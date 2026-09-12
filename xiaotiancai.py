@@ -58,16 +58,28 @@ class Xiaotiancai:
 
     # ------------------------------------------------------------------ 生命周期
     def launch(self) -> bool:
+        """启动小天才 App，返回是否确认到达前台。
+
+        WSA 上 `am start -n` 偶发失败，adb_controller.launch_app() 内部已做多策略
+        启动 + 前台轮询；这里只负责重试与日志。
+        """
         self.log("info", f"启动小天才 App: {self.package}")
-        try:
-            self.adb.launch_app(self.package, self.main_activity)
-            ok = self.adb.wait_for_activity(self.package, timeout=20)
-            if not ok:
-                self.log("warning", "小天才 App 启动后未检测到前台窗口")
-            return ok
-        except AdbError as e:
-            self.log("error", f"启动失败: {e}")
+        if not self.adb.package_installed(self.package):
+            self.log("error", f"设备上没有安装 {self.package}（请先在模拟器/WSA 里安装并登录小天才 App）")
             return False
+        last = ""
+        for attempt in range(1, 4):
+            try:
+                used = self.adb.launch_app(self.package, self.main_activity)
+                if used and self.adb.is_in_foreground(self.package):
+                    return True
+                last = f"activity={used or '(未解析)'} 前台={self.current_activity() or '(未知)'}"
+            except AdbError as e:
+                last = str(e)
+            self.log("warning", f"启动小天才未确认（第 {attempt}/3 次）：{last}")
+            time.sleep(2.0 * attempt)
+        self.log("error", f"启动失败: {last}")
+        return False
 
     def current_activity(self) -> str:
         return self.adb.get_current_focus() or ""
@@ -98,7 +110,7 @@ class Xiaotiancai:
     def require_login(self) -> bool:
         ok = self.is_logged_in()
         if not ok and not self._warned_not_login:
-            self.log("warning", "小天才 App 未登录家长账号：请在模拟器中完成登录（登录前无法读取/发送消息）")
+            self.log("warning", "小天才 App 未登录家长账号：请在目标 Android 环境（模拟器/WSA/Waydroid/真机）里完成登录（登录前无法读取/发送消息）")
             self._warned_not_login = True
         return ok
 
@@ -485,6 +497,65 @@ class Xiaotiancai:
             self.adb.find_element(root, content_desc=contact))
 
     # ------------------------------------------------------------------ 发送消息
+    def chat_input_text(self) -> str:
+        """读取聊天输入框当前文本；读不到返回 ''。"""
+        try:
+            root = self.adb.dump_ui(retries=1, delay=0.0)
+        except AdbError:
+            return ""
+        edit = self._find_input(root)
+        if edit is None:
+            return ""
+        return edit.get("text", "") or ""
+
+    def input_verifier(self, text: str):
+        """给 adb.input_text 用的校验回调：输入框里已出现目标文本，或发送按钮已出现
+        （小天才 App 只在输入框有内容时才显示发送按钮）即视为注入成功。"""
+        needle = (text or "").strip()
+
+        def _verify() -> bool:
+            try:
+                root = self.adb.dump_ui(retries=1, delay=0.0)
+            except AdbError:
+                return True  # dump 失败无法判定，不阻塞发送流程
+            edit = self._find_input(root)
+            if edit is not None:
+                cur = edit.get("text", "") or ""
+                if needle and needle in cur:
+                    return True
+                if cur.strip():
+                    # 输入框里有内容但和目标不一致（例如剪贴板粘错），
+                    # 说明注入通道是通的，由调用方清空重输，不在这里当作失败
+                    self.log("warning", f"输入框内容与预期不一致: {cur[:40]!r}")
+                    return True
+                return False
+            # 没有输入框（切走了/语音模式）：退而看发送按钮是否出现
+            return self._find_send(root) is not None
+
+        return _verify
+
+    def _clear_chat_input(self) -> None:
+        """清空聊天输入框，避免上一次失败残留的内容被拼在新消息前面。"""
+        try:
+            root = self.adb.dump_ui(retries=1, delay=0.0)
+        except AdbError:
+            return
+        edit = self._find_input(root)
+        if edit is None:
+            return
+        cur = (edit.get("text", "") or "").strip()
+        if not cur:
+            return
+        self.adb.tap_element(edit)
+        time.sleep(0.6)
+        self.adb.clear_text_field()
+        time.sleep(0.3)
+        left = self.chat_input_text().strip()
+        if left:
+            for _ in range(len(left) + 5):   # 兜底：逐字符删除
+                self.adb.keyevent(67)
+            time.sleep(0.2)
+
     def send_message(self, text: str) -> bool:
         try:
             # 快路径：缓存命中且在聊天页 → 用缓存的输入框/发送按钮坐标，不 dump
@@ -493,7 +564,7 @@ class Xiaotiancai:
                 sx, sy = self._cache["send_xy"]
                 self.adb.tap(ix, iy)
                 time.sleep(1.5)
-                if self.adb.input_text(text):
+                if self.adb.input_text(text, verify=self.input_verifier(text)):
                     time.sleep(0.8)
                     self.adb.tap(sx, sy)
                     time.sleep(1.0)
@@ -502,6 +573,7 @@ class Xiaotiancai:
                 self.log("warning", "快路径发送未确认，回退完整流程")
 
             self._dismiss_blockers()
+            self._clear_chat_input()
             root = self.adb.dump_ui()
             input_node = self._find_input(root)
             if input_node is None:
@@ -516,7 +588,7 @@ class Xiaotiancai:
                 return False
             self.adb.tap_element(input_node)
             time.sleep(1.5)  # 等待软键盘弹出完成，避免输入被吞
-            if not self.adb.input_text(text):
+            if not self.adb.input_text(text, verify=self.input_verifier(text)):
                 return False
             time.sleep(0.5)
             root = self.adb.dump_ui()
@@ -639,7 +711,7 @@ class Xiaotiancai:
     def keyboard_visible(self) -> bool:
         """软键盘是否弹出（dumpsys input_method 判断）。"""
         try:
-            return "mInputShown=true" in (self.adb.shell("dumpsys input_method") or "")
+            return self.adb.ime_shown()
         except AdbError:
             return False
 

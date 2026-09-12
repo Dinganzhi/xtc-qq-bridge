@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import locale
 import sys
 import threading
 import time
@@ -19,8 +20,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
+def read_text_auto(path: str) -> str:
+    """读配置文本：优先 UTF-8（含 BOM），失败再按系统 ANSI（中文 Windows = GBK）读。
+
+    中文 Windows 上 Python 的默认文件编码是 cp936，而配置模板/大多数编辑器
+    保存的是 UTF-8；不显式处理会在读取时报 UnicodeDecodeError 或读成乱码。
+    """
+    raw = Path(path).read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+    for enc in ("utf-8", locale.getpreferredencoding(False), "gbk"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def load_config(path: str) -> dict:
-    text = Path(path).read_text(encoding="utf-8")
+    text = read_text_auto(path)
     try:
         import yaml
         return yaml.safe_load(text) or {}
@@ -37,7 +55,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="小天才 ↔ QQ 桥接（AstrBot 插件版）")
     ap.add_argument("--config", default="config.yaml", help="配置文件路径")
     ap.add_argument("--check", action="store_true", help="环境自检后退出")
-    ap.add_argument("--debug", choices=["dump-ui"], help="调试命令")
+    ap.add_argument("--debug", choices=["dump-ui", "adb-info"], help="调试命令")
     ap.add_argument("--once", action="store_true", help="轮询一轮后退出")
     ap.add_argument("--no-adbkeyboard", action="store_true", help="跳过 ADBKeyBoard 自动安装")
     args = ap.parse_args()
@@ -56,15 +74,25 @@ def main() -> None:
     adb = ADBController(adb_path=adb_cfg.get("path", ""),
                         host=adb_cfg.get("host", "127.0.0.1"),
                         port=int(adb_cfg.get("port", 5555)),
-                        serial=adb_cfg.get("serial", ""), logger=log)
+                        serial=adb_cfg.get("serial", ""), logger=log,
+                        extra_ports=adb_cfg.get("extra_ports") or [],
+                        wsa_port=int(adb_cfg.get("wsa_port", 0) or 0),
+                        input_retries=int(adb_cfg.get("input_retries", 2) or 2))
 
     if args.debug == "dump-ui":
         from tools import dump_ui
         sys.exit(dump_ui.run(adb))
 
-    adb.ensure_connected()
-    log.info(f"ADB 就绪: {adb.serial} | Android {adb.android_version()} "
-             f"| 屏幕 {adb.get_screen_size()}")
+    if args.debug == "adb-info":
+        print(adb.dump_diagnostics())
+        sys.exit(0)
+
+    adb.ensure_connected(auto_launch_wsa=bool(adb_cfg.get("auto_launch_wsa", False)),
+                         auto_launch_emulator=bool(adb_cfg.get("auto_launch_emulator", False)))
+    log.info(f"ADB 就绪: {adb.device_summary()} | 屏幕 {adb.get_screen_size()}")
+    if adb.is_wsa() or adb.runtime_tag() in ("Waydroid", "Genymotion"):
+        log.info(f"检测到 {adb.runtime_tag()} 环境（输入法={adb.current_ime() or '未知'}，"
+                 f"软键盘显示={adb.ime_shown()}）")
 
     # 关闭窗口/转场/属性动画：持续动画会让 uiautomator dump 一直 "could not get
     # idle state"（静默失败并读到旧文件），关闭后 dump 才能稳定工作。
@@ -130,24 +158,41 @@ def main() -> None:
 
 
 def run_check() -> int:
-    from adb_controller import ADBController
-    adb = ADBController()
+    from adb_controller import (ADBController, AdbError, IS_WINDOWS, available_launchers,
+                                platform_tag, waydroid_present, wsa_adb_port, wsa_installed)
+    try:
+        adb = ADBController()
+    except AdbError as e:
+        print(f"FAIL 查找 adb: {e}")
+        return 1
+    print(f"平台: {platform_tag()}")
     print(f"adb: {adb.adb_path}")
+    if IS_WINDOWS:
+        print(f"内置探测：WSA 已安装={wsa_installed()} "
+              f"注册表端口={wsa_adb_port()} 候选端口={adb._port_candidates()}")
+    else:
+        print(f"内置探测：Waydroid={waydroid_present()} "
+              f"可用启动器={available_launchers() or '(无)'} 候选端口={adb._port_candidates()}")
     if not adb.is_connected():
         try:
             adb.connect()
         except Exception as e:  # noqa: BLE001
             print(f"FAIL 连接: {e}")
             return 1
-    print(f"设备: {adb.serial}")
-    print(f"Android: {adb.android_version()} (SDK {adb.android_sdk()})")
-    print(f"屏幕: {adb.get_screen_size()}")
-    print(f"当前前台: {adb.get_current_focus() or '(未知)'}")
+    if not adb.is_connected():
+        print("FAIL 连接：没有在线设备")
+        print(adb._connect_hint())
+        return 1
+    print(adb.dump_diagnostics())
     try:
         root = adb.dump_ui()
         print(f"UI dump: OK（{len(list(root.iter('node')))} 节点）")
     except Exception as e:  # noqa: BLE001
         print(f"UI dump: FAIL {e}")
+    if not adb.adbkeyboard_ready():
+        print("提示: 未检测到 ADBKeyBoard（main.py 启动时会自动安装本地 APK）")
+    elif adb.current_ime() != "com.android.adbkeyboard/.AdbIME":
+        print(f"提示: 当前输入法为 {adb.current_ime() or '(未知)'}，发送前会自动切到 ADBKeyBoard")
     print("自检完成。")
     return 0
 

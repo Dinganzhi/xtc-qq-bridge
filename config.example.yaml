@@ -4,14 +4,22 @@
 #  建议阅读 README.md 后再进行编辑
 # =====================================================================
 
-# ---------- ADB / 模拟器 ----------
+# ---------- ADB / 模拟器 / 容器（Windows / Linux / macOS 通用） ----------
+# 设备查找顺序：已有的在线设备 → 环境变量 ADB_SERIAL → WSA 端口（仅 Windows）
+#   → 常见 adb 端口（5555 通用 / 16384 MuMu / 62001 夜神 / 21503 逍遥 / 5556 Waydroid）。
+# 已有设备永远优先，不会被抢掉。
 adb:
-  path: ""                                       # 留空自动探测（LDPlayer / MuMu 目录 → PATH）
+  path: ""                                       # 留空自动探测（雷电/MuMu/Waydroid/WindowsApps/PATH）
   host: "127.0.0.1"
-  port: 5555                                     # 雷电/MuMu 实例0 的 adb 端口（MuMu 另有 16384 亦可用）
-  serial: ""                                     # 留空自动选择唯一在线设备
+  port: 5555                                     # 通用 adb 端口（MuMu 16384、夜神 62001、逍遥 21503）
+  wsa_port: 0                                    # WSA/WSABuilds 的 ADB 端口（仅 Windows）；0=自动读注册表
+  extra_ports: []                                # 额外尝试的端口，例如 [58526, 5555, 62001]
+  serial: ""                                     # 留空自动选择唯一在线设备（如 "127.0.0.1:5555"）
+  auto_launch_wsa: false                         # 找不到设备时自动拉起 WSA 客户端（仅 Windows）
+  auto_launch_emulator: false                    # 找不到设备时自动拉起模拟器/容器（如 Linux 的 Waydroid）
   heartbeat_interval: 10
   disable_animations: true                       # 关闭系统动画（uiautomator dump 需要界面空闲才能工作）
+  input_retries: 2                               # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
 
 # ---------- 转发（QQ 侧） ----------
 forward:
@@ -42,7 +50,7 @@ xiaotiancai:
   package: "com.xtc.watch"
   main_activity: ".MainActivity"
   check_interval: 2
-  auto_install_adbkeyboard: true                 # 优先用捆绑的 APK，其次在线下载
+  auto_install_adbkeyboard: true                 # 先查设备上有没有；没有才用项目目录里的本地 APK（不联网）
   login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
     phone: ""                                    # 手机号
     password: ""                                 # 密码（注意：不是验证码）

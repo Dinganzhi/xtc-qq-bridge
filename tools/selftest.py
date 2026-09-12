@@ -44,9 +44,21 @@ def main() -> int:
     # 3. 系统信息
     try:
         ver, sdk, size = adb.android_version(), adb.android_sdk(), adb.get_screen_size()
-        check("系统信息", bool(ver and size), f"Android {ver} (SDK {sdk}) 屏幕 {size}")
+        check("系统信息", bool(ver and size),
+              f"Android {ver} (SDK {sdk}) 屏幕 {size} "
+              f"{'[WSA]' if adb.is_wsa() else ''} 序列号 {adb.serial}")
     except AdbError as e:
         check("系统信息", False, str(e))
+
+    # 3.5 输入通道探测（WSA 上最容易出问题的一环）
+    try:
+        check("ADBKeyBoard 已安装", adb.adbkeyboard_ready(),
+              "未安装：main.py 启动时会自动安装（或 python main.py --no-adbkeyboard 跳过）")
+        check("当前输入法", True, f"{adb.current_ime() or '(未知)'} | 键盘显示={adb.ime_shown()}")
+        check("剪贴板通道", adb.probe_clipboard(),
+              "写入+回读一致才可用；WSA 上不可用时注入只走 ADBKeyBoard 广播")
+    except AdbError as e:
+        check("输入通道", False, str(e))
 
     # 4. UI dump
     try:
@@ -74,10 +86,17 @@ def main() -> int:
     check("读取最新消息（不崩溃即可）", True,
           f"contact={contact!r} text={text!r}（未登录时为空属预期）")
 
-    # 8. 中文输入能力（只探测，不实际输入）
-    ok = adb.input_text("selftest-ascii")
-    check("文本注入可用", ok,
-          "ADBKeyBoard 未装时仅支持 ASCII；中文需装 ADBKeyBoard（main.py 会自动尝试）")
+    # 8. 中文输入能力（真机验证：只在聊天页/输入框聚焦时才真正注入）
+    try:
+        xtc.ensure_input_clean()
+        ok = adb.input_text("selftest-测试", verify=xtc.input_verifier("selftest-测试"))
+        check("文本注入可用", ok,
+              "失败时：确认 ADBKeyBoard 为当前输入法（adb shell ime set "
+              "com.android.adbkeyboard/.AdbIME）且输入框已聚焦")
+        if ok:
+            adb.clear_text_field()
+    except AdbError as e:
+        check("文本注入可用", False, str(e))
 
     fails = [r for r in results if not r[1]]
     print(f"\n===== 自检完成：{len(results) - len(fails)}/{len(results)} 通过 =====")

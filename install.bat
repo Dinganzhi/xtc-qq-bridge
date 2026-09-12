@@ -57,6 +57,17 @@ if not exist "%SRC%config.yaml" (
     echo [OK] config.yaml exists - keep as-is
 )
 
+REM ---------- 6. ADBKeyBoard APK (local file only, no download) ----------
+if exist "%SRC%keyboardservice-debug.apk" (
+    echo [OK] ADBKeyBoard APK ready - auto-installed to the device only if missing
+) else if exist "%SRC%ADBKeyBoard.apk" (
+    echo [OK] ADBKeyBoard APK ready - auto-installed to the device only if missing
+) else (
+    echo [WARN] No ADBKeyBoard APK in the project folder.
+    echo        Ignore if the device already has ADBKeyBoard; otherwise Chinese
+    echo        text cannot be typed - put the APK back into the project root.
+)
+
 echo.
 echo ============================================
 echo   NEXT STEPS
@@ -67,6 +78,6 @@ echo      "xtc_qq_bridge" in WebUI
 echo   3. Configure NapCat adapter, login QQ bot
 echo   4. Send the bot a message once
 echo      (learns platform id)
-echo   5. python main.py
+echo   5. Double-click start.bat  (or: python main.py)
 echo ============================================
 pause

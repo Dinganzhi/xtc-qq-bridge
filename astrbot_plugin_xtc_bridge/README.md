@@ -6,9 +6,10 @@
 ## 安装
 
 1. 把整个 `xtc_qq_bridge` 目录放到 AstrBot 插件目录：
-   - 桌面版（本机）：`C:\Users\<你的用户名>\.astrbot\data\plugins\xtc_qq_bridge\`
-   - 或 pip 版：`<AstrBot 根目录>/data/plugins/xtc_qq_bridge/`
-   - 仓库根目录的 `install.bat` 会自动完成复制。
+   - Windows：`%USERPROFILE%\.astrbot\data\plugins\xtc_qq_bridge\`
+   - Linux / macOS：`~/.astrbot/data/plugins/xtc_qq_bridge/`
+   - pip 版：`<AstrBot 根目录>/data/plugins/xtc_qq_bridge/`
+   - 仓库根目录的 `install.bat`（Windows）/ `install.sh`（Linux、macOS）会自动完成复制。
 2. 启动 AstrBot，在 WebUI「插件管理」中启用 `xtc_qq_bridge`。
 3. 打开插件配置，与 Python 侧 `config.yaml` 对齐：
    - `http_port`（默认 11452）↔ `forward.plugin.base_url`
