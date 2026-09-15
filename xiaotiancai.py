@@ -85,27 +85,62 @@ class Xiaotiancai:
         return self.adb.get_current_focus() or ""
 
     def is_logged_in(self) -> bool:
-        """通过 Activity 名 + 界面文案判断是否已登录家长账号。
-        小天才 App 不在前台（如桌面）时一律视为未登录。"""
+        """通过 Activity 名 + 登录页专属控件判断是否已登录家长账号。
+
+        判定逻辑（避免误报"未登录"）：
+        - App 不在前台 → False（无法判断）；
+        - Activity 名含 welcome/login/register/signin → False；
+        - **出现密码输入框**（账号密码登录页才有的 inputType=password / 密码提示文案）→ False；
+        - 出现"获取验证码/短信验证码登录"等短信登录页专属元素 → False；
+        - 出现配置的 login_markers（默认「注册/登录」「立即登录」，**不含泛化的"登录"**）
+          → False；
+        - 其余情况（例如聊天列表/微聊主页里恰好有"登录"字样）→ True。
+        """
         act = self.current_activity()
         if not act.startswith(self.package):
             return False
-        for marker in ("welcome", "login", "register", "signin"):
-            if marker in act.lower():
-                return False
+        low = act.lower()
+        if any(marker in low for marker in ("welcome", "login", "register", "signin")):
+            return False
         try:
             root = self.adb.dump_ui()
         except AdbError:
             return False
-        texts = [n.get("text", "") for n in root.iter("node")]
-        joined = "".join(texts)
-        for marker in self.ui.get("login_markers", ["注册/登录", "立即登录", "登录"]):
-            if marker in joined:
-                return False
+        if self._looks_like_login_page(root):
+            return False
         # 首启隐私协议弹窗 = 尚未进入 App，视为未登录
+        joined = "".join(n.get("text", "") or "" for n in root.iter("node"))
         if "温馨提示" in joined and ("同意" in joined or "不同意" in joined):
             return False
         return True
+
+    def _looks_like_login_page(self, root: ET.Element) -> bool:
+        """登录页判定：只认登录页**专属**特征，避免把已登录界面里的"登录"字样误判。
+
+        专属特征：
+        1) 密码输入框（EditText 的 password="true"，或提示文案含"密码"）；
+        2) 短信登录页元素（获取验证码 / 短信验证码登录）；
+        3) 配置的 login_markers（默认只含「注册/登录」「立即登录」这类强标记）。
+        """
+        texts = [(n.get("text", "") or "") for n in root.iter("node")]
+        hint = "".join(texts) + "".join(
+            (n.get("content-desc", "") or "") for n in root.iter("node"))
+        for marker in ("获取验证码", "短信验证码登录", "验证码登录"):
+            if marker in hint:
+                return True
+        for n in root.iter("node"):
+            if not (n.get("class", "") or "").endswith("EditText"):
+                continue
+            if (n.get("password", "") or "").lower() == "true":
+                return True
+            if "密码" in (n.get("text", "") or "") or "密码" in (n.get("content-desc", "") or ""):
+                return True
+        for marker in self.ui.get("login_markers", ["注册/登录", "立即登录"]):
+            if not marker:
+                continue
+            if any(marker in (t or "") for t in texts):
+                return True
+        return False
 
     def require_login(self) -> bool:
         ok = self.is_logged_in()
@@ -113,6 +148,125 @@ class Xiaotiancai:
             self.log("warning", "小天才 App 未登录家长账号：请在目标 Android 环境（模拟器/WSA/Waydroid/真机）里完成登录（登录前无法读取/发送消息）")
             self._warned_not_login = True
         return ok
+
+    # ------------------------------------------------------------------ 表单输入（登录页用）
+    def _field_verifier(self, field_node=None):
+        """生成 input_text 的校验回调工厂：必须**按行精确匹配**目标文本。
+
+        为什么不用"输入框非空即成功"：登录页有多个 EditText，把手机号写进密码框、
+        或残留上一次的内容时，非空判定会误报成功，导致后续逻辑"找不到控件"反复重输
+        （用户遇到的密码被输好几遍）。这里要求某一行的文本恰好等于目标值；
+        **密码框显示为掩码**（••••/圆点）时按"已清空且长度一致"判断，
+        否则掩码文本永远不等于明文密码 → 会被误判为没输进去而重复输入。
+        """
+        masked = self._is_masked_field(field_node)
+
+        def _verify_text(expected: str):
+            want = (expected or "").strip()
+
+            def _v() -> bool:
+                try:
+                    root = self.adb.dump_ui(retries=1, delay=0.0)
+                except AdbError:
+                    return True  # 读不到界面时不阻塞流程
+                rows = self._input_row_texts(root)
+                if not rows:
+                    return True
+                for r in rows:
+                    cur = (r or "").strip()
+                    if cur == want:
+                        return True
+                    if masked and cur and self._is_mask_text(cur) and len(cur) == len(want):
+                        return True
+                return False
+
+            return _v
+
+        return _verify_text
+
+    @staticmethod
+    def _is_masked_field(node) -> bool:
+        if node is None:
+            return False
+        try:
+            if (node.get("password", "") or "").lower() == "true":
+                return True
+            hint = (node.get("text", "") or "") + (node.get("content-desc", "") or "")
+            return "密码" in hint
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _is_mask_text(text: str) -> bool:
+        """掩码文本判定：全部由圆点/星号/实心点构成（允许尾部空格）。"""
+        s = (text or "").strip()
+        if not s:
+            return False
+        return all(ch in "•·*＊●○□■" for ch in s)
+
+    def _input_row_texts(self, root: ET.Element) -> list[str]:
+        """当前界面上所有输入类控件的文本（EditText 优先，其次聚焦节点）。"""
+        rows: list[str] = []
+        for n in root.iter("node"):
+            cls = n.get("class", "") or ""
+            if cls.endswith("EditText"):
+                rows.append(n.get("text", "") or "")
+        if rows:
+            return rows
+        for n in root.iter("node"):
+            if (n.get("focusable", "") or "") == "true" and (n.get("text", "") or ""):
+                rows.append(n.get("text", "") or "")
+        return rows
+
+    def fill_login_form(self, edits: list, values: list) -> tuple[bool, list[str]]:
+        """按行填入登录表单，返回 (是否全部成功, 最终各行文本)。
+
+        每个字段：点击聚焦 → 清空（必要时删两行，避免残留）→ 注入 → 按行校验。
+        校验失败只"清空重填一次"，绝不重复追加，因此不会出现"密码被输好几遍"。
+        密码框显示为掩码时按长度校验（见 _field_verifier）。
+        """
+        final: list[str] = []
+        for edit, value in zip(edits, values):
+            if not value:
+                continue
+            ok_field = False
+            for attempt in (1, 2):
+                self.adb.tap_element(edit)
+                time.sleep(1.2)
+                self.adb.clear_text_field()   # 尽量清空前后文本（含掩码字段的残留）
+                time.sleep(0.4)
+                ok_field = self.adb.input_text(
+                    value, verify=self._field_verifier(edit)(value), retries=2)
+                time.sleep(0.4)
+                final = self._input_row_texts(self._current_root())
+                if self._field_looks_ok(edit, value, final):
+                    ok_field = True
+                    break
+                self.log("warning",
+                         f"第 {attempt} 次输入未确认（当前输入框内容={final!r}），清空后重试")
+            if not ok_field:
+                return False, final
+        return True, final
+
+    def _field_looks_ok(self, edit, value: str, rows: list[str]) -> bool:
+        """最终判定：明文逐行精确匹配；掩码字段按"非空且长度等于目标长度"。"""
+        want = (value or "").strip()
+        if any((r or "").strip() == want for r in rows):
+            return True
+        if self._is_masked_field(edit):
+            for r in rows:
+                cur = (r or "").strip()
+                if cur and self._is_mask_text(cur) and len(cur) == len(want):
+                    return True
+                if cur == want:
+                    return True
+        return False
+
+    def _current_root(self) -> ET.Element:
+        try:
+            return self.adb.dump_ui(retries=1, delay=0.0)
+        except AdbError:
+            return ET.Element("hierarchy")
 
     # ------------------------------------------------------------------ 账密登录
     def login(self, phone: str, password: str) -> str:
@@ -163,22 +317,24 @@ class Xiaotiancai:
             self.log("debug",
                      f"切换后前台={self.current_activity()} "
                      f"EditText={len(self.adb.find_elements(root, class_name='EditText'))}")
-            # 3) 找手机号 + 密码两个输入框
+            # 3) 找手机号 + 密码两个输入框（确认确实在账密页，避免把密码写进短信页）
             edits = self.adb.find_elements(root, class_name="EditText")
             edits.sort(key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
             if len(edits) < 2:
                 self.log("error", "未找到账密输入框（页面结构变化？运行 python tools/dump_ui.py 查看登录页）")
                 return "error"
-            # 4) 输入手机号、密码（先清空再输入）
-            for edit, value in ((edits[0], phone), (edits[1], password)):
-                self.adb.tap_element(edit)
-                time.sleep(1.5)
-                for _ in range(20):
-                    self.adb.keyevent(67)  # 清空可能残留的内容
-                if not self.adb.input_text(value):
-                    self.log("error", "文本注入失败（ADBKeyBoard 未就绪？）")
-                    return "error"
-                time.sleep(0.5)
+            if not self._is_account_login_page(root):
+                self.log("error", "当前不是账号密码登录页（只有 1 个输入框或缺少账密入口）"
+                                  "，已中止，避免把密码输错位置")
+                return "error"
+            # 4) 输入手机号、密码（点击聚焦 → 清空 → 注入 → **按行精确校验**）
+            ok_fill, final_rows = self.fill_login_form(
+                [edits[0], edits[1]], [phone, password])
+            if not ok_fill:
+                self.log("error",
+                         f"登录表单输入未确认：输入框内容={final_rows!r}"
+                         "（运行 python tools/dump_ui.py 查看登录页控件）")
+                return "error"
             # 5) 勾选协议（若存在且未勾选）
             root = self.adb.dump_ui()
             cb = self._first(
@@ -558,16 +714,18 @@ class Xiaotiancai:
 
     def send_message(self, text: str) -> bool:
         try:
-            # 快路径：缓存命中且在聊天页 → 用缓存的输入框/发送按钮坐标，不 dump
+            # 快路径：缓存命中且在聊天页 → 用缓存的输入框/发送按钮坐标，不做 UI dump
+            # 说明：这里**不做逐次输入校验**（每次校验要 dump 一次界面，手表/模拟器上
+            # 每次 1-2 秒，长消息会明显变慢）；发送是否成功由 _send_confirmed 兜底判断。
             if self._fast_path_available():
                 ix, iy = self._cache["input_xy"]
                 sx, sy = self._cache["send_xy"]
                 self.adb.tap(ix, iy)
-                time.sleep(1.5)
-                if self.adb.input_text(text, verify=self.input_verifier(text)):
-                    time.sleep(0.8)
+                time.sleep(1.2)
+                if self.adb.input_text(text, verify=lambda: True):
+                    time.sleep(0.6)
                     self.adb.tap(sx, sy)
-                    time.sleep(1.0)
+                    time.sleep(0.8)
                     if self._send_confirmed(text):
                         return True
                 self.log("warning", "快路径发送未确认，回退完整流程")
@@ -597,7 +755,7 @@ class Xiaotiancai:
                 self.log("warning", "未找到发送按钮，改用回车发送")
                 self.adb.keyevent(66)  # KEYCODE_ENTER
             else:
-                self.adb.tap_element(send_node)
+                self.adb.tap_element(send_node)   # 顺带缓存发送按钮坐标（下次走快路径）
             time.sleep(1.0)
             if not self._send_confirmed(text):
                 self.log("warning", "消息可能未发出（输入框仍保留内容），请检查小天才 App 与手表网络")

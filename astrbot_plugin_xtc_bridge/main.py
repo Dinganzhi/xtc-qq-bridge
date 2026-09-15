@@ -40,7 +40,7 @@ _USAGE = ("用法：\n"
           "/小天才 登录          手动登录小天才\n"
           "/小天才 自动登录      开启/关闭十分钟自动登录检测\n"
           "/小天才 初始化        检测并恢复界面状态（登录/聊天/输入框）\n"
-          "/小天才 历史消息 <条数>  查看小天才最近对话记录（1-100，默认20）\n"
+          "/小天才 历史消息 [条数] [来源]  查看历史记录（默认20条，可只看 手表/QQ群/QQ私聊）\n"
           "/小天才 命令模式      切换命令模式（开=仅命令转发；关=所有新消息都转发）")
 
 
@@ -221,23 +221,27 @@ class Main(star.Star):
             event.set_result(event.plain_result(result))
 
     async def _history_flow(self, event: AstrMessageEvent, args: str) -> None:
-        """/小天才 历史消息 <条数>：让桥接读取小天才最近对话并回传。
+        """/小天才 历史消息 [条数] [来源]：让桥接读取本地消息库并回传。
 
+        来源可选：手表 / QQ群 [群号] / QQ私聊 [QQ号]，留空=全部（每条都带来源标注）。
         短内容（≤1300 字符）用引用+@ 回复；超长内容直接以纯文本发送到原会话——
         AstrBot 会把超过 forward_threshold(默认1500) 的纯文本回复包成"合并转发
         Node"（uin=机器人自己），NapCat 会报错或把内容"发给机器人自己"。"""
         count = 20
-        if args:
-            try:
-                count = int(args)
-            except ValueError:
-                event.set_result(event.plain_result("用法：/小天才 历史消息 <条数>（1-100，默认20）"))
-                return
+        source = ""
+        parts = (args or "").split()
+        if parts:
+            if parts[0].isdigit():
+                count = int(parts[0])
+                parts = parts[1:]
+            if parts:
+                source = " ".join(parts).strip()
         if not 1 <= count <= 100:
             event.set_result(event.plain_result("条数需在 1-100 之间"))
             return
-        result = await self._post_and_wait(event, action="history",
-                                           extra={"history_count": count}, timeout=150)
+        result = await self._post_and_wait(
+            event, action="history",
+            extra={"history_count": count, "history_source": source}, timeout=150)
         if not result:
             return
         if len(result) > 1300:

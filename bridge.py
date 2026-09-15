@@ -138,6 +138,11 @@ class MessageBridge:
             (cfg.get("xiaotiancai") or {}).get("cmd_prefix", "/小天才")).strip()
         self._cmd_pending: dict[str, tuple[str, str]] = {}  # text -> (side, label)
         self._cmd_done: set[tuple[str, str, str]] = set()
+        # 会话级"这条命令已经处理过"记忆：(side, text) -> 已处理时的 App 时间标签。
+        # 解决"同一条 /小天才 反复触发"：命令消息会一直挂在"最新一条"上，若 App 的
+        # 时间标签也一直不变（同一分钟/解析不出时间），仅靠 (side, text, label) 判重
+        # 不足；这里标签一变（说明是用户新输入的一条）才允许再次执行。
+        self._cmd_seen_text: dict[tuple[str, str], str] = {}
         self._cmd_done_file = str(Path(__file__).resolve().parent / "data" / "xtc_cmd_done.json")
         self._cmd_lock = threading.Lock()
         self._load_cmd_done()
@@ -181,9 +186,10 @@ class MessageBridge:
                     _, request_id = job
                     self._do_init_job(request_id)
                 elif kind == "history":
-                    # 小天才历史消息：count + 回传方式（request_id 或写入小天才聊天）
-                    _, count, request_id, into_chat = job
-                    self._do_history_job(count, request_id, into_chat)
+                    # 小天才历史消息：count + 回传方式（request_id 或写入小天才聊天）+ 来源过滤
+                    _, count, request_id, into_chat = job[:4]
+                    src = job[4] if len(job) > 4 else ""
+                    self._do_history_job(count, request_id, into_chat, src)
                 elif kind == "cmd":
                     # xtc 侧命令（在小天才聊天里输入的 /小天才 xxx，手表侧或家长侧均可）
                     _, text = job
@@ -237,9 +243,12 @@ class MessageBridge:
                 is_cmd_text = bool(self._xtc_cmd_prefix and text
                                    and text.startswith(self._xtc_cmd_prefix))
                 # xtc 侧命令（/小天才 …）：手表侧或家长侧输入均可。
-                # 1) 手表侧（对方发来）的命令 → 执行，不转发、不入消息库
+                # 1) 手表侧（对方发来）的命令 → 执行，不转发、不入消息库；
+                #    已被处理过（同一侧+同一文本+同一时间标签）就不再进入执行流程，
+                #    这样桥接自己发出去的"结果/帮助"被读回时也不会再被当成新命令。
                 if is_cmd_text:
-                    self._maybe_xtc_cmd("watch", text, time_label)
+                    if not self._cmd_text_handled("watch", text, time_label):
+                        self._maybe_xtc_cmd("watch", text, time_label)
                 # 2) 家长侧输入的命令：可能被送达确认等新消息盖过（不再是"最新一条"），
                 #    扫最近若干条自己发的消息；跳过桥接自己转发过去的旧命令文本
                 elif own_recent:
@@ -248,6 +257,8 @@ class MessageBridge:
                             continue
                         if self.history.seen("qq2xtc", t):
                             continue  # 曾经由桥接转发进聊天的文本，不视为新输入的命令
+                        if self._cmd_text_handled("own", t, lbl):
+                            continue  # 已经执行过这条（含桥接自己发出去的回复）
                         self._maybe_xtc_cmd("own", t, lbl)
                         break
                 # 普通手表消息 → 转发（命令已被上面拦截，绝不转发/入库）
@@ -258,7 +269,9 @@ class MessageBridge:
                         # 本地消息库归档（发送成功等系统提示已被读取层过滤，
                         # 时间优先取 App 时间标签解析出的真实时刻）
                         ts = self._label_epoch(time_label)
-                        self.msgs.append("xtc", contact or "", text, t=ts)
+                        self.msgs.append("xtc", contact or "", text, t=ts,
+                                         source=self._xtc_source(contact),
+                                         source_id=contact or "")
                         try:
                             ok = self._forward(contact, text, time_label)
                         except Exception as e:  # noqa: BLE001
@@ -384,7 +397,7 @@ class MessageBridge:
         if ok:
             # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
             self.history.mark("qq2xtc", text)
-            self._archive_qq_send(text)
+            self._archive_qq_send(text, user_id=user_id, group_id=group_id)
         # 命令类文本（/小天才 …）的"结果"由命令任务自己写回小天才聊天，
         # 不再向 QQ 发"发送成功"确认，避免误导。
         is_cmd_text = bool(self._xtc_cmd_prefix
@@ -402,8 +415,23 @@ class MessageBridge:
                 self._send_confirm(user_id, group_id, result_msg)
 
     # ------------------------------------------------------------------ 送达确认
-    def _archive_qq_send(self, text: str) -> None:
-        """QQ → 小天才 发送成功后归档到本地消息库。
+    # 历史消息来源标签：明确每条消息是"谁从哪儿发的"
+    def _xtc_source(self, contact: str = "") -> str:
+        """小天才（手表）侧来源：手表/家长侧在 App 内说的都归这里。"""
+        who = self._display_name(contact) if contact else ""
+        return f"手表{('・' + who) if who else ''}"
+
+    @staticmethod
+    def _qq_source(user_id: str = "", group_id: str = "") -> str:
+        """QQ 侧来源：QQ群 <群号> / QQ私聊 <QQ号>。"""
+        if group_id:
+            return f"QQ群 {group_id}"
+        if user_id:
+            return f"QQ私聊 {user_id}"
+        return "QQ"
+
+    def _archive_qq_send(self, text: str, user_id: str = "", group_id: str = "") -> None:
+        """QQ → 小天才 发送成功后归档到本地消息库（带来源标签）。
         - 发送的整条消息是插件格式 `[MM-DD HH:MM] [QQ昵称] 内容` → 拆出昵称与内容；
         - 命令文本（/小天才 …）与系统提示不入库。"""
         m = re.match(r"^\[(\d{2}-\d{2} \d{2}:\d{2})\] \[(.+?)\] (.*)$", text)
@@ -418,7 +446,9 @@ class MessageBridge:
             return
         if self._xtc_cmd_prefix and content.startswith(self._xtc_cmd_prefix):
             return
-        self.msgs.append("qq", sender, content)
+        self.msgs.append("qq", sender, content,
+                         source=self._qq_source(user_id, group_id),
+                         source_id=str(group_id or user_id or ""))
 
     def _confirm_delivery(self) -> bool:
         return bool((self.cfg.get("target") or {}).get("confirm_delivery", True))
@@ -590,28 +620,56 @@ class MessageBridge:
 
     # ------------------------------------------------------------------ 小天才历史消息（QQ 与 xtc 侧共用）
     def fetch_xtc_history(self, count: int = 20, request_id: str = "",
-                          into_chat: bool = False) -> str:
+                          into_chat: bool = False, source: str = "") -> str:
         """读取小天才最近对话历史（入队，由工作线程串行执行，保证与发送顺序）。
         - QQ 侧：request_id 回传插件，插件在原会话引用+@ 回复；
-        - xtc 侧：into_chat=True 时结果写进小天才聊天。
+        - xtc 侧：into_chat=True 时结果写进小天才聊天；
+        - source：可选来源过滤（手表 / QQ私聊 <号> / QQ群 <群号>），留空为全部。
         返回 'queued'。count 自动夹到 1..100。"""
         try:
             count = max(1, min(int(count), 100))
         except (TypeError, ValueError):
             count = 20
-        self._job_queue.put(("history", count, request_id or "", bool(into_chat)))
+        self._job_queue.put(("history", count, request_id or "", bool(into_chat),
+                             str(source or "")))
         return "queued"
 
-    def _do_history_job(self, count: int, request_id: str, into_chat: bool) -> None:
+    def _match_source(self, entries: list[dict], source: str) -> list[dict]:
+        """按来源过滤：支持「手表」「QQ私聊 <号>」「QQ群 <群号>」或裸的号
+        （只写号码时，私聊/群聊都能命中）。"""
+        want = (source or "").strip()
+        if not want:
+            return entries
+        if want in ("手表", "xtc", "watch", "家长", "宝贝"):
+            return [e for e in entries if e.get("kind") == "xtc"]
+        if want in ("qq", "QQ", "私聊", "群聊"):
+            if want in ("私聊",):
+                return [e for e in entries if "[QQ私聊" in (e.get("source") or "")]
+            if want in ("群聊",):
+                return [e for e in entries if "[QQ群" in (e.get("source") or "")]
+            return [e for e in entries if e.get("kind") == "qq"]
+        # 具体来源：优先 source_id 精确匹配，其次标签包含
+        hit = [e for e in entries if str(e.get("source_id") or "") == want]
+        if hit:
+            return hit
+        return [e for e in entries if want in (e.get("source") or "")]
+
+    def _do_history_job(self, count: int, request_id: str, into_chat: bool,
+                        source: str = "") -> None:
         """工作线程内：读本地消息库 → 格式化回传（不滚动界面，不依赖聊天页状态）。"""
-        entries = self.msgs.recent(count)
+        entries = self.msgs.recent(1000)          # 先取全部，再做来源过滤
+        if source:
+            entries = self._match_source(entries, source)
+        entries = entries[-count:]
         if not entries:
-            reply = ("小天才历史消息：暂无本地消息记录"
+            reply = (f"小天才历史消息（来源：{source}）：暂无本地消息记录"
+                     if source else
+                     "小天才历史消息：暂无本地消息记录"
                      "（消息库自桥接启用后自动积累真实对话）")
         else:
             reply = self._format_history_text(entries, count,
                                               max_chars=900 if into_chat else 3800)
-        self._log("info", f"[历史消息] 本地消息库 {len(entries)} 条，回传方式: "
+        self._log("info", f"[历史消息] 来源={source or '全部'} {len(entries)} 条，回传方式: "
                           f"{'写入小天才聊天' if into_chat else 'QQ'}")
         if into_chat:
             self._reply_into_xtc(reply)
@@ -627,12 +685,15 @@ class MessageBridge:
 
     def _format_history_text(self, entries: list[dict], count: int,
                              max_chars: int = 3800) -> str:
-        """把本地消息库条目格式化为文本。行格式：[MM-DD HH:MM] 发送方: 内容。
+        """把本地消息库条目格式化为文本。行格式：
+            [MM-DD HH:MM] [来源] 发送方: 内容
+        来源明确写出「手表」「QQ私聊 <号>」「QQ群 <群号>」，末尾附来源统计。
         - 日期用明确数字（昨天/前天 等已由归档时间戳换算成具体日期，如 09-01）；
         - 跳过系统提示（发送成功/发送失败）与命令文本（防御性过滤）；
         - 超长从最旧截断。"""
         sys_prefixes = self._system_msg_prefixes()
         lines: list[str] = []
+        tally: dict[str, int] = {}
         for e in entries:
             text = (e.get("text") or "").strip()
             if not text:
@@ -642,13 +703,22 @@ class MessageBridge:
             if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
                 continue
             sender = (e.get("sender") or "").strip()
-            if e.get("kind") == "xtc":
+            source = (e.get("source") or "").strip()
+            if not source:  # 兼容旧数据（没有 source 字段）
+                if e.get("kind") == "xtc":
+                    source = self._xtc_source(sender)
+                    sender = self._display_name(sender)
+                else:
+                    source = "QQ"
+            elif e.get("kind") == "xtc":
                 sender = self._display_name(sender)
             try:
                 dt = datetime.fromtimestamp(float(e.get("t") or 0))
             except (TypeError, ValueError, OSError):
                 dt = datetime.now()
-            lines.append(f"[{dt:%m-%d} {dt:%H:%M}] {sender}: {text}")
+            short = self._short_source(source)
+            tally[short] = tally.get(short, 0) + 1
+            lines.append(f"[{dt:%m-%d} {dt:%H:%M}] [{short}] {sender}: {text}")
         if not lines:
             return "小天才历史消息：暂无本地消息记录"
         dropped = 0
@@ -659,7 +729,17 @@ class MessageBridge:
         if dropped:
             header += f"，省略更早 {dropped} 条"
         header += "）："
-        return header + "\n" + "\n".join(lines)
+        summary = "来源统计：" + "、".join(
+            f"{k} {v} 条" for k, v in sorted(tally.items(), key=lambda x: -x[1]))
+        return header + "\n" + "\n".join(lines) + "\n" + summary
+
+    @staticmethod
+    def _short_source(source: str) -> str:
+        """来源标签里的「手表・昵称」简化为「手表」，避免每行过长（手表上打字慢）。"""
+        s = (source or "").strip()
+        if s.startswith("手表"):
+            return "手表"
+        return s
 
     def _system_msg_prefixes(self) -> list:
         ui = ((self.cfg.get("xiaotiancai") or {}).get("ui") or {})
@@ -703,7 +783,7 @@ class MessageBridge:
                   "/小天才 搜索 <昵称>          白名单QQ私聊/群聊中找人（附最后消息时间）\n"
                   "/小天才 在线人数 <分钟>      最近N分钟白名单QQ会话发言人数（1-60）\n"
                   "/小天才 提醒 <群号> <QQID> [内容]    在指定QQ群内@提醒该用户\n"
-                  "/小天才 历史消息 <条数>      查看最近对话记录（1-100，默认20）")
+                  "/小天才 历史消息 [条数] [来源]   查看对话记录（默认20条，可只看 手表/QQ群/QQ私聊）")
 
     def _xtc_usage(self) -> str:
         return self._XTC_USAGE
@@ -737,18 +817,44 @@ class MessageBridge:
             except Exception:  # noqa: BLE001 写盘失败不影响运行
                 pass
 
+    def _cmd_text_handled(self, side: str, text: str, time_label: str) -> bool:
+        """这条命令（同侧同文本同标签）是否已经处理过——用于轮询时跳过重复触发。"""
+        key = (side, (text or "").strip())
+        label = (time_label or "").strip()
+        with self._cmd_lock:
+            if self._cmd_seen_text.get(key) == label:
+                return True
+            return (side, (text or "").strip(), label) in self._cmd_done
+
     def _maybe_xtc_cmd(self, side: str, text: str, time_label: str) -> None:
         """命令去重入队（手表侧/家长侧输入共用）。
+
+        三层去重，彻底解决"同一条命令被反复执行/反复回复"：
         - pending：已入队未完成 → 不再重复入队；
-        - done：执行成功且身份相同（侧+文本+时间标签）→ 不再执行（持久化），
-          因此"消息仍是最新一条"或桥接重启都不会反复触发；
-          用户再次输入相同命令（新消息/新时间标签）仍可执行。
-        回复失败不标记 done，下一轮轮询自动重试。"""
-        if text in self._cmd_pending:
-            return
+        - done（持久化）：身份相同（侧+文本+时间标签）→ 不再执行，重启也不重复；
+        - **seen_text（会话级）**：同一侧的同一条命令文本，只要 App 时间标签没变，
+          就不再处理（含"桥接自己发出去的回复/结果"被读回的情况）。
+          标签变了说明是用户新输入的一条（哪怕文本一样），仍会执行。
+        """
         label = (time_label or "").strip()
-        if self._cmd_done_has(side, text, label):
-            return
+        key = (side, text)
+        with self._cmd_lock:
+            if text in self._cmd_pending:
+                # 仍在队列里/正在执行：同一次输入不重复入队；
+                # 若是用户新发的一条（标签变了），把标签更新为新值，
+                # 这样执行成功后 done 记录的是最新身份，不会因旧标签被反复触发。
+                if label and self._cmd_pending[text][1] != label:
+                    self._cmd_pending[text] = (side, label)
+                return
+            if self._cmd_seen_text.get(key) == label:
+                return
+            if (side, text, label) in self._cmd_done:
+                self._cmd_seen_text[key] = label
+                return
+            self._cmd_seen_text[key] = label
+            if len(self._cmd_seen_text) > 200:
+                recent = list(self._cmd_seen_text.items())[-200:]
+                self._cmd_seen_text = dict(recent)
         self._cmd_pending[text] = (side, label)
         self._log("info", f"[xtc命令] 收到: {text}")
         self._job_queue.put(("cmd", text))
@@ -785,18 +891,22 @@ class MessageBridge:
         return self._reply_into_xtc(reply)
 
     def _cmd_history(self, args: str):
-        """返回 None=已执行（写回聊天）；str=帮助列表（参数错误时）。"""
-        if args:
-            try:
-                n = int(args)
-            except ValueError:
-                return self._xtc_usage()
-            if not 1 <= n <= 100:
-                return self._xtc_usage()
-        else:
-            n = 20
+        """参数：[条数] [来源]。返回 None=已执行（写回聊天）；str=帮助列表（参数错误）。"""
+        n = 20
+        source = ""
+        parts = (args or "").split()
+        if parts:
+            if parts[0].isdigit():
+                n = int(parts[0])
+                if not 1 <= n <= 100:
+                    return self._xtc_usage()
+                parts = parts[1:]
+            else:
+                n = 20
+            if parts:
+                source = " ".join(parts).strip()
         # 已处于工作线程：直接同步执行历史读取任务（结果写入小天才聊天）
-        self._do_history_job(n, "", into_chat=True)
+        self._do_history_job(n, "", into_chat=True, source=source)
         return None
 
     def _cmd_search(self, args: str) -> str:
