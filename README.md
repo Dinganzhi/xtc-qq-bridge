@@ -230,7 +230,8 @@ project/
 | `adb.auto_launch_wsa` | 找不到设备时自动拉起 WSA 客户端（仅 Windows，默认 false） |
 | `adb.auto_launch_emulator` | 找不到设备时自动拉起模拟器/容器（如 Linux 的 Waydroid，默认 false） |
 | `adb.input_retries` | 文本注入重试轮数（默认 2） |
-| `adb.dump_retries` / `adb.dump_delay` | UI dump 默认重试次数/间隔（默认 2 / 0.8s；交互路径自动用更快的参数） |
+| `adb.dump_retries` / `adb.dump_delay` | UI dump 默认重试次数/间隔（默认 2 / 0.8s，逐轮递增等待界面空闲；交互路径自动用更快的参数） |
+| `adb.dump_timeout` | 单次 `uiautomator dump` 超时（秒，默认 60） |
 | `adb.focus_cache_ttl` | 前台组件缓存秒数（默认 1.5；减少 dumpsys，点击/发送更快） |
 | `forward.mode` | `plugin`=走 AstrBot 插件；`log`=仅打印调试 |
 | `target.xtc_contact` | 小天才联系人名（打开聊天用） |
@@ -273,7 +274,8 @@ adb:
   disable_animations: true     # 关系统动画（uiautomator dump 需要界面空闲）
   input_retries: 2             # 文本注入重试轮数
   dump_retries: 2              # UI dump 重试次数
-  dump_delay: 0.8              # UI dump 重试间隔（秒）
+  dump_delay: 0.8              # UI dump 重试间隔（秒，逐轮递增）
+  dump_timeout: 60             # 单次 uiautomator dump 超时（秒）
   focus_cache_ttl: 1.5         # 前台组件缓存（秒）
 
 # ---------- 转发（QQ 侧） ----------
@@ -565,7 +567,7 @@ python tools/wsa_net_guard.py --test
 | 日志"启动小天才未确认" | 用 `python main.py --debug dump-ui` 看前台是不是 `com.xtc.watch`；`--debug adb-info` 看 `focus` 字段。App 未安装会直接报错 |
 | 中文发不出去 / 发出去是旧内容 | `--debug adb-info` 看 `adbkeyboard_ready` 与 `ime`：必须 `com.android.adbkeyboard/.AdbIME`；`clipboard_ok=false` 时不要依赖剪贴板 |
 | 输入框有残留导致内容拼接 | 已内置发送前清空；若仍出现，检查 `adb.input_retries` 与聊天页是否稳定 |
-| uiautomator dump 失败 | 系统动画未关闭（`adb.disable_animations: true`）；界面有持续动画/弹窗。dump 已支持 `/dev/tty` 快路径 + 文件回退 |
+| **uiautomator dump 失败 / 反复出现 `cat: /sdcard/xtc_dump_*.xml: No such file or directory`** | 根因是 `uiautomator` 没写出文件（最常见是 `ERROR: could not get idle state.`：界面一直不空闲，如转场/加载动画、弹窗、键盘光标闪烁；其次是 `/sdcard` 未挂载或无写权限）。现已：① 优先走 `uiautomator dump /dev/tty` 快路径（不落盘）；② 落盘自动换 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` 三个目录；③ 读取改用 `exec-out cat`；④ 重试逐轮递增等待，并自动重设动画缩放；⑤ **报错里带 uiautomator 的真实原因 + 当前前台组件**（不再只报 cat）。仍出现时：调大 `adb.dump_retries` / `adb.dump_delay`，确认 `adb.disable_animations: true`，用 `/小天才 初始化` 清理界面，或看 `python main.py --debug adb-info` 里的 `last_dump_error` |
 
 ---
 
@@ -670,8 +672,21 @@ python tools/wsa_net_guard.py --test
 "读不到界面"绝不重发，避免重复消息。
 
 速度优化：UI dump 优先 `uiautomator dump /dev/tty`（一次 shell 调用拿到 XML，失败再回退
-"写文件->cat->删文件"）；交互路径用 `retries=2, delay=0.3` 的快速 dump；
-前台组件与登录态都带短缓存；等待时间由 `ui.interaction_delay` 控制。
+"写文件 -> 读取 -> 删文件"，且读取走 `exec-out cat`）；交互路径用 `retries=2, delay=0.3`
+的快速 dump；前台组件与登录态都带短缓存；等待时间由 `ui.interaction_delay` 控制。
+
+**UI dump 的三层策略与可读报错**（`adb_controller._dump_ui_locked`）：
+
+| 层 | 动作 | 作用 |
+|---|---|---|
+| 1 | `uiautomator dump /dev/tty` | 不落盘，一次 shell 调用拿到 XML（最快，也绕开 `/sdcard` 写不进去的问题） |
+| 2 | 落盘 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` | `/sdcard` 未挂载/无权限时自动换目录；读文件用 `exec-out cat`（二进制直出，不做换行转换） |
+| 3 | 重试逐轮递增等待 + 重设动画缩放 + 最后再试 `--compressed` | 等转场/动画结束；动画设置被系统恢复时补救 |
+
+失败时抛出的错误形如：
+`UI dump 失败: /dev/tty: ERROR: could not get idle state.；/sdcard: 读取 ... 失败: 文件不存在 | ...（界面一直不空闲：...可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面）｜当前前台=com.xtc.watch/.ChatActivity`
+——即**真实原因 + 当前前台 + 怎么处理**，而上层（打开聊天/读消息/发送）遇到读不到界面时
+只记一条节流后的 warning 并稍后重试，不再整轮报 ERROR、也不再影响后续轮询。
 
 ## 6. 日志与可观测性
 

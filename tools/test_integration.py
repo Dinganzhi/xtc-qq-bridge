@@ -361,6 +361,88 @@ def test_diagnose_fields() -> None:
     check("识别当前输入法", "adbkeyboard" in (info.get("ime") or ""))
 
 
+# ---------------------------------------------------------------- UI dump 失败诊断
+class DumpAdb(FakeAdb):
+    """模拟 uiautomator 落盘失败（could not get idle state）/ 快路径可用等场景。"""
+
+    def __init__(self, tty_xml: str = "", file_xml: str = "", idle: bool = True):
+        super().__init__()
+        self.tty_xml = tty_xml
+        self.file_xml = file_xml
+        self.idle = idle
+        self.tty_calls: list[str] = []
+        self.file_calls: list[str] = []
+        self.execout_calls: list[str] = []
+
+    def run(self, args, timeout=None, binary=False, check=True):
+        if args and args[0] == "exec-out":
+            self.execout_calls.append(" ".join(args))
+            return (self.file_xml.encode("utf-8") if self.file_xml else b""), ""
+        return super().run(args, timeout=timeout, binary=binary, check=check)
+
+    def _shell(self, sh: str) -> str:
+        if "uiautomator dump" in sh:
+            if "/dev/tty" in sh:
+                self.tty_calls.append(sh)
+                if self.tty_xml:
+                    return f"UI hierchary dumped to: /dev/tty\n{self.tty_xml}\n"
+                return "ERROR: could not get idle state.\n" if self.idle else ""
+            self.file_calls.append(sh)
+            if self.idle:
+                return "ERROR: could not get idle state.\n"      # 静默失败：不写文件
+            return "UI hierchary dumped to: /sdcard/x.xml\n"
+        if sh.startswith(("cat ", "rm -f ", "test ")):
+            return ""        # 文件不存在 -> 复现用户看到的 "cat: ... No such file"
+        return super()._shell(sh)
+
+
+def test_ui_dump_tty_fast_path() -> None:
+    """快路径：`uiautomator dump /dev/tty` 一次调用拿到 XML（不落盘、不 cat）。"""
+    ctl, _ = make_controller()
+    ctl.serial = "127.0.0.1:58526"
+    fake = DumpAdb(tty_xml=chat_xml(""))
+    ctl._run = fake.run  # type: ignore[method-assign]
+    root = ctl.dump_ui(retries=1)
+    check("快路径返回 XML 树", len(list(root.iter("node"))) > 0)
+    check("只试了 /dev/tty（没有落盘尝试）",
+          len(fake.tty_calls) == 1 and not fake.file_calls,
+          f"tty={len(fake.tty_calls)} file={len(fake.file_calls)}")
+
+
+def test_ui_dump_idle_error_is_readable() -> None:
+    """落盘失败时必须报出 uiautomator 的**真实原因**（而不是误导性的 cat 报错）。"""
+    ctl, _ = make_controller()
+    ctl.serial = "127.0.0.1:58526"
+    fake = DumpAdb(idle=True)
+    ctl._run = fake.run  # type: ignore[method-assign]
+    try:
+        ctl.dump_ui(retries=2)
+        check("dump 失败时抛 AdbError", False, "没有抛异常")
+    except ac.AdbError as e:
+        msg = str(e)
+        check("报错包含真实原因（could not get idle state）",
+              "idle" in msg.lower(), msg[:160])
+        check("报错包含当前前台组件", "当前前台" in msg, msg[-70:])
+        check("报错附带可行动提示（动画/调参）",
+              "dump_retries" in msg or "初始化" in msg, msg[:220])
+        check("整体是可读的 'UI dump 失败: ...'", msg.startswith("UI dump 失败"), msg[:40])
+    check("失败原因记录到诊断字段", bool(ctl._last_dump_detail), ctl._last_dump_detail[:100])
+    check("尝试过 /data/local/tmp 兜底目录",
+          any("/data/local/tmp" in c for c in fake.file_calls), str(fake.file_calls[:3]))
+
+
+def test_ui_dump_file_fallback_when_tty_unusable() -> None:
+    """/dev/tty 不可用时回退文件方案（用 exec-out cat 读取）仍应成功。"""
+    ctl, _ = make_controller()
+    ctl.serial = "127.0.0.1:58526"
+    fake = DumpAdb(tty_xml="", file_xml=chat_xml(""), idle=False)
+    ctl._run = fake.run  # type: ignore[method-assign]
+    root = ctl.dump_ui(retries=1)
+    check("回退路径拿到 XML", len(list(root.iter("node"))) > 0)
+    check("确实走过 uiautomator 文件方案", bool(fake.file_calls), str(fake.file_calls[:2]))
+    check("用 exec-out 读取 dump 文件", bool(fake.execout_calls), str(fake.execout_calls[:2]))
+
+
 def test_adbkeyboard_already_installed_skips_install() -> None:
     """设备上已有 ADBKeyBoard -> 不装 APK，只确保它是默认输入法。"""
     ctl, fake = make_controller()
@@ -410,7 +492,10 @@ def main() -> int:
                test_input_plain_swallowed_b64_rescue, test_input_all_channels_dead,
                test_input_clipboard_confirmed_then_paste, test_input_ascii_only_fallback,
                test_input_skips_clipboard_when_unsupported, test_clear_residue_before_send,
-               test_diagnose_fields, test_adbkeyboard_already_installed_skips_install,
+               test_diagnose_fields,
+               test_ui_dump_tty_fast_path, test_ui_dump_idle_error_is_readable,
+               test_ui_dump_file_fallback_when_tty_unusable,
+               test_adbkeyboard_already_installed_skips_install,
                test_adbkeyboard_installs_from_local_apk,
                test_adbkeyboard_missing_local_apk_no_remote):
         print(f"--- {fn.__name__} ---")

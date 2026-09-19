@@ -106,6 +106,11 @@ _WSA_COMMON_PORTS = [58526, 58527, 58525, 6520, 6521]
 #   5556   = Waydroid 多实例；6520 = WSA 旧端口
 _EMULATOR_COMMON_PORTS = [5555, 16384, 7555, 21503, 62001, 62025, 5556]
 
+# uiautomator dump 的落盘目录候选（按可写性排序）。
+#   /sdcard 未挂载或 scoped storage 拦截时会写不进去（表现为 "cat: ... No such file"），
+#   /data/local/tmp 对 shell 用户一定可写，作为兜底。
+_DUMP_DIRS = ("/sdcard", "/data/local/tmp", "/storage/emulated/0")
+
 # 没有在线设备时可尝试自动拉起的模拟器/容器（Linux 优先 Waydroid）：
 #   命令 -> (可执行文件候选, 参数列表)
 _LAUNCHERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -426,7 +431,7 @@ class ADBController:
                  serial: str = "", timeout: float = 30.0, logger=None,
                  extra_ports: list[int] | None = None, wsa_port: int = 0,
                  input_retries: int = 2, dump_retries: int = 2, dump_delay: float = 0.8,
-                 focus_ttl: float = 1.5):
+                 focus_ttl: float = 1.5, dump_timeout: float = 60.0):
         self.adb_path = find_adb(adb_path)
         self.host = host
         self.port = port
@@ -440,6 +445,10 @@ class ADBController:
         # 参数（retries=2, delay=0.3），避免"按个按钮要好几秒"。
         self.dump_retries = max(1, int(dump_retries or 1))
         self.dump_delay = max(0.0, float(dump_delay or 0.0))
+        # 单次 uiautomator dump 的超时（界面卡住时不至于把整条流程挂死）
+        self.dump_timeout = max(5.0, float(dump_timeout or 60.0))
+        # 最近一次 dump 失败的详细原因（供 --check / 诊断输出；便于排障）
+        self._last_dump_detail = ""
         # 前台 component 缓存：dumpsys 每次要 0.3~1s，短时间内的连续判断直接复用，
         # 命中点击/按键后立即失效（界面已变化）。
         self.focus_ttl = max(0.0, float(focus_ttl or 0.0))
@@ -983,42 +992,126 @@ class ADBController:
             return ""
         return out[start:end + len("</hierarchy>")]
 
-    def _dump_ui_locked(self, retries: int, delay: float) -> ET.Element:
-        """dump 当前窗口 UI 为 XML。
+    @staticmethod
+    def _short_reason(text: str, limit: int = 200) -> str:
+        """把 ADB/uiautomator 的多行输出压成一行短原因（写进异常信息用）。"""
+        return " ".join(str(text or "").split())[:limit]
 
-        快路径：`uiautomator dump /dev/tty` 直接把 XML 打到 stdout —— 一次 shell 调用
-        就拿到结果，比"写文件 -> cat -> 删文件"的 3 次调用快一半以上。
-        快路径失败（部分镜像不支持 / 界面未空闲）再回退到文件方案：
-        每次用唯一文件名，先删后写再删，避免 uiautomator 静默失败（rc=0、错误进
-        stderr，如动画导致的 "could not get idle state"）时读到上一次的旧文件。
+    def _parse_dump(self, xml: str) -> ET.Element:
+        try:
+            return ET.fromstring(xml)
+        except ET.ParseError as e:
+            raise AdbError(f"UI dump XML 解析失败: {e}") from e
+
+    def _read_dump_file(self, path: str) -> tuple[str, str]:
+        """读取设备上的 dump 文件，返回 (内容, 失败说明)。
+
+        用 `exec-out cat`（二进制直出，不经过 shell 的换行/编码转换）；不可用时回退
+        `shell cat`。**失败说明里会带上真实原因**（例如 "No such file or directory"），
+        这样上层日志不再只出现误导性的 "cat: ... No such file"。
         """
-        last: Exception | None = None
+        out, err = self._run(["exec-out", "cat", path], timeout=30, binary=True, check=False)
+        data = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
+        if "<?xml" in data:
+            return data, ""
+        alt = self.try_shell(f"cat {path}", timeout=30)
+        if "<?xml" in alt:
+            return alt, ""
+        detail = (err or "").strip() or (alt or "").strip() or data.strip()
+        return "", f"读取 {path} 失败: {self._short_reason(detail) or '文件不存在'}"
+
+    def _dump_via_tty(self) -> tuple[str, str]:
+        """快路径：`uiautomator dump /dev/tty` 直接把 XML 打到 stdout（一次 shell 调用，不落盘）。"""
+        try:
+            out = self.shell("uiautomator dump /dev/tty 2>&1", timeout=self.dump_timeout)
+        except AdbError as e:
+            return "", f"/dev/tty: {self._short_reason(str(e))}"
+        xml = self._extract_xml(out)
+        if xml:
+            return xml, ""
+        return "", f"/dev/tty: {self._short_reason(out) or '没有 XML 输出'}"
+
+    def _dump_via_file(self, compressed: bool = False) -> tuple[str, str]:
+        """文件方案：依次在多个可写目录里尝试落盘（/sdcard 不可用时自动换目录）。"""
+        flag = " --compressed" if compressed else ""
+        details: list[str] = []
+        for base in _DUMP_DIRS:
+            path = f"{base}/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
+            try:
+                self.try_shell(f"rm -f {path}", timeout=15)
+                out = self.try_shell(f"uiautomator dump{flag} {path} 2>&1",
+                                     timeout=self.dump_timeout)
+                data, why = self._read_dump_file(path)
+                self.try_shell(f"rm -f {path}", timeout=15)
+                if data:
+                    return data, ""
+                details.append(f"{base}: {why or self._short_reason(out) or '未生成文件'}")
+            except AdbError as e:
+                details.append(f"{base}: {self._short_reason(str(e))}")
+                self.try_shell(f"rm -f {path}", timeout=15)
+        return "", " | ".join(details)
+
+    def _looks_like_idle_error(self, details: list) -> bool:
+        return any("idle" in d.lower() for d in details)
+
+    def _reapply_animations(self) -> None:
+        """重设动画缩放（有些镜像/重启后会恢复默认，导致界面永不"空闲"）。"""
+        for key in ("window_animation_scale", "transition_animation_scale",
+                    "animator_duration_scale"):
+            self.try_shell(f"settings put global {key} 0", timeout=15)
+        self.logger.debug("已重新关闭系统动画（UI dump 空闲性重试）")
+
+    def _dump_failure_message(self, details: list) -> str:
+        """组装**可读、可行动**的失败原因（含 uiautomator 的真实报错 + 当前前台）。"""
+        joined = "；".join(d for d in details if d)
+        self._last_dump_detail = joined
+        low = joined.lower()
+        hint = ""
+        if "idle" in low:
+            hint = ("（界面一直不空闲：多为转场/加载动画、弹窗或键盘光标；已重设动画并延长等待重试。"
+                    "可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面）")
+        elif "no such file" in low or "not exist" in low or "文件不存在" in low:
+            hint = ("（uiautomator 没有写出文件：常见于界面未空闲、/sdcard 未挂载或没有写权限；"
+                    "已自动改用 /data/local/tmp 等目录重试）")
+        focus = ""
+        try:
+            focus = self.get_current_focus(use_cache=False)
+        except Exception:  # noqa: BLE001 诊断信息拿不到不影响抛出
+            focus = ""
+        return (f"UI dump 失败: {joined or '未知原因'}{hint}"
+                f"｜当前前台={focus or '(未知)'}")
+
+    def _dump_ui_locked(self, retries: int, delay: float) -> ET.Element:
+        """dump 当前窗口 UI 为 XML（多策略 + 可读报错）。
+
+        顺序：
+          1) 快路径 `uiautomator dump /dev/tty`（一次 shell 调用，不依赖文件系统）；
+          2) 文件方案：`/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0`，
+             先删后写再读；读取用 `exec-out cat`；
+          3) 重试之间递进等待（等转场/动画结束），并重设一次动画缩放；
+          4) 最后再试一次 `--compressed`。
+        失败时抛出的信息包含 uiautomator 的**真实报错**与当前前台组件，
+        不会再只显示 "cat: ...: No such file or directory" 这种误导性原因。
+        """
+        details: list[str] = []
         for i in range(retries):
-            try:
-                out = self.shell("uiautomator dump /dev/tty 2>/dev/null", timeout=60)
-                xml = self._extract_xml(out)
-                if xml:
-                    return ET.fromstring(xml)
-            except (AdbError, ET.ParseError) as e:
-                last = e
-            path = f"/sdcard/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
-            try:
-                self.shell(f"rm -f {path}")
-                self.shell(f"uiautomator dump {path} 2>&1", timeout=60)
-                out = self.shell(f"cat {path}", timeout=30)
-                self.shell(f"rm -f {path}")
-                if out.strip().lstrip().startswith("<?xml"):
-                    return ET.fromstring(out)
-                last = AdbError("dump 输出为空或非 XML（界面未空闲？）")
-            except (AdbError, ET.ParseError) as e:
-                last = e
-                try:
-                    self.shell(f"rm -f {path}")
-                except AdbError:
-                    pass
+            xml, why = self._dump_via_tty()
+            if xml:
+                return self._parse_dump(xml)
+            details.append(why)
+            xml, why = self._dump_via_file()
+            if xml:
+                return self._parse_dump(xml)
+            details.append(why)
+            if i == 0 and self._looks_like_idle_error(details):
+                self._reapply_animations()
             if i < retries - 1:
-                time.sleep(delay)
-        raise AdbError(f"UI dump 失败: {last}")
+                time.sleep(max(0.0, delay) * (i + 1))   # 递进等待：界面越不稳等越久
+        xml, why = self._dump_via_file(compressed=True)
+        if xml:
+            return self._parse_dump(xml)
+        details.append(why)
+        raise AdbError(self._dump_failure_message(details))
 
     @staticmethod
     def _node_matches(node, resource_id=None, text=None, class_name=None,
@@ -1380,6 +1473,8 @@ class ADBController:
             "clipboard_ok": self.probe_clipboard(),
             "clipboard_text": self.get_clipboard(),
         })
+        if self._last_dump_detail:
+            info["last_dump_error"] = self._last_dump_detail
         return info
 
     def dump_diagnostics(self) -> str:

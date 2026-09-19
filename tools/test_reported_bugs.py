@@ -118,6 +118,9 @@ class FakeAdb:
         self.calls.append(cmd)
         return ""
 
+    def ime_shown(self) -> bool:
+        return False
+
     def package_installed(self, package: str) -> bool:
         self.calls.append(f"pm list packages {package}")
         return True

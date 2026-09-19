@@ -99,6 +99,7 @@ class Xiaotiancai:
         except (TypeError, ValueError):
             self._send_retries = 2
         self._net_retry_ts = 0.0     # 网络弹窗"重试"按钮的点击冷却
+        self._last_dump_warn = 0.0   # "读不到界面"告警的节流时间戳
 
     def log(self, level: str, msg: str):
         if self.logger is None:
@@ -112,6 +113,30 @@ class Xiaotiancai:
         时不至于把整轮发送/登录直接判成失败。
         """
         return self.adb.dump_ui(retries=2, delay=0.3)
+
+    def _dump_with_retry(self, attempts: int = 2) -> ET.Element | None:
+        """读界面并容错：失败时（先收起键盘）再试，仍失败返回 None。
+
+        为什么要收键盘：软键盘/光标闪烁是 uiautomator "could not get idle state"
+        的常见原因之一，收起后再 dump 往往就成功了。
+        日志节流：同一类失败 30 秒内只打一次 warning，其余降级为 debug（避免刷屏）。
+        """
+        for i in range(max(1, attempts)):
+            try:
+                return self._dump_fast()
+            except AdbError as e:
+                now = time.monotonic()
+                level = "warning" if now - self._last_dump_warn >= 30 else "debug"
+                self._last_dump_warn = now
+                self.log(level, f"读取界面失败（第 {i + 1}/{attempts} 次）: {e}")
+                if i + 1 >= attempts:
+                    return None
+                try:
+                    self.close_keyboard()   # 键盘/光标闪烁是"界面不空闲"的常见原因
+                except Exception:  # noqa: BLE001 个别实现没有 ime_shown 时忽略
+                    pass
+                time.sleep(0.8)
+        return None
 
     # ------------------------------------------------------------------ 生命周期
     def launch(self) -> bool:
@@ -856,9 +881,16 @@ class Xiaotiancai:
         if self.is_in_chat():
             return True
         self._dismiss_blockers()
+        # 读界面（失败自动收键盘重试；仍失败就本轮放弃，交给外层稍后重试，
+        # 不再抛出 "cat: ... No such file" 这种误导性 ERROR）
+        root = self._dump_with_retry(2)
+        if root is None:
+            self.log("warning", f"打开聊天暂缓：连续读不到界面控件（联系人 {contact}），"
+                                "稍后会自动重试（若反复出现，多为界面一直不空闲，"
+                                "可调大 adb.dump_retries / adb.dump_delay）")
+            return False
         try:
             # 主页即"微聊"列表：先直接在当前页找联系人，找不到再尝试切 Tab
-            root = self._dump_fast()
             node = self._find_contact_node(root, contact)
             if node is None:
                 tab_text = self.ui.get("message_tab_text", "微聊")
@@ -869,7 +901,10 @@ class Xiaotiancai:
                 if tab is not None:
                     self.adb.tap_element(tab)
                     time.sleep(self._delay)
-                    root = self._dump_fast()
+                    root = self._dump_with_retry(2)
+                    if root is None:
+                        self.log("warning", "打开聊天暂缓：切换微聊 Tab 后读不到界面，稍后重试")
+                        return False
                     node = self._find_contact_node(root, contact)
             if node is None:
                 self.log("error", f"在消息列表找不到联系人: {contact}")
@@ -880,7 +915,6 @@ class Xiaotiancai:
             deadline = time.time() + 12
             reclick = 0
             while time.time() < deadline:
-                root = None
                 if self.is_in_chat():
                     return True
                 act = self.current_activity()
@@ -888,16 +922,17 @@ class Xiaotiancai:
                     if self._dismiss_blockers():
                         time.sleep(0.5)
                     if reclick < 2:
-                        root = self._dump_fast()
-                        node = self._find_contact_node(root, contact)
-                        if node is not None:
-                            self.adb.tap_element(node)   # 弹窗关掉后重新点联系人
+                        root = self._dump_with_retry(1)   # 读不到不影响本轮继续等待
+                        if root is not None:
+                            node = self._find_contact_node(root, contact)
+                            if node is not None:
+                                self.adb.tap_element(node)   # 弹窗关掉后重新点联系人
                         reclick += 1
                 time.sleep(0.8)
             self.log("warning", f"点击联系人 {contact} 后未检测到聊天窗口（可能 App 界面有弹窗）")
             return False
         except AdbError as e:
-            self.log("error", f"打开聊天失败: {e}")
+            self.log("warning", f"打开聊天失败: {e}")
             return False
 
     def _find_contact_node(self, root: ET.Element, contact: str):
@@ -1053,17 +1088,11 @@ class Xiaotiancai:
         较短的固定等待，一次发送通常 3~5 秒（旧实现 10 秒以上）。
         """
         try:
-            try:
-                root = self._dump_fast()
-            except AdbError:
-                root = None
+            root = self._dump_with_retry(2)   # 读不到界面（界面不空闲）时自动收键盘重试
             if root is None or self._find_input(root) is None:
                 # 找不到输入框：可能有弹窗盖住了聊天页，先清理再重读界面
                 if self._dismiss_blockers():
-                    try:
-                        root = self._dump_fast()
-                    except AdbError:
-                        root = None
+                    root = self._dump_with_retry(1)
             if root is None:
                 return False, "界面读取失败，无法确认聊天页状态"
             input_node = self._find_input(root)
@@ -1262,8 +1291,12 @@ class Xiaotiancai:
         try:
             if not self.require_login():
                 return (None, None, "", "", [])
-            # 一次 dump 同时用于登录态判断与消息解析（登录态有缓存，避免重复 dump）
-            root = self._dump_fast()
+            # 一次 dump 同时用于登录态判断与消息解析（登录态有缓存，避免重复 dump）；
+            # 读不到界面（界面一直不空闲等）→ 返回空，交给轮询层稍后重试/自愈，
+            # 不抛异常也不刷 ERROR 日志。
+            root = self._dump_with_retry(2)
+            if root is None:
+                return (None, None, "", "", [])
             if self.is_in_chat(root):
                 contact, text, time_label = self._latest_in_chat(root)
                 own_recent = self._own_texts_in_chat(root)

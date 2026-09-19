@@ -21,7 +21,8 @@ adb:
   disable_animations: true                       # 关闭系统动画（uiautomator dump 需要界面空闲才能工作）
   input_retries: 2                               # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
   dump_retries: 2                                # UI dump 默认重试次数（交互路径自动用更快的单次 dump）
-  dump_delay: 0.8                                # UI dump 重试间隔（秒）
+  dump_delay: 0.8                                # UI dump 重试间隔（秒，逐轮递增等待界面空闲）
+  dump_timeout: 60                               # 单次 uiautomator dump 超时（秒）
   focus_cache_ttl: 1.5                           # 前台组件缓存秒数（减少 dumpsys，提升点击/发送速度）
 
 # ---------- 转发（QQ 侧） ----------

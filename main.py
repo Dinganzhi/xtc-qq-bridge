@@ -80,7 +80,8 @@ def main() -> None:
                         input_retries=int(adb_cfg.get("input_retries", 2) or 2),
                         dump_retries=int(adb_cfg.get("dump_retries", 2) or 2),
                         dump_delay=float(adb_cfg.get("dump_delay", 0.8) or 0.8),
-                        focus_ttl=float(adb_cfg.get("focus_cache_ttl", 1.5) or 0.0))
+                        focus_ttl=float(adb_cfg.get("focus_cache_ttl", 1.5) or 0.0),
+                        dump_timeout=float(adb_cfg.get("dump_timeout", 60) or 60))
 
     if args.debug == "dump-ui":
         from tools import dump_ui
