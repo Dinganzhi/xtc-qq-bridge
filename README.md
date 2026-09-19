@@ -118,7 +118,7 @@
 
 | 平台 | 命令 | 一键完成的事 |
 |---|---|---|
-| **Windows** | 双击 `install.bat` | ① 装 pyyaml ② 复制插件到 `%USERPROFILE%\.astrbot\data\plugins\xtc_qq_bridge\` ③ 从模板生成 `config.yaml` ④ 生成插件初始配置 |
+| **Windows** | 双击 `install.bat` | (1) 装 pyyaml (2) 复制插件到 `%USERPROFILE%\.astrbot\data\plugins\xtc_qq_bridge\` (3) 从模板生成 `config.yaml` (4) 生成插件初始配置 |
 | **Linux / macOS** | `bash install.sh` | 同上，插件目录为 `~/.astrbot/data/plugins/xtc_qq_bridge/`；缺少 pyyaml 时优先装进项目 `.venv/`（绕开 PEP 668 限制），并检查 `adb` 是否在 PATH |
 
 之后编辑 `config.yaml`，再按「快速开始」启用插件即可。脚本只做初始化，**不会覆盖已有的
@@ -163,15 +163,15 @@ bash start.sh --debug adb-info
 ```bash
 pip install -r requirements.txt         # 只需 pyyaml（无外网时可用 JSON 格式配置）
 
-python tools/selftest.py                # ① 环境自检（adb 发现/连接/UI dump/启动/登录检测）
-python main.py --check                  # ② 或使用 --check
+python tools/selftest.py                # (1) 环境自检（adb 发现/连接/UI dump/启动/登录检测）
+python main.py --check                  # (2) 或使用 --check
 ```
 
 然后在 Android 环境里登录小天才家长账号（也可用 `/小天才登录` 自动登录），再：
 
 ```bash
-python tools/dump_ui.py --filter 消息    # ③ 查看界面控件，按需调整 config.yaml -> xiaotiancai.ui
-python main.py                           # ④ 启动桥接
+python tools/dump_ui.py --filter 消息    # (3) 查看界面控件，按需调整 config.yaml -> xiaotiancai.ui
+python main.py                           # (4) 启动桥接
 ```
 
 ## 5. 目录结构
@@ -552,11 +552,11 @@ python tools/wsa_net_guard.py --test
 | `adb devices` 显示 `unauthorized` | 在目标设备/子系统窗口里点「允许 USB 调试」；真机可在手机上撤销授权后重新插拔 |
 | **WSA / WSABuilds 隔三差五断网** | 跑独立守护：`python tools/wsa_net_guard.py`（分级修复：重连 -> 网络复位 -> 重启子系统；见「WSA 网络守护」）。只想看一眼用 `--status` |
 | WSA 报 `10061` 端口被拒 | Hyper-V 抢占端口：`netsh int ipv4 add excludedportrange protocol=tcp startport=<端口> numberofports=1` + 重启（见「Windows」小节） |
-| **自动登录不生效** | ① 看日志有没有 `检测到小天才未登录，触发自动登录`；② 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；③ 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；④ 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
+| **自动登录不生效** | (1) 看日志有没有 `检测到小天才未登录，触发自动登录`；(2) 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；(3) 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；(4) 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
 | **明明在登录中却提示"登录失败"** | 已修复：出现"登录中/正在验证/请稍候"等进度文案时**一律不判失败**；只有明确的账号/密码错误才算失败，网络类临时问题按"超时->稍后重试"处理。若仍误报，把该文案加进 `xiaotiancai.ui.login_progress_markers` |
 | **发送提示失败但其实发不出去 / 提示成功却没发出** | 已修复：只有"输入框已清空且无新的失败提示"或"出现新的己方气泡"才回「发送成功」；读不到界面、出现"发送失败/网络异常"、输入框仍有残留 -> 如实回「发送失败」。若你的机型提示语不同，补充 `xiaotiancai.ui.send_fail_markers` |
 | **按按钮/发送很慢** | 已优化：UI dump 走 `/dev/tty` 快路径、前台组件缓存、登录态缓存、交互等待变短。设备本身慢可调大 `xiaotiancai.ui.interaction_delay`（0.6 -> 1.0）；网络差可减小 |
-| **控制台看不到收到的命令** | INFO 级别下应当能看到 `[QQ回调] 收到 …`、`[收到QQ命令] …`、`[收到小天才命令] …`、`[收到小天才消息] …`、`[QQ->小天才] 发送成功/失败`。看不到时：① 确认 `logging.level: INFO`；② 确认命令真的到了（QQ 侧看插件日志，小天才侧看界面）；③ 中文 Windows 控制台编码问题已兜底（不会再整条丢失） |
+| **控制台看不到收到的命令** | INFO 级别下应当能看到 `[QQ回调] 收到 …`、`[收到QQ命令] …`、`[收到小天才命令] …`、`[收到小天才消息] …`、`[QQ->小天才] 发送成功/失败`。看不到时：(1) 确认 `logging.level: INFO`；(2) 确认命令真的到了（QQ 侧看插件日志，小天才侧看界面）；(3) 中文 Windows 控制台编码问题已兜底（不会再整条丢失） |
 | **已经启动了 App 还重复启动** | 已修复：`launch()` 先判断前台，已在前台直接返回，不执行任何启动命令；`/小天才 初始化` 也改成按需执行 |
 | **弹窗挡住界面导致读不到消息** | 已修复：常见弹窗（权限/无响应/更新/评价/活动/网络/警告）会自动处理；连续读不到消息会触发界面自愈。特殊弹窗可加 `xiaotiancai.ui.popup_skip_texts` / `anr_wait_texts` |
 | Linux 真机看不到设备 | udev 规则/权限问题：配 `/etc/udev/rules.d/51-android.rules` 并把用户加入 `plugdev`（见「Linux」小节），再 `sudo udevadm control --reload-rules && sudo udevadm trigger` |
@@ -599,7 +599,7 @@ python tools/wsa_net_guard.py --test
   返回 `timeout`（稍后重试），**不返回 fail**。
 - 状态机与节流在 `bridge._do_login_job()` / `bridge._login_check_loop()`：
   用 `_login_not_before` + `_login_inflight` 保证"该重试就重试、该等用户就等用户、不重复触发"。
-- 登录表单输入按行精确校验；密码框是掩码（••••）时按长度校验，**不会把密码输好几遍**。
+- 登录表单输入按行精确校验；密码框显示为掩码（圆点）时按长度校验，**不会把密码输好几遍**。
 
 ## 2. 界面自愈与弹窗处理策略
 

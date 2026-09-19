@@ -276,7 +276,11 @@ class Xiaotiancai:
 
     @staticmethod
     def _is_mask_text(text: str) -> bool:
-        """掩码文本判定：全部由圆点/星号/实心点构成（允许尾部空格）。"""
+        """掩码文本判定：全部由圆点/星号/实心点构成（允许尾部空格）。
+
+        注意：下面这串字符是**功能字符**（App 可能用其中任意一种渲染密码掩码），
+        不是装饰符号，清理"特殊符号"时不要删；它们都是 GBK 可编码的。
+        """
         s = (text or "").strip()
         if not s:
             return False
