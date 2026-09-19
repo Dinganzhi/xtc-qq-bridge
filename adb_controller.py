@@ -9,12 +9,12 @@ UI 树解析等能力。
 - 任何能通过 `adb connect` 接入的 Android 实例（含真机 USB / 网络调试）
 
 设计要点：
-- adb 查找顺序：config 指定路径 → 环境变量 ADB_PATH → 平台常见安装路径 → PATH。
-- 设备查找顺序：**已有的在线设备** → 环境变量 ADB_SERIAL → WSA 端口（Windows）
-  → 常见端口（5555 / 16384 / 62001 …）→ 多次重试。任何情况下都不会顶掉已连接的
+- adb 查找顺序：config 指定路径 -> 环境变量 ADB_PATH -> 平台常见安装路径 -> PATH。
+- 设备查找顺序：**已有的在线设备** -> 环境变量 ADB_SERIAL -> WSA 端口（Windows）
+  -> 常见端口（5555 / 16384 / 62001 …）-> 多次重试。任何情况下都不会顶掉已连接的
   设备去抢端口。
-- 启动 App：解析 launcher activity（cmd/pm resolve-activity）→ `am start -n`
-  → `monkey -p <pkg>`（WSA 上最稳）→ `cmd package` 兜底，并轮询前台确认。
+- 启动 App：解析 launcher activity（cmd/pm resolve-activity）-> `am start -n`
+  -> `monkey -p <pkg>`（WSA 上最稳）-> `cmd package` 兜底，并轮询前台确认。
 - 前台判定：兼容 Android 13+ 的 `topResumedActivity`/`mFocusedApp`，不再只认
   `mCurrentFocus`（WSA/新镜像上 mCurrentFocus 经常为空，会把"启动成功"误判成失败）。
 - 中文输入策略链（每一步都做**结果校验**，失败才降级）：
@@ -107,7 +107,7 @@ _WSA_COMMON_PORTS = [58526, 58527, 58525, 6520, 6521]
 _EMULATOR_COMMON_PORTS = [5555, 16384, 7555, 21503, 62001, 62025, 5556]
 
 # 没有在线设备时可尝试自动拉起的模拟器/容器（Linux 优先 Waydroid）：
-#   命令 → (可执行文件候选, 参数列表)
+#   命令 -> (可执行文件候选, 参数列表)
 _LAUNCHERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # Linux（Waydroid 官方建议 wayland；会话是 X11 时加 -X）
     "waydroid": (("waydroid",), ("session", "start")),
@@ -219,7 +219,7 @@ def _environment_hints() -> list[str]:
         if wsa_installed():
             info = wsa_connection_info()
             hints.append(
-                f"检测到本机安装了 WSA：请在 WSA 设置 → Advanced settings → Developer mode "
+                f"检测到本机安装了 WSA：请在 WSA 设置 -> Advanced settings -> Developer mode "
                 f"里确认端口，然后设置 adb.port={info['port']} 或 "
                 f"adb.serial=\"{info['ip']}:{info['port']}\""
                 f"（若报 10061 端口被占用，管理员执行 netsh int ipv4 add excludedportrange "
@@ -425,7 +425,8 @@ class ADBController:
     def __init__(self, adb_path: str = "", host: str = "127.0.0.1", port: int = 5555,
                  serial: str = "", timeout: float = 30.0, logger=None,
                  extra_ports: list[int] | None = None, wsa_port: int = 0,
-                 input_retries: int = 2):
+                 input_retries: int = 2, dump_retries: int = 2, dump_delay: float = 0.8,
+                 focus_ttl: float = 1.5):
         self.adb_path = find_adb(adb_path)
         self.host = host
         self.port = port
@@ -435,13 +436,21 @@ class ADBController:
         self.extra_ports = [int(p) for p in (extra_ports or []) if int(p) > 0]
         self.wsa_port = int(wsa_port or 0)
         self.input_retries = max(1, int(input_retries or 1))
+        # UI dump 默认重试参数：默认值偏保守（2 次 / 0.8s），交互路径会显式用更快的
+        # 参数（retries=2, delay=0.3），避免"按个按钮要好几秒"。
+        self.dump_retries = max(1, int(dump_retries or 1))
+        self.dump_delay = max(0.0, float(dump_delay or 0.0))
+        # 前台 component 缓存：dumpsys 每次要 0.3~1s，短时间内的连续判断直接复用，
+        # 命中点击/按键后立即失效（界面已变化）。
+        self.focus_ttl = max(0.0, float(focus_ttl or 0.0))
+        self._focus_cache: tuple[float, str] = (0.0, "")
         self._sdk: int | None = None
         self._clipboard_ok: bool | None = None
         self._adbkeyboard_ok: bool | None = None
         self._adbkeyboard_b64_ok: bool | None = None
         self._input_verify_supported: bool | None = None
         self._is_wsa: bool | None = None
-        # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 ≠ input 物理坐标）
+        # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 != input 物理坐标）
         self._rotation: int = 0
         self._rotation_ts: float = 0.0
         self._phys: tuple[int, int] | None = None
@@ -502,7 +511,7 @@ class ADBController:
         return states
 
     def _port_candidates(self) -> list[int]:
-        """连接候选端口：WSA 端口 → 配置端口 → WSA 常见端口 → 模拟器常见端口。"""
+        """连接候选端口：WSA 端口 -> 配置端口 -> WSA 常见端口 -> 模拟器常见端口。"""
         cands: list[int] = []
         for p in ([self.wsa_port] if self.wsa_port else []) + [wsa_adb_port()] + \
                  [self.port] + self.extra_ports + _WSA_COMMON_PORTS + _EMULATOR_COMMON_PORTS:
@@ -747,7 +756,7 @@ class ADBController:
         """当前应用的逻辑屏幕尺寸（宽, 高）——uiautomator bounds 与 input 坐标所在空间。
 
         模拟器被旋转成竖屏（ROTATION_90/270）时逻辑尺寸与物理尺寸互换，
-        例如物理 1920x1080 → 逻辑 1080x1920。发送/读取的左右判定与滑动
+        例如物理 1920x1080 -> 逻辑 1080x1920。发送/读取的左右判定与滑动
         计算都应使用逻辑尺寸。"""
         pw, ph = self._phys_size()
         return (pw, ph) if self._current_rotation() in (0, 180) else (ph, pw)
@@ -773,8 +782,16 @@ class ADBController:
                     return m.group(1)
         return ""
 
-    def get_current_focus(self) -> str:
-        """返回当前前台组件，如 'com.xtc.watch/com.xtc.watch.MainActivity'；无则 ''。"""
+    def get_current_focus(self, use_cache: bool = True) -> str:
+        """返回当前前台组件，如 'com.xtc.watch/com.xtc.watch.MainActivity'；无则 ''。
+
+        use_cache=True（默认）时复用 focus_ttl 秒内的结果：一次点击/滑动会连续触发
+        多轮前台判断，每次都 dumpsys 会显著拖慢操作；tap/swipe/keyevent 会主动失效缓存。
+        """
+        if use_cache and self.focus_ttl > 0:
+            ts, cached = self._focus_cache
+            if cached and (time.monotonic() - ts) < self.focus_ttl:
+                return cached
         for cmd in ("dumpsys window", "dumpsys activity activities"):
             try:
                 out = self.shell(cmd, timeout=25)
@@ -782,11 +799,16 @@ class ADBController:
                 continue
             focus = self._parse_focus(out)
             if focus:
+                self._focus_cache = (time.monotonic(), focus)
                 return focus
         return ""
 
-    def is_in_foreground(self, package: str) -> bool:
-        focus = self.get_current_focus()
+    def invalidate_focus(self) -> None:
+        """丢弃前台缓存（界面刚被点击/按键改变后调用）。"""
+        self._focus_cache = (0.0, "")
+
+    def is_in_foreground(self, package: str, use_cache: bool = True) -> bool:
+        focus = self.get_current_focus(use_cache=use_cache)
         return bool(focus) and focus.startswith(package)
 
     # ------------------------------------------------------------------ 操作
@@ -794,13 +816,16 @@ class ADBController:
     # （旋转竖屏时二者同步变成 1080x1920），因此直接透传，不需要坐标变换。
     def tap(self, x: int | float, y: int | float) -> None:
         self.shell(f"input tap {int(x)} {int(y)}")
+        self.invalidate_focus()
 
     def swipe(self, x1: int | float, y1: int | float,
               x2: int | float, y2: int | float, duration_ms: int = 300) -> None:
         self.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration_ms)}")
+        self.invalidate_focus()
 
     def keyevent(self, code: int) -> None:
         self.shell(f"input keyevent {int(code)}")
+        self.invalidate_focus()
 
     def clear_text_field(self) -> None:
         """清空当前输入框：优先 ADBKeyBoard 的 ADB_CLEAR_TEXT，其次全选+删除。"""
@@ -840,7 +865,7 @@ class ADBController:
         return ""
 
     def resolve_launcher_activity(self, package: str) -> str:
-        """解析 launcher activity：cmd package → pm dump（monkey 兜底由启动逻辑负责）。"""
+        """解析 launcher activity：cmd package -> pm dump（monkey 兜底由启动逻辑负责）。"""
         for cmd in (f"cmd package resolve-activity --brief {package}",
                     f"pm resolve-activity --brief {package}"):
             out = self.try_shell(cmd, timeout=20)
@@ -917,7 +942,7 @@ class ADBController:
         """等待 package 到达前台（typo 名保留：wait_for_activity）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.is_in_foreground(package):
+            if self.is_in_foreground(package, use_cache=False):
                 return True
             time.sleep(interval)
         return False
@@ -934,17 +959,48 @@ class ADBController:
         return out
 
     # ------------------------------------------------------------------ UI 解析
-    def dump_ui(self, retries: int = 3, delay: float = 2.0) -> ET.Element:
-        """uiautomator dump 并解析为 XML 树。线程安全（串行化），首次 dump 偶发失败自动重试。"""
+    def dump_ui(self, retries: int | None = None, delay: float | None = None) -> ET.Element:
+        """uiautomator dump 并解析为 XML 树。线程安全（串行化），失败自动重试。
+
+        retries/delay 省略时用实例默认值（config -> adb.dump_retries/dump_delay）。
+        需要"快一点"的交互路径（点击/发送前后）显式传 retries=2, delay=0.3。
+        """
         with self._dump_lock:
-            return self._dump_ui_locked(retries, delay)
+            return self._dump_ui_locked(
+                self.dump_retries if retries is None else max(1, int(retries)),
+                self.dump_delay if delay is None else max(0.0, float(delay)))
+
+    @staticmethod
+    def _extract_xml(out: str) -> str:
+        """从 uiautomator 输出里截出 XML（/dev/tty 方案前面可能混有提示行）。"""
+        if not out:
+            return ""
+        start = out.find("<?xml")
+        if start < 0:
+            return ""
+        end = out.rfind("</hierarchy>")
+        if end < 0:
+            return ""
+        return out[start:end + len("</hierarchy>")]
 
     def _dump_ui_locked(self, retries: int, delay: float) -> ET.Element:
-        """dump 当前窗口 UI 为 XML。每次用唯一文件名，先删后写再删，
-        避免 uiautomator 静默失败（rc=0、错误进 stderr，如桌面动画导致的
-        "could not get idle state"）时读到上一次的旧文件。"""
+        """dump 当前窗口 UI 为 XML。
+
+        快路径：`uiautomator dump /dev/tty` 直接把 XML 打到 stdout —— 一次 shell 调用
+        就拿到结果，比"写文件 -> cat -> 删文件"的 3 次调用快一半以上。
+        快路径失败（部分镜像不支持 / 界面未空闲）再回退到文件方案：
+        每次用唯一文件名，先删后写再删，避免 uiautomator 静默失败（rc=0、错误进
+        stderr，如动画导致的 "could not get idle state"）时读到上一次的旧文件。
+        """
         last: Exception | None = None
         for i in range(retries):
+            try:
+                out = self.shell("uiautomator dump /dev/tty 2>/dev/null", timeout=60)
+                xml = self._extract_xml(out)
+                if xml:
+                    return ET.fromstring(xml)
+            except (AdbError, ET.ParseError) as e:
+                last = e
             path = f"/sdcard/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
             try:
                 self.shell(f"rm -f {path}")

@@ -6,7 +6,7 @@
   - 连接：没有在线设备时自动 connect WSA 端口（58526）；已有设备优先，不去抢端口
   - 启动：resolve-activity 输出带警告行时仍能解析；`am start -n` 失败后 monkey 兜底；
           前台判定兼容 Android 13 的 topResumedActivity
-  - 文本注入：以输入框真实内容校验；明文被吞 → base64 救回；全失败 → 老实返回 False
+  - 文本注入：以输入框真实内容校验；明文被吞 -> base64 救回；全失败 -> 老实返回 False
   - 剪贴板：回读不一致（WSA 把宿主剪贴板内容读回来）时绝不按 KEYCODE_PASTE
 
 用法：python tools/test_integration.py
@@ -205,7 +205,7 @@ def test_connect_attempted_when_devices_empty() -> None:
 
 
 def test_adopt_already_listed_device() -> None:
-    """设备已在 adb devices 里（模拟器常见）→ 直接采用，不做多余 connect。"""
+    """设备已在 adb devices 里（模拟器常见）-> 直接采用，不做多余 connect。"""
     ctl, fake = make_controller(connected=True, listed=True)
     ctl.serial = ""
     ok = ctl.ensure_connected(retries=1)
@@ -299,7 +299,7 @@ def test_input_plain_swallowed_b64_rescue() -> None:
 
 
 def test_input_all_channels_dead() -> None:
-    """全部广播失败 + 剪贴板回读不一致 → 必须返回 False，且绝不粘贴宿主旧内容。"""
+    """全部广播失败 + 剪贴板回读不一致 -> 必须返回 False，且绝不粘贴宿主旧内容。"""
     ctl, fake = make_controller(broadcast="dead", clipboard="broken")
     ctl.serial = "127.0.0.1:58526"
     ok = ctl.input_text("你好世界", verify=lambda: fake.device_input == "你好世界")
@@ -362,7 +362,7 @@ def test_diagnose_fields() -> None:
 
 
 def test_adbkeyboard_already_installed_skips_install() -> None:
-    """设备上已有 ADBKeyBoard → 不装 APK，只确保它是默认输入法。"""
+    """设备上已有 ADBKeyBoard -> 不装 APK，只确保它是默认输入法。"""
     ctl, fake = make_controller()
     ctl.serial = "127.0.0.1:58526"
     fake.adbkeyboard_installed = True
@@ -374,7 +374,7 @@ def test_adbkeyboard_already_installed_skips_install() -> None:
 
 
 def test_adbkeyboard_installs_from_local_apk() -> None:
-    """设备上没有 ADBKeyBoard → 只用项目目录里的本地 APK 安装。"""
+    """设备上没有 ADBKeyBoard -> 只用项目目录里的本地 APK 安装。"""
     ctl, fake = make_controller()
     ctl.serial = "127.0.0.1:58526"
     fake.adbkeyboard_installed = False
@@ -390,7 +390,7 @@ def test_adbkeyboard_installs_from_local_apk() -> None:
 
 
 def test_adbkeyboard_missing_local_apk_no_remote() -> None:
-    """设备没装、项目里也没 APK → 返回 False 并提示放本地文件，绝不联网。"""
+    """设备没装、项目里也没 APK -> 返回 False 并提示放本地文件，绝不联网。"""
     ctl, fake = make_controller()
     ctl.serial = "127.0.0.1:58526"
     fake.adbkeyboard_installed = False

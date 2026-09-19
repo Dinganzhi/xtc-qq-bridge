@@ -52,7 +52,7 @@ def load_config(path: str) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="小天才 ↔ QQ 桥接（AstrBot 插件版）")
+    ap = argparse.ArgumentParser(description="小天才 <-> QQ 桥接（AstrBot 插件版）")
     ap.add_argument("--config", default="config.yaml", help="配置文件路径")
     ap.add_argument("--check", action="store_true", help="环境自检后退出")
     ap.add_argument("--debug", choices=["dump-ui", "adb-info"], help="调试命令")
@@ -77,7 +77,10 @@ def main() -> None:
                         serial=adb_cfg.get("serial", ""), logger=log,
                         extra_ports=adb_cfg.get("extra_ports") or [],
                         wsa_port=int(adb_cfg.get("wsa_port", 0) or 0),
-                        input_retries=int(adb_cfg.get("input_retries", 2) or 2))
+                        input_retries=int(adb_cfg.get("input_retries", 2) or 2),
+                        dump_retries=int(adb_cfg.get("dump_retries", 2) or 2),
+                        dump_delay=float(adb_cfg.get("dump_delay", 0.8) or 0.8),
+                        focus_ttl=float(adb_cfg.get("focus_cache_ttl", 1.5) or 0.0))
 
     if args.debug == "dump-ui":
         from tools import dump_ui
@@ -109,11 +112,20 @@ def main() -> None:
     xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=log)
     xtc.launch()
 
-    if not xtc.is_logged_in():
-        log.warning("小天才 App 未登录——将自动尝试账密登录"
-                    "（已配置 xiaotiancai.login 时；否则请手动登录）")
-
     xc_cfg = cfg.get("xiaotiancai") or {}
+    auto_login = bool(xc_cfg.get("auto_login", True))
+    acc = xc_cfg.get("login") or {}
+    has_cred = bool(str(acc.get("phone", "")).strip() and str(acc.get("password", "")).strip())
+    if not xtc.is_logged_in(force=True):
+        if auto_login and has_cred:
+            log.warning("小天才 App 未登录——约 5 秒后自动账密登录"
+                        "（若失败会按 login_retry_interval 自动重试，可在 QQ 发 /小天才 自动登录 关闭）")
+        elif auto_login and not has_cred:
+            log.warning("小天才 App 未登录，但未配置 xiaotiancai.login.phone/password"
+                        " -> 自动登录不会生效，请手动登录或补齐配置")
+        else:
+            log.warning("小天才 App 未登录（自动登录已关闭）——请手动登录")
+
     if xc_cfg.get("auto_install_adbkeyboard", True) and not args.no_adbkeyboard:
         adb.install_adbkeyboard()
 
@@ -134,8 +146,8 @@ def main() -> None:
         log.info(f"反向回调已启动: http://{wh_cfg.get('host', '127.0.0.1')}:"
                  f"{wh_cfg.get('port', 5000)}{wh_cfg.get('path', '/qq_callback')}")
         if not (wh_cfg.get("allow_from") or wh_cfg.get("allow_groups")):
-            log.warning("webhook 白名单为空：QQ→小天才 将拒绝所有消息，"
-                        "请在 config.yaml → webhook.allow_from（私聊）/ allow_groups（群聊）配置")
+            log.warning("webhook 白名单为空：QQ->小天才 将拒绝所有消息，"
+                        "请在 config.yaml -> webhook.allow_from（私聊）/ allow_groups（群聊）配置")
 
     bridge.start()
     if args.once:

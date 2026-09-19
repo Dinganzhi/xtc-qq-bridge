@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""小天才 ↔ QQ 桥接插件（AstrBot v4.x，已对照 4.27.4 桌面版源码核对 API）
+"""小天才 <-> QQ 桥接插件（AstrBot v4.x，已对照 4.27.4 桌面版源码核对 API）
 
 职责：
-1. Python → QQ：暴露本地 HTTP 端点（默认 http://127.0.0.1:11452/api/forward），
+1. Python -> QQ：暴露本地 HTTP 端点（默认 http://127.0.0.1:11452/api/forward），
    接收 Python 桥脚本（main.py）的转发请求，经 context.send_message() 发送 QQ 消息。
    /api/forward 会等待实际发送结果再返回（避免"假成功"）。
-2. QQ → 小天才：子命令 `/小天才 发送|登录|自动登录|初始化|命令模式`；
+2. QQ -> 小天才：子命令 `/小天才 发送|登录|自动登录|初始化|命令模式`；
    「命令模式」关闭时，群/私聊所有新消息都会转发到小天才。
 
 关键 API（v4）：
@@ -224,7 +224,7 @@ class Main(star.Star):
         """/小天才 历史消息 [条数] [来源]：让桥接读取本地消息库并回传。
 
         来源可选：手表 / QQ群 [群号] / QQ私聊 [QQ号]，留空=全部（每条都带来源标注）。
-        短内容（≤1300 字符）用引用+@ 回复；超长内容直接以纯文本发送到原会话——
+        短内容（<=1300 字符）用引用+@ 回复；超长内容直接以纯文本发送到原会话——
         AstrBot 会把超过 forward_threshold(默认1500) 的纯文本回复包成"合并转发
         Node"（uin=机器人自己），NapCat 会报错或把内容"发给机器人自己"。"""
         count = 20
@@ -355,7 +355,7 @@ class Main(star.Star):
         with urllib.request.urlopen(req, timeout=5) as r:
             r.read()
 
-    # ------------------------------------------------------------------ Python → QQ
+    # ------------------------------------------------------------------ Python -> QQ
     def _start_http(self) -> None:
         host = self.config.get("http_host", "127.0.0.1")
         port = int(self.config.get("http_port", 11452))
@@ -576,12 +576,12 @@ class Main(star.Star):
 
 class _HttpHandler(BaseHTTPRequestHandler):
     """本地端点：
-    GET  /api/ping                → 健康检查
-    POST /api/forward             → 转发消息 {target_type, target_id, message}（等待实际结果）
-    POST /api/result              → 桥接结果回传 {request_id, message}（引用+@ 回复发送人）
-    POST /api/qq_search           → xtc 侧「搜索」：白名单私聊/群聊按昵称搜人
-    POST /api/qq_online           → xtc 侧「在线人数」：最近N分钟白名单会话发言人数
-    POST /api/qq_remind           → xtc 侧「提醒」：在群内 @ 某 QQ 用户
+    GET  /api/ping                -> 健康检查
+    POST /api/forward             -> 转发消息 {target_type, target_id, message}（等待实际结果）
+    POST /api/result              -> 桥接结果回传 {request_id, message}（引用+@ 回复发送人）
+    POST /api/qq_search           -> xtc 侧「搜索」：白名单私聊/群聊按昵称搜人
+    POST /api/qq_online           -> xtc 侧「在线人数」：最近N分钟白名单会话发言人数
+    POST /api/qq_remind           -> xtc 侧「提醒」：在群内 @ 某 QQ 用户
     """
 
     plugin: Main | None = None

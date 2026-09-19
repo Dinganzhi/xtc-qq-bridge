@@ -98,7 +98,7 @@ else
         echo "  Debian/Ubuntu: sudo apt install adb"
         echo "  Fedora:        sudo dnf install android-tools"
         echo "  Arch:          sudo pacman -S android-tools"
-        echo "  或下载 platform-tools 后在 config.yaml → adb.path 指定绝对路径"
+        echo "  或下载 platform-tools 后在 config.yaml -> adb.path 指定绝对路径"
     fi
 fi
 

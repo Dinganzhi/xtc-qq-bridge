@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """实机 UI 探测工具：打印当前界面所有控件（序号/class/resource-id/text），
-用于登录家长账号后填写 config.yaml → xiaotiancai.ui 的映射表。
+用于登录家长账号后填写 config.yaml -> xiaotiancai.ui 的映射表。
 
 用法：
   python tools/dump_ui.py                      # 打印当前界面控件
