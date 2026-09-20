@@ -217,6 +217,49 @@ def classify(shell_ok: bool, ping: bool | None) -> str:
     return "unknown"
 
 
+# ---------------------------------------------------------------- 联网验证（captive portal）
+# 为什么需要这一层：WSA 里 TCP/DNS 可能都是通的，但 Android 判定"能不能上网"靠的是
+# 自己的验证探针。默认探针地址 connectivitycheck.gstatic.com 在国内**连不上**，
+# 于是系统把网络标成 PARTIAL_CONNECTIVITY（能力里带 INTERNET 但没有 VALIDATED），
+# 各种 App 就会当作"没有网络"（小天才发消息报网络异常就是这么来的）。
+# 这几个设置写在 /data 里，重启子系统后依然有效，重复执行也是幂等的。
+VALIDATION_SETTINGS = (
+    ("captive_portal_mode", "0"),
+    ("captive_portal_http_url", "http://connectivitycheck.platform.hicloud.com/generate_204"),
+    ("captive_portal_https_url", "https://connectivitycheck.platform.hicloud.com/generate_204"),
+    ("captive_portal_fallback_url", "http://connect.rom.miui.com/generate_204"),
+    ("captive_portal_other_fallback_urls", "http://wifi.vivo.com.cn/generate_204"),
+    ("captive_portal_use_https", "0"),
+    ("private_dns_mode", "off"),
+)
+
+# 实测可达的 generate_204 端点（用 nc 从 WSA 里逐个验过）；gstatic 在国内不通
+VALIDATION_PROBE_HOSTS = ("connectivitycheck.platform.hicloud.com",
+                          "connect.rom.miui.com", "wifi.vivo.com.cn")
+
+
+def validation_settings_commands() -> list:
+    """修联网验证需要执行的 adb shell 命令（幂等）。"""
+    return [f"settings put global {k} {v}" for k, v in VALIDATION_SETTINGS]
+
+
+def parse_validation_state(out: str) -> str:
+    """从 `dumpsys connectivity` 的 NetworkAgentInfo 行判断验证状态。
+
+    返回 'validated' / 'partial' / 'unknown'。
+    注意只看 NetworkAgentInfo 那一行：请求段里也会出现 "VALIDATED" 字样，
+    用它判断会把"没验证通过"误判成通过。
+    """
+    low = (out or "").lower()
+    if "networkagentinfo" not in low:
+        return "unknown"
+    if "partial_connectivity" in low:
+        return "partial"
+    if "validated" in low:
+        return "validated"
+    return "unknown"
+
+
 def plan_action(problem: str, streak: int, level: int, *, allow_reboot: bool,
                 allow_restart_wsa: bool, light_recover: bool,
                 reboot_allowed_now: bool) -> str:
@@ -375,6 +418,10 @@ class WsaNetGuard:
         self._nc_usable: bool | None = None
         self._ping_evidence = ""
         self._last_unknown_log = 0.0
+        # 联网验证（PARTIAL_CONNECTIVITY）修复：默认开启，10 分钟最多修一次
+        self.fix_validation_enabled = bool(c.get("fix_validation", True))
+        self.validation_fix_cooldown = float(c.get("validation_fix_cooldown", 600) or 600)
+        self._last_validation_fix = 0.0
 
     # -------------------------------------------------- 日志
     def log(self, level: str, msg: str) -> None:
@@ -465,7 +512,8 @@ class WsaNetGuard:
     def check(self) -> dict:
         """返回 {'problem', 'shell_ok', 'ping', 'net_probe', 'serial', 'device_state'}。"""
         result = {"problem": "no_adb", "shell_ok": False, "ping": None, "net_probe": "",
-                  "serial": self.serial, "device_state": ""}
+                  "serial": self.serial, "device_state": "",
+                  "validation": "", "validation_evidence": ""}
         if not self.serial:
             self.serial = self.adb.adopt("")
             result["serial"] = self.serial
@@ -500,7 +548,41 @@ class WsaNetGuard:
         result["ping"] = ping
         result["net_probe"] = evidence
         result["problem"] = classify(True, ping)
+        # 联网验证状态：TCP/DNS 通不代表 App 认为有网（见 VALIDATION_SETTINGS 注释）
+        if self.fix_validation_enabled:
+            state, verr = self.check_validation()
+            result["validation"] = state
+            result["validation_evidence"] = verr
         return result
+
+    def check_validation(self) -> tuple:
+        """读系统的联网验证状态，返回 (state, 证据)。
+
+        'partial' = TCP/DNS 都通，但系统验证没通过（WSA 上默认探针被墙时就是这样）。
+        """
+        try:
+            out = self.adb.shell("dumpsys connectivity | grep -e NetworkAgentInfo | head -3",
+                                 timeout=25)
+        except AdbError as e:  # noqa: BLE001
+            return "unknown", f"读取失败: {e}"
+        state = parse_validation_state(out)
+        if state == "partial":
+            return state, "网络被标记为 PARTIAL_CONNECTIVITY（验证探针不通，App 会以为没网）"
+        if state == "validated":
+            return state, "系统已确认该网络可上网（VALIDATED）"
+        return state, shorten(" ".join((out or "").split())) or "无输出"
+
+    def action_fix_validation(self) -> bool:
+        """修"能上网但系统认为没网"：验证探针换成国内可达端点 + 关 DoT（幂等）。"""
+        def _fn() -> bool:
+            ok = True
+            for cmd in validation_settings_commands():
+                out, rc = self.adb.shell_rc(cmd, timeout=15)
+                if rc != 0:
+                    ok = False
+                    self.log("warning", f"设置失败（rc={rc}）: {cmd} {shorten(out)}")
+            return ok
+        return self._do("fix_validation", _fn)
 
     # -------------------------------------------------- 修复动作
     def _targets(self) -> list:
@@ -640,6 +722,20 @@ class WsaNetGuard:
         res = self.check()
         problem = res["problem"]
         if problem == "ok":
+            # 能上网但系统没验证通过：修验证探针，而不是去重启子系统
+            # （重启既治不了这个病，还会把正在运行的桥接/小天才一起打断）
+            if self.fix_validation_enabled and res.get("validation") == "partial":
+                now = time.monotonic()
+                if now - self._last_validation_fix >= self.validation_fix_cooldown:
+                    self._last_validation_fix = now
+                    self.log("warning",
+                             "子系统能上网（TCP/DNS 正常），但系统标记为 PARTIAL_CONNECTIVITY："
+                             "默认验证探针在国内不通，App 会当作没网 -> 改验证探针")
+                    ok = self.action_fix_validation()
+                    self.log("info" if ok else "warning",
+                             "联网验证设置已更新（写入 /data，重启子系统后依然有效；"
+                             "系统下一轮验证通过后即变为 VALIDATED）" if ok else "联网验证设置失败")
+                    return {**res, "action": "fix_validation", "action_ok": ok}
             if self.streak or self.level:
                 self.log("info", f"网络已恢复正常（连续异常 {self.streak} 轮后自愈）")
             self.streak = 0
@@ -740,6 +836,8 @@ class WsaNetGuard:
                  f"  device   : {res.get('device_state') or '(不在 adb devices 里)'}",
                  f"  ping     : {res.get('ping')}（ping 可用={self._ping_usable}）",
                  f"  探测证据 : {res.get('net_probe') or self._ping_evidence or '(无)'}",
+                 f"  联网验证 : {res.get('validation') or '(未检测)'}"
+                 f"{'  ' + str(res.get('validation_evidence') or '') if res.get('validation') else ''}",
                  f"  候选目标 : {' '.join(self._targets()[:4])}",
                  f"  宿主端口 : {self.host}:{self.port or wsa_adb_port()} "
                  f"{'监听中' if host_port_open(self.host, self.port or wsa_adb_port()) else '未监听'}"]
@@ -791,7 +889,14 @@ def load_guard_config(config_path: str, section: str = "wsa_guard") -> dict:
         import yaml  # type: ignore
         data = yaml.safe_load(text) or {}
         sec = data.get(section) if isinstance(data, dict) else None
-        return dict(sec) if isinstance(sec, dict) else {}
+        out = dict(sec) if isinstance(sec, dict) else {}
+        # 顺带带出顶层 adb.path：本工具必须和主程序用**同一个 adb**。
+        # 两个不同版本的 adb.exe 会互相杀掉对方在 5037 上的 server，表现就是
+        # 设备一会儿在线一会儿掉线。
+        adb_sec = data.get("adb") if isinstance(data, dict) else None
+        if isinstance(adb_sec, dict) and adb_sec.get("path") and not out.get("adb_path"):
+            out["adb_path"] = adb_sec["path"]
+        return out
     except ImportError:
         pass
     except Exception as e:  # noqa: BLE001 yaml 解析失败也别崩
@@ -811,6 +916,18 @@ def load_guard_config(config_path: str, section: str = "wsa_guard") -> dict:
         key = key.strip()
         if key:
             out[key] = _mini_yaml_scalar(val)
+    # 同样把顶层 adb.path 带出来（与主程序共用同一个 adb）
+    in_adb = False
+    for line in text.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")):
+            in_adb = line.split(":", 1)[0].strip() == "adb"
+            continue
+        if in_adb and ":" in line:
+            key, _, val = line.strip().partition(":")
+            if key.strip() == "path" and not out.get("adb_path"):
+                out["adb_path"] = _mini_yaml_scalar(val)
     return out
 
 
@@ -854,6 +971,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="WSA / WSABuilds 网络守护（独立工具）：检测断网并按级别修复",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="config.yaml", help="配置文件路径（读取 wsa_guard 段）")
+    ap.add_argument("--adb", default="", help="adb 可执行文件（默认用 config.yaml 里 adb.path，"
+                                             "必须和主程序一致）")
+    ap.add_argument("--fix-validation", action="store_true",
+                    help="修「能上网但系统认为没网」：改写联网验证探针地址（幂等，立即生效）")
     ap.add_argument("--serial", default="", help="设备序列号（如 127.0.0.1:58526）")
     ap.add_argument("--host", default="", help="WSA 宿主地址（默认取注册表/127.0.0.1）")
     ap.add_argument("--port", type=int, default=0, help="WSA adb 端口（0=自动读注册表）")
@@ -891,6 +1012,8 @@ def main(argv=None) -> int:
     if not args.config or args.config == "config.yaml":
         args.config = str(runtime_paths.resolve_config())   # 冻结时找 exe 旁边的配置
     cfg = load_guard_config(args.config)
+    if args.adb:
+        cfg["adb_path"] = args.adb
     if args.serial:
         cfg["serial"] = args.serial
     if args.host:
@@ -921,6 +1044,15 @@ def main(argv=None) -> int:
         res = guard.check()
         print(guard.status_text(res))
         return 0 if res["problem"] == "ok" else 1
+    if args.fix_validation:
+        state, ev = guard.check_validation()
+        print(f"当前联网验证状态: {state}\n  证据: {ev}")
+        ok = guard.action_fix_validation()
+        state2, ev2 = guard.check_validation()
+        print(f"修复动作: {'成功' if ok else '失败'}；重新读取: {state2}\n  证据: {ev2}")
+        print("说明：设置写入 /data，重启子系统后依然有效。系统要等下一轮验证才会把状态"
+              "变成 VALIDATED（TCP/DNS 通但状态暂时仍是 partial 属正常）。")
+        return 0 if ok else 1
     if args.once:
         res = guard.step()
         guard.write_state(res)
@@ -1015,6 +1147,29 @@ def run_selftest() -> int:
     check("健康时不动作", plan_action("ok", 0, 0, **kw) == "none")
     check("关闭轻量修复时网络问题不动作",
           plan_action("net_down", 3, 0, **{**kw, "light_recover": False}) == "none")
+
+    print("--- 联网验证（captive portal）---")
+    check("PARTIAL_CONNECTIVITY -> partial",
+          parse_validation_state(
+              'NetworkAgentInfo{network{102} ni{Ethernet CONNECTED} '
+              'nc{[ Capabilities: INTERNET&PARTIAL_CONNECTIVITY&NOT_VPN ]}}') == "partial")
+    check("VALIDATED（无 partial）-> validated",
+          parse_validation_state(
+              'NetworkAgentInfo{network{102} nc{[ Capabilities: INTERNET&VALIDATED ]}}')
+          == "validated")
+    check("只看 NetworkAgentInfo：请求段里的 VALIDATED 不算通过",
+          parse_validation_state(
+              'callbackRequest [ NetworkRequest [ LISTEN [ Capabilities: INTERNET&VALIDATED ]]]')
+          == "unknown")
+    check("空输出 -> unknown", parse_validation_state("") == "unknown")
+    cmds = validation_settings_commands()
+    check("验证探针命令覆盖 http/https/fallback/DoT",
+          any("captive_portal_http_url" in c and "hicloud" in c for c in cmds)
+          and any("captive_portal_https_url" in c for c in cmds)
+          and any("captive_portal_fallback_url" in c for c in cmds)
+          and any("private_dns_mode off" in c for c in cmds), str(cmds[:2]))
+    check("验证探针不再是国内不通的 gstatic",
+          all("gstatic" not in c for c in cmds))
 
     print("--- 配置解析 ---")
     check("load_guard_config 缺文件返回空 dict",

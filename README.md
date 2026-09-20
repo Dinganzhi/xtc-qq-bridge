@@ -409,9 +409,31 @@ WSA（含 WSABuilds / MagiskOnWSA）跑久了会"隔三差五断网"：宿主侧
 > 顺带一提：探测命令的退出码为 1 时也要保留输出（`ping` 丢包、`nc` 连不上都是 rc=1），
 > 这也是早期版本"一直提示无法判断"的原因之一。
 
+**根因提醒：国内网络下 `PARTIAL_CONNECTIVITY`（App 说没网，其实能上网）**
+
+WSA 里 TCP/DNS 都通、但各种 App 仍然报"网络异常"，通常不是网真的断了，而是 Android
+自己的**联网验证探针**失败：默认探针地址 `connectivitycheck.gstatic.com` 在国内连不上，
+系统于是把网络标成 `PARTIAL_CONNECTIVITY`（有 `INTERNET` 但没有 `VALIDATED`），
+App 一律当作没网。守护现在会：
+① 在状态里显示"联网验证: validated / partial / unknown"；
+② 发现"能上网但没验证通过"时**自动改写验证探针**（换成实测可达的
+`connectivitycheck.platform.hicloud.com` / `connect.rom.miui.com` / `wifi.vivo.com.cn`
+的 `generate_204`，并关掉 DoT），而不是去重启子系统——重启治不了这个病，还会打断桥接。
+
+```bash
+python tools/wsa_net_guard.py --fix-validation   # 立刻改写探针（幂等，写入 /data）
+```
+
+设置写在 `/data` 里，重启子系统后依然有效；但 Android 要等**下一轮验证**（或子系统重启）
+才会把状态翻成 `VALIDATED`，所以改完当场看到 `partial` 属正常。
+
+> **必须和主程序共用一个 adb**：守护默认读取 `config.yaml` 的 `adb.path`（也可用 `--adb` 指定）。
+> 两个**不同版本**的 `adb.exe` 会互相杀掉对方在 5037 上的 server，表现就是设备一会儿在线一会儿掉线。
+
 | 级别 | 触发条件 | 动作 |
 |---|---|---|
 | 0 | 一切正常 | 只记录状态（写入 `data/wsa_guard_state.json`，含**探测证据**文本） |
+| 0.5 | 能上网但 `PARTIAL_CONNECTIVITY` | 改写联网验证探针 + 关 DoT（10 分钟内最多一次） |
 | 1 | ADB 掉线 / 子系统网络不通 | `adb connect` 重连；网络问题则关飞行模式 + `svc wifi/data enable` |
 | 2 | 连续 2 轮仍未恢复 | `adb kill-server` + `start-server` 重连；网络栈复位（飞行模式开->关、wifi 关->开） |
 | 3 | 连续 3 轮仍未恢复 | `adb reboot` 重启 Android 子系统（**有冷却期**，默认 10 分钟内只做轻量修复） |
