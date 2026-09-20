@@ -36,6 +36,11 @@ _CONTACT_NAME_IDS = ("tv_chat_dialog_name", "tv_chat_dialog_title", "chat_dialog
 _CONTACT_PREVIEW_IDS = ("tv_chat_dialog_last_msg_content", "tv_chat_dialog_last_msg")
 # 语音模式 -> 文字模式的切换按钮
 _SWITCH_TO_TEXT_IDS = ("iv_left_img_view", "chat_record_button")
+# 发送控件 id 线索（实测 tv_send_view，可点的是父 fl_chat_text_send）
+_SEND_ID_HINTS = ("tv_send_view", "fl_chat_text_send", "btn_send", "send_view", "iv_send",
+                  "chat_send", "send_button")
+# 这些是"消息状态"图标（发送中/发送失败/重发），**不是**发送按钮，必须排除
+_SEND_EXCLUDE_IDS = ("msg_item_state", "resend", "send_state", "send_fail", "msg_state")
 # 系统录音权限弹窗按钮（不同 Android 版本 id 不同，全部尝试）
 _PERMISSION_ALLOW_IDS = (
     "com.android.permissioncontroller:id/permission_allow_foreground_only_button",
@@ -120,6 +125,7 @@ class Xiaotiancai:
             self._send_retries = 2
         self._net_retry_ts = 0.0     # 网络弹窗"重试"按钮的点击冷却
         self._last_dump_warn = 0.0   # "读不到界面"告警的节流时间戳
+        self._last_label_retry = 0.0  # "快照里没有时间标签"的补救重读节流
 
     def log(self, level: str, msg: str):
         if self.logger is None:
@@ -1493,10 +1499,19 @@ class Xiaotiancai:
             base_fail = self._fail_signature(root)
             base_own = self._own_bubble_counter(root)
             self._clear_chat_input(root)
-            self.adb.tap_element(input_node)
-            time.sleep(self._delay)   # 等软键盘弹出，避免输入被吞
+            self._focus_input(input_node)
             if not self.adb.input_text(text, verify=self.input_verifier(text)):
-                return False, "文本注入失败（输入框未收到内容）"
+                # 注入失败最常见的原因是"输入框没拿到输入连接"（点一下没生效、
+                # 输入法没挂上）。这时反复发 ADBKeyBoard 广播是没用的（没人接收），
+                # 必须重新点击输入框拿到焦点后再注入一次。
+                self.log("warning", "文本注入未生效，重新聚焦输入框后再注入一次")
+                try:
+                    fresh = self._dump_fast()
+                except AdbError:
+                    fresh = root
+                self._focus_input(self._find_input(fresh) or input_node)
+                if not self.adb.input_text(text, verify=self.input_verifier(text)):
+                    return False, "文本注入失败（输入框未收到内容）"
             time.sleep(0.3)
             try:
                 send_root = self._dump_fast()
@@ -1507,10 +1522,21 @@ class Xiaotiancai:
                 self.log("warning", "未找到发送按钮，改用回车发送")
                 self.adb.keyevent(66)  # KEYCODE_ENTER
             else:
-                self.adb.tap_element(send_node)
+                self._tap_send(send_node, send_root)
             return self._confirm_sent(text, base_fail, base_own)
         except AdbError as e:
             return False, f"ADB 异常: {e}"
+
+    def _focus_input(self, edit) -> None:
+        """点击输入框让它获得焦点，并等软键盘/输入连接就绪。
+
+        输入框没有焦点时，ADBKeyBoard 的广播会"发出去了但没人接收"，
+        表现就是"文本注入失败（输入框未收到内容）"。
+        """
+        if edit is None:
+            return
+        self.adb.tap_element(edit)
+        time.sleep(self._delay)
 
     def _confirm_sent(self, text: str, base_fail: list, base_own: dict) -> tuple[bool, str]:
         """发送后确认（最多 3 次快速 dump，约 2s）。返回 (是否确认发出, 说明)。"""
@@ -1579,23 +1605,51 @@ class Xiaotiancai:
         return None
 
     def _find_send(self, root: ET.Element):
+        """找"发送"控件。必须**只**认真正的发送控件，不能误认消息状态图标。
+
+        实机（WSA + 小天才，1366x768）实测：
+        - 输入框有内容时：`tv_send_view`（TextView text=发送，本身 clickable=false，
+          真正可点的是它的父 `fl_chat_text_send`）；
+        - 输入框为空时：**没有** tv_send_view；此时旧的 content-desc 子串匹配会命中
+          `iv_chat_msg_item_state`（每条消息右侧的"发送中/发送失败"状态图标），
+          于是"没输入内容也以为发送按钮存在"——注入其实没成功却继续点它，
+          表现为"莫名其妙发送失败"。所以这里排除状态图标，且 desc 必须完全相等。
+        """
         rid = self.ui.get("send_resource_id", "")
         if rid:
             n = self.adb.find_element(root, resource_id=rid)
             if n is not None:
                 return n
-        # resource-id 含 send（实测 tv_send_view）
+        # 1) 已知发送控件 id（不依赖文案，最稳）
         for n in root.iter("node"):
-            if "send" in self._id_tail(n).lower() and "Text" in n.get("class", ""):
+            tail = self._id_tail(n).lower()
+            if any(x in tail for x in _SEND_EXCLUDE_IDS):
+                continue
+            if any(x in tail for x in _SEND_ID_HINTS):
                 return n
-        # 精确文本"发送"（不能用 text_contains：会命中输入框"发送文字"提示）
+        # 2) 精确文本"发送"（不能用 text_contains：会命中输入框"发送文字"提示）
         for t in self.ui.get("send_texts", ["发送"]):
-            n = self._first(
-                self.adb.find_element(root, text=t),
-                self.adb.find_element(root, content_desc=t))
+            n = self.adb.find_element(root, text=t)
             if n is not None:
                 return n
+        # 3) 最后才看 content-desc，且必须完全相等 + 不是消息状态图标
+        for t in self.ui.get("send_texts", ["发送"]):
+            n = self.adb.find_element(root, content_desc=t, content_desc_contains=False)
+            if n is not None and not any(
+                    x in self._id_tail(n).lower() for x in _SEND_EXCLUDE_IDS):
+                return n
         return None
+
+    def _tap_send(self, send_node, root: ET.Element) -> None:
+        """点发送：优先点它自己，不可点则点最近的可点祖先（实测 tv_send_view
+        的 clickable=false，父 fl_chat_text_send 才接收点击）。"""
+        target = send_node
+        try:
+            if str(send_node.get("clickable", "")).lower() != "true":
+                target = self._clickable_ancestor(send_node, root) or send_node
+        except Exception:  # noqa: BLE001 拿不到祖先就点自己
+            target = send_node
+        self.adb.tap_element(target)
 
     # ------------------------------------------------------------------ 界面初始化/恢复
     def ensure_input_clean(self) -> str:
@@ -1694,6 +1748,22 @@ class Xiaotiancai:
                 return (None, None, "", "", [])
             if self.is_in_chat(root):
                 contact, text, time_label = self._latest_in_chat(root)
+                # 偶发的"不完整界面快照"：聊天里有消息，但一个时间标签都没有。
+                # 这时直接转发会退化成"当前时间"（用户报告过 8 点的消息被按当前时间
+                # 转发）。重读一两次通常就有标签了；20 秒内只补救一次，避免拖慢轮询。
+                if (text and not time_label and self._date_count(root) == 0
+                        and time.monotonic() - self._last_label_retry >= 20):
+                    self._last_label_retry = time.monotonic()
+                    for _ in range(2):
+                        time.sleep(0.4)
+                        again = self._dump_with_retry(1)
+                        if again is None or not self.is_in_chat(again):
+                            break
+                        c2, t2, l2 = self._latest_in_chat(again)
+                        if l2:
+                            root = again                     # 用更完整的那次快照
+                            contact, text, time_label = (c2 or contact), t2, l2
+                            break
                 own_recent = self._own_texts_in_chat(root)
                 return (contact, text, time_label,
                         own_recent[0][0] if own_recent else "", own_recent)
@@ -1764,16 +1834,35 @@ class Xiaotiancai:
         if not candidates:
             return (None, None, "")
         n, t, y_bottom = max(candidates, key=lambda c: c[2])
-        # 取气泡上方最近的日期标签作为时间
-        time_label = ""
-        bubble_top = (self._bounds(n) or (0, 0, 0, 0))[1]
-        # dates 按 y 升序；取"最靠下且仍在气泡上方"的标签 = 最近的上方标签
-        # （注意不能用第一个满足的——那是最上面的标签，会取到更早消息的时间）
-        for d_top, d_bottom, d_text in reversed(dates):
-            if d_bottom <= bubble_top + 5:  # 标签在气泡上方
-                time_label = d_text
-                break
-        return (None, t, time_label)
+        return (None, t, self._label_for_bubble(n, dates))
+
+    def _label_for_bubble(self, bubble, dates: list) -> str:
+        """给某个气泡挑时间标签（dates = [(top, bottom, text)]，按 top 升序）。
+
+        ① 优先"最靠下且仍在该气泡上方"的标签（同一时间段只有组首上方有标签）；
+        ② 有些版本把时间画在气泡同一行（左右并排），取垂直区间有重叠的标签；
+        ③ 都不匹配时（标签被虚拟列表回收、气泡被输入栏遮挡等）取垂直中心最近的标签。
+        返回 "" 表示这次界面快照里确实没有任何可用的时间信息。
+
+        为什么这么费劲：拿不到标签时上层会退化成"当前时间"，用户遇到过
+        "8 点发的消息被按当前时间转发"。
+        """
+        b = self._bounds(bubble)
+        if not b or not dates:
+            return ""
+        top, bottom = b[1], b[3]
+        for _d_top, d_bottom, d_text in reversed(dates):   # ② 之前先满足 ①
+            if d_bottom <= top + 5:
+                return d_text
+        row = [d for d in dates if d[0] < bottom and d[1] > top]
+        if row:
+            return max(row, key=lambda d: d[1])[2]
+        center = (top + bottom) / 2
+        return min(dates, key=lambda d: abs((d[0] + d[1]) / 2 - center))[2]
+
+    def _date_count(self, root: ET.Element) -> int:
+        return sum(1 for n in root.iter("node")
+                   if self._id_tail(n) == "tv_chat_msg_item_date")
 
     # ------------------------------------------------------------------ 历史消息 / 命令轮询
     def _chat_bubbles(self, root: ET.Element, include_own: bool = False) -> list[dict]:

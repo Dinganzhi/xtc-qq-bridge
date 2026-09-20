@@ -1200,6 +1200,126 @@ def test_logger_tolerant_stream() -> None:
     check("可编码内容仍然写出", "普通中文 OK" in raw.data, raw.data[:40])
 
 
+def test_find_send_ignores_message_state_icon() -> None:
+    """输入框为空时，"发送"不能命中消息状态图标（发送中/发送失败）。
+
+    实机（WSA）实测：输入框为空时没有 tv_send_view，但每条消息右侧有
+    iv_chat_msg_item_state（content-desc="发送失败"）。旧的 content-desc 子串匹配
+    "发送"会命中它，于是"没输入内容也以为发送按钮存在"——注入其实没成功也继续走，
+    点击还落到状态图标上，表现为"莫名其妙发送失败"。
+    """
+    xml = node_xml(
+        n(cls="android.widget.TextView", text="", rid="com.xtc.watch:id/tv_chat_msg_item_date",
+          bounds="[945,312][990,337]")
+        + n(cls="android.widget.ImageView", text="", desc="发送失败",
+            rid="com.xtc.watch:id/iv_chat_msg_item_state", bounds="[1022,614][1042,634]")
+        + n(cls="android.widget.EditText", text=" 发送文字",
+            rid="com.xtc.watch:id/et_chat_text_content", bounds="[774,678][1120,721]"))
+    xtc, _ = make_xtc(xml, ui_cfg={"send_resource_id": "com.xtc.watch:id/tv_send_view"})
+    found = xtc._find_send(ET.fromstring(xml))
+    check("空输入框时找不到发送按钮（不误认消息状态图标）", found is None,
+          f"got={None if found is None else xtc._id_tail(found)}")
+
+    xml2 = node_xml(
+        '<node class="android.widget.FrameLayout" text="" '
+        'resource-id="com.xtc.watch:id/fl_chat_text_send" content-desc="" '
+        'clickable="true" bounds="[1275,677][1323,721]">'
+        '<node class="android.widget.TextView" text="发送" '
+        'resource-id="com.xtc.watch:id/tv_send_view" content-desc="" '
+        'clickable="false" bounds="[1275,683][1317,715]" /></node>')
+    xtc2, adb2 = make_xtc(xml2, ui_cfg={"send_resource_id": "com.xtc.watch:id/tv_send_view"})
+    root2 = ET.fromstring(xml2)
+    send = xtc2._find_send(root2)
+    check("有内容时命中真正的发送控件 tv_send_view",
+          send is not None and xtc2._id_tail(send) == "tv_send_view",
+          f"got={None if send is None else xtc2._id_tail(send)}")
+    xtc2._tap_send(send, root2)
+    check("点发送时点的是可点击的父容器 fl_chat_text_send",
+          any("1275,677" in c for c in adb2.calls), str(adb2.calls[-1:]))
+
+
+def test_content_desc_exact_match() -> None:
+    """content-desc 支持"完全相等"，避免子串误伤。"""
+    root = ET.fromstring(node_xml(
+        n(cls="android.widget.ImageView", text="", desc="发送失败",
+          rid="com.xtc.watch:id/iv_chat_msg_item_state")))
+    adb = FakeAdb()
+    check("默认仍是子串匹配（不影响弹窗/按钮文案）",
+          adb.find_element(root, content_desc="发送") is not None)
+    check("显式关闭子串后不命中",
+          adb.find_element(root, content_desc="发送", content_desc_contains=False) is None)
+
+
+def test_time_label_fallbacks() -> None:
+    """时间标签：上方优先 / 同一行 / 垂直最近，都取不到才返回空串。"""
+    xtc, _ = make_xtc("", ui_cfg={})
+    bubble = ET.fromstring(n(bounds="[786,351][922,531]"))
+    dates = [(123, 148, "07:06"), (312, 337, "08:08"), (565, 590, "22:20")]
+    got = xtc._label_for_bubble(bubble, dates)
+    check("取气泡上方最近的标签（不是最上面那个）", got == "08:08", f"got={got!r}")
+    got2 = xtc._label_for_bubble(bubble, [(351, 376, "08:08")])
+    check("时间画在气泡同一行时也能取到", got2 == "08:08", f"got={got2!r}")
+    got3 = xtc._label_for_bubble(bubble, [(700, 725, "23:59")])
+    check("都不匹配时退化为垂直最近的标签", got3 == "23:59", f"got={got3!r}")
+    got4 = xtc._label_for_bubble(bubble, [])
+    check("确实没有标签时返回空串", got4 == "", f"got={got4!r}")
+
+
+class SeqAdb(FakeAdb):
+    """按调用次数返回不同界面快照（模拟"偶发不完整 dump"）。"""
+
+    def __init__(self, xmls: list) -> None:
+        super().__init__("", "com.xtc.watch/.ChatActivity")
+        self.xmls = list(xmls)
+        self.i = 0
+
+    def dump_ui(self, retries: int = 3, delay: float = 2.0):
+        xml = self.xmls[min(self.i, len(self.xmls) - 1)]
+        self.i += 1
+        return ET.fromstring(xml)
+
+
+def test_latest_message_retries_when_labels_missing() -> None:
+    """快照里"有消息但一个时间标签都没有"时，要重读拿到消息真实时间。
+
+    不修的话上层会退化成"当前时间"，用户就看到了"8 点发的消息按当前时间转发"。
+    """
+    no_label = node_xml(
+        n(cls="android.widget.TextView", text="早上好", desc="童武洋发的消息,早上好",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[786,351][922,531]"))
+    with_label = node_xml(
+        n(cls="android.widget.TextView", text="早上好", desc="童武洋发的消息,早上好",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[786,351][922,531]")
+        + n(cls="android.widget.TextView", text="08:08",
+            rid="com.xtc.watch:id/tv_chat_msg_item_date", bounds="[945,312][990,337]"))
+    adb = SeqAdb([no_label, with_label])
+    xtc = Xiaotiancai(adb, {"ui": {}}, logger=None)
+    xtc.require_login = lambda *a, **k: True          # 隔离登录态探测的 dump
+    _c, text, label, _own, _recent = xtc.get_latest_message()
+    check("重读后拿到真实时间标签", label == "08:08", f"label={label!r} text={text!r}")
+
+
+def test_start_enqueues_auto_init() -> None:
+    """启动时自动排队初始化（用户报告"程序不会自动初始化"）。"""
+    root = tmp_root()
+    cfg = {"target": {"xtc_contact": "张三"},
+           "xiaotiancai": {"ui": {"interaction_delay": 0.01}}, "webhook": {}}
+    xtc, adb = make_xtc(chat_page_xml(), ui_cfg={"interaction_delay": 0.01})
+    br = bridge_mod.MessageBridge(cfg, adb, xtc, forwarder=None, logger=None)
+    br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+    seen: list = []
+    real_put = br._job_queue.put
+    br._job_queue.put = lambda item, *a, **k: (seen.append(item), real_put(item, *a, **k))[1]
+    try:
+        br.start()
+        time.sleep(0.3)
+        check("启动时自动排队 init 任务",
+              any(j and j[0] == "init" for j in seen), f"seen={seen}")
+    finally:
+        br.stop()
+        cleanup(root)
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1221,6 +1341,9 @@ def main() -> int:
                test_input_hint_text_is_not_residue,
                test_foreground_logic_two_layers,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
+               test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
+               test_time_label_fallbacks, test_latest_message_retries_when_labels_missing,
+               test_start_enqueues_auto_init,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:

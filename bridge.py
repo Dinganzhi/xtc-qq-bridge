@@ -176,6 +176,15 @@ class MessageBridge:
         self._job_thread = threading.Thread(target=self._job_worker, name="xtc-jobs", daemon=True)
         self._job_thread.start()
         self._log("info", f"小天才消息轮询已启动（间隔 {self._poll_interval}s）")
+        # 启动即自动初始化（等价于 QQ 命令 /小天才 初始化，以前只有手动发命令才会做）：
+        # 清弹窗 -> 确认前台 -> 按需登录 -> 进入聊天页 -> 清空输入框残留。
+        # 不做这一步时，启动后的第一轮轮询可能还在列表页/残留状态上，
+        # 读到的第一条"新消息"其实是启动前的旧消息。
+        try:
+            self._job_queue.put(("init", ""))
+            self._log("info", "已排队启动自动初始化（清弹窗 / 进聊天页 / 清输入框残留）")
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"启动自动初始化入队失败: {e}")
 
     def stop(self) -> None:
         self.running = False

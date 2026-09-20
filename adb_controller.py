@@ -1358,7 +1358,8 @@ class ADBController:
 
     @staticmethod
     def _node_matches(node, resource_id=None, text=None, class_name=None,
-                      content_desc=None, text_contains=False) -> bool:
+                      content_desc=None, text_contains=False,
+                      content_desc_contains=True) -> bool:
         if resource_id:
             rid = node.get("resource-id", "")
             if rid != resource_id and not rid.endswith("/" + resource_id.lstrip("/")):
@@ -1375,7 +1376,14 @@ class ADBController:
             if c != class_name and not c.endswith("." + class_name):
                 return False
         if content_desc:
-            if content_desc not in node.get("content-desc", ""):
+            d = node.get("content-desc", "")
+            # 默认子串匹配（历史行为：弹窗/按钮文案常带前后缀）；
+            # 但"精确等于"的场景必须显式关掉子串匹配——例如发送按钮的"发送"
+            # 会命中"发送失败/发送中"这类消息状态图标。
+            if content_desc_contains:
+                if content_desc not in d:
+                    return False
+            elif d != content_desc:
                 return False
         return True
 
