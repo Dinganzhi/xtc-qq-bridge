@@ -872,15 +872,17 @@ xtc-wsa-guard.exe --test             # 守护自身逻辑自测（不需要设�
 
 三条可行路线：
 
-**(a) GitHub Actions（推荐，本项目已配好）**：推一个 tag 就会自动为 6 个平台矩阵编译并发布 Release：
+**(a) GitHub Actions（推荐，本项目已配好）**：推一个 tag 会为 6 个平台矩阵编译并把产物传到 Actions 附件：
 
 ```bash
 git tag v1.1.0 && git push origin v1.1.0      # 触发 .github/workflows/build-release.yml
 ```
 
 工作流做的事：跑离线测试 -> 矩阵编译（Windows/Linux/macOS × x86_64/arm64）-> 每个产物跑
-`--version` 和 `--verify` 冒烟测试 -> 重命名带平台后缀 -> 上传 Release 附件。
-也可以在 Actions 页面手动 `workflow_dispatch` 只编译不发布。
+`--version` 和 `--verify` 冒烟测试 -> 重命名带平台后缀 -> 上传 Actions 产物。
+
+发布（创建 GitHub Release）**不会**自动发生：只有到 Actions 页面手动 `workflow_dispatch`，
+并显式勾选 `publish` 为真，才会创建/更新 Release。这样打 tag 永远不会变成正式发布。
 
 矩阵里的 runner 与注意点：
 
