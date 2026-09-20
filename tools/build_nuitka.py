@@ -356,9 +356,8 @@ def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     if not exe or not exe.exists():
         print(f"[冒烟] 找不到可执行文件（artifact={artifact}），跳过")
         return False
-    cmds = [["--version"]] if target == "guard" else [["--version"], ["--verify"]]
-    if target == "guard":
-        cmds.append(["--test"])
+    # guard 没有 --version（它只有 --test 等参数），所以两个目标的自检命令不一样
+    cmds = [["--test"]] if target == "guard" else [["--version"], ["--verify"]]
     ok = True
     for extra in cmds:
         try:
