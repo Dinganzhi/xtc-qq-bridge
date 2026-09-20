@@ -916,6 +916,8 @@ PLATFORM=linux/arm64 bash tools/build_in_docker.sh                    # arm64（
 |---|---|
 | `The '--output-dir' option requires an argument with '--output-dir='` | Nuitka 4.2 要求 `--opt=value` 写法（驱动脚本已统一用等号，老版本会自动退回 `--onefile`） |
 | `failed to create cache directory` | Nuitka 缓存目录不可写（受限环境）：驱动脚本会自动改用项目内 `.nuitka-cache`，也可手动设 `NUITKA_CACHE_DIR` |
+| 构建崩在 `AssertionError: ...\dist\main.build\module.__main__.c` | 上次编译被打断（Ctrl+C / 崩溃）或两个编译并行，残留的中间目录会让 Nuitka 的断言失败。驱动脚本现在会在编译前**自动清掉** `<目标>.build` / `.onefile-build` / `.dist`，失败时也会清掉半成品；如果你是自己手敲 nuitka 命令，删掉 `dist/main.build` 再编即可 |
+| `[中止] 另一个编译正在进行（pid=...）` | 同一个输出目录已经有编译在跑（并行会互相踩，表现就是上面那条断言）。等它结束再编；确认那个进程已经死了，删掉 `dist/.build.lock` 重试（pid 已消失的残留锁会自动接管，不会永久卡住） |
 | Windows 报找不到 C 编译器 | 装 Visual Studio 2022+ 的"使用 C++ 的桌面开发"；**Python 3.13/3.14 不能用 MinGW64** |
 | 编译过了但运行报 `No module named yaml` | 编译时没装 pyyaml 或漏了 `--include-package=yaml`（驱动已默认加，`--check-env` 会提前报错） |
 | 运行 `--verify` 报"捆绑资源缺失" | 编译时漏了 `--include-data-*`（驱动已按清单打包；插件是**逐文件**打进包的，因为 `--include-data-dir` 会剔除 `.py`） |

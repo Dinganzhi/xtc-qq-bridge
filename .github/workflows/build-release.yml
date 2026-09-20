@@ -103,6 +103,9 @@ jobs:
       - name: Build with Nuitka (+ built-in smoke test)
         # 驱动脚本编译完会自己在干净目录里跑 --version / --verify（bridge）或 --test（guard），
         # 顺带验证"数据写在 exe 旁边、捆绑资源确实打进包了"，失败即整个 job 失败。
+        # 显式用 bash：Nuitka 会把大量进度写到 stderr，而 GitHub 的 pwsh 步骤带
+        # $ErrorActionPreference='stop'，在 Windows runner 上可能把正常日志当错误中止步骤。
+        shell: bash
         run: python tools/build_nuitka.py --mode ${{ matrix.mode }} --target all --out dist
 
       - name: Show artifacts
