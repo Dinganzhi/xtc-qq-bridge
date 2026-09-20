@@ -68,7 +68,7 @@ fi
 if command -v adb >/dev/null 2>&1; then
     say_ok "adb: $(command -v adb)"
 elif [ -f "config.yaml" ]; then
-    say_warn "PATH 里没有 adb；若 config.yaml → adb.path 已指定绝对路径可忽略"
+    say_warn "PATH 里没有 adb；若 config.yaml -> adb.path 已指定绝对路径可忽略"
 else
     say_warn "PATH 里没有 adb（macOS: brew install --cask android-platform-tools）"
 fi
@@ -126,6 +126,8 @@ menu() {
     echo "  4) 打印当前界面控件   (--debug dump-ui)"
     echo "  5) 编辑 config.yaml"
     echo "  6) 查看日志           (logs/bridge.log 末尾 40 行)"
+    echo "  7) WSA 网络守护状态   (tools/wsa_net_guard.py --status)"
+    echo "  8) 运行 WSA 网络守护  (常驻，Ctrl+C 退出)"
     echo "  0) 退出"
     echo "--------------------------------------------"
 }
@@ -173,6 +175,19 @@ while true; do
             else
                 say_warn "还没有日志文件 logs/bridge.log（先启动一次桥接）"
             fi
+            ;;
+        7)
+            echo
+            "$PY" tools/wsa_net_guard.py --status
+            echo
+            ;;
+        8)
+            echo
+            echo "[运行] WSA 网络守护（常驻，Ctrl+C 退出）"
+            echo "  分级修复：重连 -> 网络复位 -> 重启子系统（必要时）"
+            echo
+            "$PY" tools/wsa_net_guard.py
+            echo
             ;;
         0|q|Q)
             exit 0

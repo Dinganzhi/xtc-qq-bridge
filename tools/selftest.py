@@ -81,10 +81,10 @@ def main() -> int:
     except AdbError as e:
         check("截图", False, str(e))
 
-    # 7. 读取消息（未登录时应返回 (None, None) 且不崩溃）
-    contact, text = xtc.get_latest_message()
-    check("读取最新消息（不崩溃即可）", True,
-          f"contact={contact!r} text={text!r}（未登录时为空属预期）")
+    # 7. 读取消息（未登录时应返回空元组且不崩溃）
+    result = xtc.get_latest_message()
+    check("读取最新消息（不崩溃即可）", isinstance(result, tuple) and len(result) == 5,
+          f"{result!r}（未登录时全部为空属预期）")
 
     # 8. 中文输入能力（真机验证：只在聊天页/输入框聚焦时才真正注入）
     try:

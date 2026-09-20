@@ -1,0 +1,145 @@
+name: build-release
+
+# 触发方式：
+#   - 打 tag（v*）          -> 编译 + 上传 Release 附件
+#   - 手动 workflow_dispatch -> 只编译 + 上传 Actions 产物
+#   - 推送到 main           -> 只跑测试（不编译，省时间）
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "编译模式"
+        type: choice
+        options: [onefile, standalone]
+        default: onefile
+
+permissions:
+  contents: write        # 发布 Release 需要
+
+jobs:
+  # ---------------------------------------------------------------- 先过测试
+  test:
+    name: offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: python -m pip install -r requirements.txt
+      - name: Offline test suites
+        run: |
+          python tools/test_wsa.py
+          python tools/test_integration.py
+          python tools/test_reported_bugs.py
+          python tools/test_paths.py
+          python tools/wsa_net_guard.py --test
+
+  # ---------------------------------------------------------------- 矩阵编译
+  build:
+    name: build ${{ matrix.artifact }}
+    needs: test
+    # 只有 tag / 手动触发才编译；普通 push 只跑测试
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x86_64（自带 Visual Studio 2022，MSVC）
+          - os: windows-latest
+            artifact: windows-x86_64
+            mode: onefile
+          # Linux x86_64：用 22.04 让产物 glibc 门槛更低（22.04 = glibc 2.35）
+          - os: ubuntu-22.04
+            artifact: linux-x86_64
+            mode: onefile
+          # Linux arm64：GitHub 的 Arm 原生 runner（公开仓库免费；私有仓库需 Arm 配额）
+          - os: ubuntu-24.04-arm
+            artifact: linux-arm64
+            mode: onefile
+          # Windows arm64：公开预览 runner（不可用时删掉这一项即可，不影响其它平台）
+          - os: windows-11-arm
+            artifact: windows-arm64
+            mode: onefile
+          # macOS（可选，按需删除）
+          - os: macos-14
+            artifact: macos-arm64
+            mode: onefile
+          - os: macos-13
+            artifact: macos-x86_64
+            mode: onefile
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 编译产物不要求目标机器装 Python；这里用 3.12 覆盖面最广（3.10~3.14 都支持）
+          python-version: "3.12"
+
+      - name: Install build deps
+        run: python -m pip install -U -r requirements-build.txt
+
+      - name: Show build environment
+        # 诊断步骤：即使自检报错也不要卡住后面的编译（真正缺编译器时，Nuitka 自己的
+        # 报错更准确）。这里顺带把 `nuitka --version` 原样打出来，便于排障。
+        continue-on-error: true
+        run: |
+          python -m nuitka --version
+          python tools/build_nuitka.py --check-env
+
+      - name: Build with Nuitka (+ built-in smoke test)
+        # 驱动脚本编译完会自己在干净目录里跑 --version / --verify（bridge）或 --test（guard），
+        # 顺带验证"数据写在 exe 旁边、捆绑资源确实打进包了"，失败即整个 job 失败。
+        run: python tools/build_nuitka.py --mode ${{ matrix.mode }} --target all --out dist
+
+      - name: Show artifacts
+        shell: bash
+        run: ls -la dist
+
+      - name: Rename artifacts with platform/arch suffix
+        shell: bash
+        run: |
+          set -e
+          mkdir -p upload
+          for f in dist/*.exe dist/*bridge* dist/*guard*; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in
+              *.dist) cp -r "$f" "upload/${base%.dist}-${{ matrix.artifact }}.dist" ;;
+              *)      cp -r "$f" "upload/${base}-${{ matrix.artifact}}" ;;
+            esac
+          done
+          cp dist/*.sha256 upload/ 2>/dev/null || true
+          ls -la upload
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: upload/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List files
+        run: ls -la artifacts
+      - name: Create/Update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

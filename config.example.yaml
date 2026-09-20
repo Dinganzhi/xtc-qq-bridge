@@ -1,12 +1,12 @@
 # =====================================================================
-#  小天才 ↔ QQ 桥接 · 配置模板
+#  小天才 <-> QQ 桥接 · 配置模板
 #  复制为 config.yaml 后按需修改。所有路径/账号/昵称均需按本机实际填写
 #  建议阅读 README.md 后再进行编辑
 # =====================================================================
 
 # ---------- ADB / 模拟器 / 容器（Windows / Linux / macOS 通用） ----------
-# 设备查找顺序：已有的在线设备 → 环境变量 ADB_SERIAL → WSA 端口（仅 Windows）
-#   → 常见 adb 端口（5555 通用 / 16384 MuMu / 62001 夜神 / 21503 逍遥 / 5556 Waydroid）。
+# 设备查找顺序：已有的在线设备 -> 环境变量 ADB_SERIAL -> WSA 端口（仅 Windows）
+#   -> 常见 adb 端口（5555 通用 / 16384 MuMu / 62001 夜神 / 21503 逍遥 / 5556 Waydroid）。
 # 已有设备永远优先，不会被抢掉。
 adb:
   path: ""                                       # 留空自动探测（雷电/MuMu/Waydroid/WindowsApps/PATH）
@@ -20,6 +20,10 @@ adb:
   heartbeat_interval: 10
   disable_animations: true                       # 关闭系统动画（uiautomator dump 需要界面空闲才能工作）
   input_retries: 2                               # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
+  dump_retries: 2                                # UI dump 默认重试次数（交互路径自动用更快的单次 dump）
+  dump_delay: 0.8                                # UI dump 重试间隔（秒，逐轮递增等待界面空闲）
+  dump_timeout: 60                               # 单次 uiautomator dump 超时（秒）
+  focus_cache_ttl: 1.5                           # 前台组件缓存秒数（减少 dumpsys，提升点击/发送速度）
 
 # ---------- 转发（QQ 侧） ----------
 forward:
@@ -31,7 +35,7 @@ forward:
 # ---------- 桥接目标 ----------
 target:
   xtc_contact: ""                                # 小天才 App 里的联系人昵称（如“小宝”）
-  nicknames:                                     # 显示昵称映射：App名 → 转发到QQ时显示的昵称
+  nicknames:                                     # 显示昵称映射：App名 -> 转发到QQ时显示的昵称
                                                  # 行首 # 是注释=不生效；启用时删掉 #
     # "小宝": "宝贝"
   default_nickname: ""                           # 未命中映射时的兜底；留空回退 App 原始名
@@ -41,8 +45,8 @@ target:
   qq_group: ""                                   # 转发目标群号：单个或多个（可与 qq_private 并存）
 
 # 消息格式（双向）：
-#   小天才 → QQ:  [HH:MM] [本地配置昵称] 消息内容（转发到上面全部目标）
-#   QQ → 小天才:  [HH:MM] [QQ发送人昵称] 消息内容（由插件用 /小天才 <文本> 命令触发，
+#   小天才 -> QQ:  [HH:MM] [本地配置昵称] 消息内容（转发到上面全部目标）
+#   QQ -> 小天才:  [HH:MM] [QQ发送人昵称] 消息内容（由插件用 /小天才 <文本> 命令触发，
 #                 且发送者需命中 webhook 白名单）
 
 # ---------- 小天才 App ----------
@@ -54,19 +58,46 @@ xiaotiancai:
   login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
     phone: ""                                    # 手机号
     password: ""                                 # 密码（注意：不是验证码）
-  login_check_interval: 600                      # 未登录自动检测间隔（秒）= 10 分钟
+  auto_login: true                               # 自动登录总开关（也可用 /小天才 自动登录 临时切换）
+  login_check_interval: 600                      # 登录态复查间隔（秒）= 10 分钟
+  login_retry_interval: 120                      # 登录"超时/网络慢"后的重试间隔（秒）
+  login_retry_after_fail: 1800                   # 明确账号/密码错误后的重试间隔（秒）
+  login_retry_after_risk: 900                    # 触发安全验证后的重试间隔（秒，等用户手动完成）
+  login_state_ttl: 5                             # 登录态缓存秒数（减少界面 dump）
   ui:
     # 登录家长账号后运行 `python tools/dump_ui.py` 查看真实界面，按需修改：
     message_tab_text: "微聊"                     # 聊天列表 Tab 文案（精确匹配）
+    message_tab_texts: ["微聊", "消息", "聊天"]   # 找不到联系人时依次尝试切换的 Tab 文案
+    contact_name_ids: ["tv_chat_dialog_name", "tv_chat_dialog_title", "chat_dialog_name"]
+                                                 # 消息列表里"联系人名"控件 id（末段）；找不到联系人时优先按它匹配
+    contact_preview_ids: ["tv_chat_dialog_last_msg_content", "tv_chat_dialog_last_msg"]
+                                                 # 消息列表行"预览"控件 id（末段）；用于判断当前页是不是列表
+    chat_id_hints: ["chat_input", "chat_edit", "et_chat_text", "chat_text_content",
+                    "chat_record", "record_button", "send_view", "btn_send", "tv_send",
+                    "chat_msg_item", "chatting_input", "edit_chat"]
+                                                 # "这是聊天页"的 id 包含特征（判定在不在聊天页）
+    activity_chat_exclude: ["list", "main", "welcome", "login", "register", "signin",
+                            "watchmsg", "msglist", "message"]
+                                                 # Activity 名含这些词就不算聊天页（防止把列表页当聊天页）
     login_markers: ["注册/登录"]                 # 出现这些文案视为未登录
     risk_markers: ["安全验证", "风险", "滑块", "拖动滑块", "图形验证", "验证码"]
-    login_error_markers: ["密码错误", "账号不存在", "不存在", "错误", "失败", "次数过多"]
+    # 登录失败判定：泛化词（错误/失败/不存在）只会在"短提示且不含网络字眼"时才采纳，
+    # "登录中/正在验证/请稍候"等进度文案一律不判失败（见 login_progress_markers）。
+    login_error_markers: ["密码错误", "账号不存在", "手机号不存在", "错误", "失败", "次数过多"]
+    login_progress_markers: ["登录中", "正在登录", "正在验证", "验证中", "正在提交", "请稍候",
+                             "请稍后", "正在加载", "加载中", "处理中", "请等待"]
+    login_timeout: 45                            # 等待登录结果的最长秒数（超时=稍后重试，不算密码错）
     watch_contact: ""                            # 与 target.xtc_contact 相同（列表读取用）
     input_resource_id: "com.xtc.watch:id/et_chat_text_content"
     send_resource_id: "com.xtc.watch:id/tv_send_view"
     send_texts: ["发送"]
+    interaction_delay: 0.6                       # 点击/输入之间的等待（秒）；设备慢可调大到 1.0
+    send_retries: 2                              # 发送确认失败时的重试轮数（仅在"输入框仍留有内容"时重发）
+    send_fail_markers: ["发送失败", "发送不成功", "未发送", "网络异常", "网络不可用", "发送异常", "无法发送"]
+    popup_skip_texts: ["以后再说", "稍后再说", "暂不更新", "稍后更新", "下次再说", "暂不升级", "忽略此版本", "取消", "关闭"]
+    anr_wait_texts: ["等待", "等待响应", "继续等待"]
     chat_junk_texts: ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话", "试试和宝贝聊天吧", "试试将作业要求发送给宝贝吧"]
-    system_msg_prefixes: ["发送成功", "发送失败", "✅", "❌"]   # 桥接系统提示前缀（送达确认等），读取时跳过不转发
+    system_msg_prefixes: ["发送成功", "发送失败"]   # 桥接系统提示前缀（送达确认等），读取时跳过不转发（务必不要留空项）
     badge_resource_ids: []
 
 # ---------- 日志 ----------
@@ -74,7 +105,7 @@ logging:
   level: "INFO"
   file: "logs/bridge.log"
 
-# ---------- 反向回调（QQ → 小天才） ----------
+# ---------- 反向回调（QQ -> 小天才） ----------
 # 白名单（严格模式）：私聊看 allow_from、群聊看 allow_groups；对应列表为空则该类消息全部拒绝。
 # 同时是 xtc 侧命令（在小天才聊天输入 /小天才 搜索|在线人数|提醒）的搜索范围：
 #   搜索/在线人数 只在 allow_from（私聊）与 allow_groups（群聊）内统计。
@@ -86,3 +117,22 @@ webhook:
   token: "change-me-webhook-token"               # 与插件配置 python_callback_token 一致
   allow_from: []                                 # 私聊白名单：允许触发 /小天才 的 QQ 号
   allow_groups: []                               # 群聊白名单：允许触发 /小天才 的群号
+
+# ---------- WSA / WSABuilds 网络守护（独立工具，可选） ----------
+# 与主程序分开运行：python tools/wsa_net_guard.py（详见 README「WSA 网络守护」）。
+# 本段只被该工具读取；主程序不使用，留空也能跑（命令行参数优先）。
+wsa_guard:
+  interval: 30                                   # 检测间隔（秒）
+  # 判断"子系统网络是否通"：
+  #   WSA 的 NAT 不转发 ICMP -> ping 公共地址永远 100% 丢包，不能用 ping 判断断网；
+  #   所以先用 TCP 连接探测（nc），失败再看 ping，最后看 IP 与 dumpsys connectivity。
+  tcp_targets: ["223.5.5.5:53", "8.8.8.8:53", "114.114.114.114:53"]  # TCP 探测目标 host:port
+  tcp_timeout: 3                                 # nc 连接超时（秒）
+  ping_hosts: ["223.5.5.5", "8.8.8.8"]           # ICMP 探测目标（模拟器/Waydroid/真机有效）
+  ping_command: ""                               # 自定义 ping 命令（{host} 占位）；留空自动尝试多种写法
+  recover_wait: 8                                # 每次修复后等待（秒）再复查
+  light_recover: true                            # 允许飞行模式/wifi 开关等轻量修复
+  allow_reboot: true                             # 允许第 3 级修复：adb reboot 重启 Android 子系统
+  reboot_cooldown: 600                           # 两次重启的最小间隔（秒）
+  allow_restart_wsa: false                       # 允许第 4 级修复：重启宿主 WSA 客户端（最重，按需开启）
+  log_file: "logs/wsa_guard.log"

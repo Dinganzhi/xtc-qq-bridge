@@ -3,19 +3,34 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 运行时数据（本机相关）
+# 杩愯鏃舵暟鎹紙鏈満鐩稿叧锛?
 data/
 logs/
 *.log
 selftest_screen.png
 
-# 本机配置（含 QQ 号/联系人/token，勿提交）
+# 鏈満閰嶇疆锛堝惈 QQ 鍙?鑱旂郴浜?token锛屽嬁鎻愪氦锛?
 config.yaml
 
-# 测试临时目录 / 文件
+# 娴嬭瘯涓存椂鐩綍 / 鏂囦欢
 .tmp-tests/
 .bugtest*
+.pathtest*
+.frozen_test/
+.smoke_run/
 bug-*/
 
-# install.sh 可能创建的虚拟环境
+# install.sh 鍙兘鍒涘缓鐨勮櫄鎷熺幆澧?
 .venv/
+
+# 缂栬瘧浜х墿涓庝腑闂寸洰褰曪紙Nuitka锛?
+dist/
+build/
+*.dist/
+*.build/
+*.onefile-build/
+.nuitka-cache/
+*.sha256
+# 缂栬緫/璋冭瘯杩囩▼涓彲鑳藉嚭鐜扮殑涓存椂鏂囦欢
+.tmp*
+.*msg*.txt

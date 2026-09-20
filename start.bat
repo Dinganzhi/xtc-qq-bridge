@@ -104,6 +104,8 @@ echo   3. Single poll then exit   (--once)
 echo   4. Dump current UI         (--debug dump-ui)
 echo   5. Edit config.yaml
 echo   6. Show log tail           (logs\bridge.log)
+echo   7. WSA network guard check (tools\wsa_net_guard.py --status)
+echo   8. WSA network guard run   (resident, Ctrl+C to stop)
 echo   0. Quit
 echo --------------------------------------------
 set "CH="
@@ -115,6 +117,8 @@ if "%CH%"=="3" goto :once
 if "%CH%"=="4" goto :dumpui
 if "%CH%"=="5" goto :opencfg
 if "%CH%"=="6" goto :viewlog
+if "%CH%"=="7" goto :wsastatus
+if "%CH%"=="8" goto :wsaguard
 if "%CH%"=="0" goto :end
 echo [warn] Invalid choice, try again.
 goto :menu
@@ -166,6 +170,25 @@ goto :menu
 :log_tail
 echo.
 powershell -NoProfile -Command "Get-Content -Path 'logs\bridge.log' -Tail 40"
+echo.
+pause
+goto :menu
+
+:wsastatus
+echo.
+echo [run] WSA network guard status (read only)
+echo.
+"%PY%" tools\wsa_net_guard.py --status
+echo.
+pause
+goto :menu
+
+:wsaguard
+echo.
+echo [run] WSA network guard (resident, Ctrl+C to stop)
+echo       Repairs WSA/WSABuilds network drops: reconnect -^> net reset -^> reboot.
+echo.
+"%PY%" tools\wsa_net_guard.py
 echo.
 pause
 goto :menu

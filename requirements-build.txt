@@ -1,0 +1,7 @@
+# 编译期依赖（源码运行只需要 requirements.txt）
+#   Windows: 需要 Visual Studio 2022+ 的"使用 C++ 的桌面开发"（Python 3.13+ 不能用 MinGW64）
+#   Linux  : 需要 gcc/g++ 与 python3-dev
+#   macOS  : 需要 xcode-select --install
+nuitka>=4.1
+# 编译产物要读 YAML 配置，pyyaml 必须一起打进去（--include-package=yaml）
+pyyaml>=6.0

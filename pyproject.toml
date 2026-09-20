@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xtc-qq-bridge"
+# 版本号唯一来源：version.py（这里用动态读取，避免两处不一致）
+dynamic = ["version"]
+description = "小天才手表 <-> QQ 双向桥接（ADB 驱动，配合 AstrBot 插件）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dinganzhi" }]
+keywords = ["xiaotiancai", "qq", "adb", "astrbot", "bridge", "wsa", "waydroid"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Environment :: Console",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+# 编译成机器码单文件（Nuitka）
+build = ["nuitka>=4.1", "pyyaml>=6.0"]
+
+[project.scripts]
+# pip install 之后可用的命令（与 Nuitka 编译产物同名/同功能）
+xtc-qq-bridge = "main:main"
+xtc-wsa-guard = "tools.wsa_net_guard:main"
+
+[project.urls]
+Homepage = "https://github.com/Dinganzhi/xtc-qq-bridge"
+
+[tool.setuptools]
+# 本项目是"扁平模块 + 两个子包"的布局，兼容 pip install 与 Nuitka 编译
+py-modules = [
+    "main", "adb_controller", "bridge", "xiaotiancai", "plugin_client", "qq_webhook",
+    "msg_log", "runtime_paths", "version",
+]
+packages = ["utils", "tools"]
+
+[tool.setuptools.dynamic]
+version = { attr = "version.__version__" }
+
+[tool.setuptools.package-data]
+# AstrBot 插件源码 / 捆绑 APK / 配置模板：随包分发（--install-plugin 会用到）
+"*" = ["*.apk", "config.example.yaml"]
+"tools" = ["*.bat", "*.py"]

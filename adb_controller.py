@@ -9,12 +9,12 @@ UI 树解析等能力。
 - 任何能通过 `adb connect` 接入的 Android 实例（含真机 USB / 网络调试）
 
 设计要点：
-- adb 查找顺序：config 指定路径 → 环境变量 ADB_PATH → 平台常见安装路径 → PATH。
-- 设备查找顺序：**已有的在线设备** → 环境变量 ADB_SERIAL → WSA 端口（Windows）
-  → 常见端口（5555 / 16384 / 62001 …）→ 多次重试。任何情况下都不会顶掉已连接的
+- adb 查找顺序：config 指定路径 -> 环境变量 ADB_PATH -> 平台常见安装路径 -> PATH。
+- 设备查找顺序：**已有的在线设备** -> 环境变量 ADB_SERIAL -> WSA 端口（Windows）
+  -> 常见端口（5555 / 16384 / 62001 …）-> 多次重试。任何情况下都不会顶掉已连接的
   设备去抢端口。
-- 启动 App：解析 launcher activity（cmd/pm resolve-activity）→ `am start -n`
-  → `monkey -p <pkg>`（WSA 上最稳）→ `cmd package` 兜底，并轮询前台确认。
+- 启动 App：解析 launcher activity（cmd/pm resolve-activity）-> `am start -n`
+  -> `monkey -p <pkg>`（WSA 上最稳）-> `cmd package` 兜底，并轮询前台确认。
 - 前台判定：兼容 Android 13+ 的 `topResumedActivity`/`mFocusedApp`，不再只认
   `mCurrentFocus`（WSA/新镜像上 mCurrentFocus 经常为空，会把"启动成功"误判成失败）。
 - 中文输入策略链（每一步都做**结果校验**，失败才降级）：
@@ -106,8 +106,13 @@ _WSA_COMMON_PORTS = [58526, 58527, 58525, 6520, 6521]
 #   5556   = Waydroid 多实例；6520 = WSA 旧端口
 _EMULATOR_COMMON_PORTS = [5555, 16384, 7555, 21503, 62001, 62025, 5556]
 
+# uiautomator dump 的落盘目录候选（按可写性排序）。
+#   /sdcard 未挂载或 scoped storage 拦截时会写不进去（表现为 "cat: ... No such file"），
+#   /data/local/tmp 对 shell 用户一定可写，作为兜底。
+_DUMP_DIRS = ("/sdcard", "/data/local/tmp", "/storage/emulated/0")
+
 # 没有在线设备时可尝试自动拉起的模拟器/容器（Linux 优先 Waydroid）：
-#   命令 → (可执行文件候选, 参数列表)
+#   命令 -> (可执行文件候选, 参数列表)
 _LAUNCHERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # Linux（Waydroid 官方建议 wayland；会话是 X11 时加 -X）
     "waydroid": (("waydroid",), ("session", "start")),
@@ -219,7 +224,7 @@ def _environment_hints() -> list[str]:
         if wsa_installed():
             info = wsa_connection_info()
             hints.append(
-                f"检测到本机安装了 WSA：请在 WSA 设置 → Advanced settings → Developer mode "
+                f"检测到本机安装了 WSA：请在 WSA 设置 -> Advanced settings -> Developer mode "
                 f"里确认端口，然后设置 adb.port={info['port']} 或 "
                 f"adb.serial=\"{info['ip']}:{info['port']}\""
                 f"（若报 10061 端口被占用，管理员执行 netsh int ipv4 add excludedportrange "
@@ -425,7 +430,8 @@ class ADBController:
     def __init__(self, adb_path: str = "", host: str = "127.0.0.1", port: int = 5555,
                  serial: str = "", timeout: float = 30.0, logger=None,
                  extra_ports: list[int] | None = None, wsa_port: int = 0,
-                 input_retries: int = 2):
+                 input_retries: int = 2, dump_retries: int = 2, dump_delay: float = 0.8,
+                 focus_ttl: float = 1.5, dump_timeout: float = 60.0):
         self.adb_path = find_adb(adb_path)
         self.host = host
         self.port = port
@@ -435,13 +441,26 @@ class ADBController:
         self.extra_ports = [int(p) for p in (extra_ports or []) if int(p) > 0]
         self.wsa_port = int(wsa_port or 0)
         self.input_retries = max(1, int(input_retries or 1))
+        # UI dump 默认重试参数：默认值偏保守（2 次 / 0.8s），交互路径会显式用更快的
+        # 参数（retries=2, delay=0.3），避免"按个按钮要好几秒"。
+        self.dump_retries = max(1, int(dump_retries or 1))
+        self.dump_delay = max(0.0, float(dump_delay or 0.0))
+        # 单次 uiautomator dump 的超时（界面卡住时不至于把整条流程挂死）
+        self.dump_timeout = max(5.0, float(dump_timeout or 60.0))
+        # 最近一次 dump 失败的详细原因（供 --check / 诊断输出；便于排障）
+        self._last_dump_detail = ""
+        # 前台 component 缓存：dumpsys 每次要 0.3~1s，短时间内的连续判断直接复用，
+        # 命中点击/按键后立即失效（界面已变化）。
+        self.focus_ttl = max(0.0, float(focus_ttl or 0.0))
+        self._focus_cache: tuple[float, str] = (0.0, "")
+        self._activity_cache: tuple[float, str] = (0.0, "")
         self._sdk: int | None = None
         self._clipboard_ok: bool | None = None
         self._adbkeyboard_ok: bool | None = None
         self._adbkeyboard_b64_ok: bool | None = None
         self._input_verify_supported: bool | None = None
         self._is_wsa: bool | None = None
-        # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 ≠ input 物理坐标）
+        # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 != input 物理坐标）
         self._rotation: int = 0
         self._rotation_ts: float = 0.0
         self._phys: tuple[int, int] | None = None
@@ -502,7 +521,7 @@ class ADBController:
         return states
 
     def _port_candidates(self) -> list[int]:
-        """连接候选端口：WSA 端口 → 配置端口 → WSA 常见端口 → 模拟器常见端口。"""
+        """连接候选端口：WSA 端口 -> 配置端口 -> WSA 常见端口 -> 模拟器常见端口。"""
         cands: list[int] = []
         for p in ([self.wsa_port] if self.wsa_port else []) + [wsa_adb_port()] + \
                  [self.port] + self.extra_ports + _WSA_COMMON_PORTS + _EMULATOR_COMMON_PORTS:
@@ -747,15 +766,39 @@ class ADBController:
         """当前应用的逻辑屏幕尺寸（宽, 高）——uiautomator bounds 与 input 坐标所在空间。
 
         模拟器被旋转成竖屏（ROTATION_90/270）时逻辑尺寸与物理尺寸互换，
-        例如物理 1920x1080 → 逻辑 1080x1920。发送/读取的左右判定与滑动
+        例如物理 1920x1080 -> 逻辑 1080x1920。发送/读取的左右判定与滑动
         计算都应使用逻辑尺寸。"""
         pw, ph = self._phys_size()
         return (pw, ph) if self._current_rotation() in (0, 180) else (ph, pw)
 
     # ------------------------------------------------ 前台 / 焦点（兼容 Android 13+）
     @staticmethod
+    def _activity_from_dump(dump: str) -> str:
+        """只从**Activity 级**信息里解析当前界面（用于"App 在不在前台"这类判断）。
+
+        为什么要和窗口焦点分开：输入法（ADBKeyBoard）、系统弹窗、Toast 出现时
+        `mCurrentFocus` 会是那些窗口（如 com.android.adbkeyboard/.AdbIME），
+        而 App 的 Activity 仍是 resumed 状态。旧实现只看 mCurrentFocus，于是
+        "键盘一弹出来就以为 App 不在前台/未登录"。这里优先取 Activity 记录。
+        """
+        if not dump:
+            return ""
+        for key in ("topResumedActivity", "mResumedActivity", "mFocusedApp",
+                    "topResumedState", "mCurrentFocus"):
+            for line in dump.splitlines():
+                if key not in line or "null" in line.lower():
+                    continue
+                m = re.search(r"\s([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", line)
+                if m:
+                    return m.group(1)
+        return ""
+
+    @staticmethod
     def _parse_focus(dump: str) -> str:
-        """从 dumpsys window 输出里解析前台组件（兼容多种系统版本）。
+        """从 dumpsys window 输出里解析**最上层窗口**（兼容多种系统版本）。
+
+        用于弹窗/遮挡判断（需要知道当前是不是 IME/权限弹窗/Dialog）。
+        App 是否在前台请用 get_current_activity()（只看 Activity 级信息）。
 
         - Android 12-：`mCurrentFocus=Window{... u0 com.pkg/com.pkg.Act}`
         - Android 13+ / WSA：`topResumedActivity=ActivityRecord{... u0 com.pkg/.Act t123}`
@@ -773,34 +816,113 @@ class ADBController:
                     return m.group(1)
         return ""
 
-    def get_current_focus(self) -> str:
-        """返回当前前台组件，如 'com.xtc.watch/com.xtc.watch.MainActivity'；无则 ''。"""
+    def _window_dump(self) -> str:
         for cmd in ("dumpsys window", "dumpsys activity activities"):
             try:
                 out = self.shell(cmd, timeout=25)
             except AdbError:
                 continue
-            focus = self._parse_focus(out)
-            if focus:
-                return focus
+            if out:
+                return out
         return ""
 
-    def is_in_foreground(self, package: str) -> bool:
-        focus = self.get_current_focus()
+    def get_current_activity(self, use_cache: bool = True) -> str:
+        """当前 **Activity** 组件（忽略输入法/弹窗等窗口）。
+
+        与 get_current_focus() 的区别见 _activity_from_dump 的说明。
+        """
+        if use_cache and self.focus_ttl > 0:
+            ts, cached = self._activity_cache
+            if cached and (time.monotonic() - ts) < self.focus_ttl:
+                return cached
+        out = self._window_dump()
+        act = self._activity_from_dump(out)
+        if not act:                       # dumpsys window 没有 Activity 信息时退回焦点
+            act = self._parse_focus(out)
+        if act:
+            self._activity_cache = (time.monotonic(), act)
+        return act
+
+    def get_current_focus(self, use_cache: bool = True) -> str:
+        """返回当前**最上层窗口**组件（弹窗/IME 也会返回），如 'com.xtc.watch/...'；无则 ''。
+
+        use_cache=True（默认）时复用 focus_ttl 秒内的结果：一次点击/滑动会连续触发
+        多轮前台判断，每次都 dumpsys 会显著拖慢操作；tap/swipe/keyevent 会主动失效缓存。
+        """
+        if use_cache and self.focus_ttl > 0:
+            ts, cached = self._focus_cache
+            if cached and (time.monotonic() - ts) < self.focus_ttl:
+                return cached
+        out = self._window_dump()
+        focus = self._parse_focus(out)
+        if focus:
+            self._focus_cache = (time.monotonic(), focus)
+            return focus
+        return ""
+
+    def invalidate_focus(self) -> None:
+        """丢弃前台缓存（界面刚被点击/按键改变后调用）。"""
+        self._focus_cache = (0.0, "")
+        self._activity_cache = (0.0, "")
+
+    def is_in_foreground(self, package: str, use_cache: bool = True) -> bool:
+        """App 是否在前台。
+
+        看 **Activity** 而不是窗口焦点：输入法/系统弹窗抢占焦点时 App 依然在前台
+        （旧实现因此会在键盘弹出后误判"App 不在前台/未登录"）。
+        只有连 Activity 信息都拿不到时，才退回窗口焦点判断。
+        """
+        act = self.get_current_activity(use_cache=use_cache)
+        if act:
+            return act.startswith(package)
+        focus = self.get_current_focus(use_cache=use_cache)
         return bool(focus) and focus.startswith(package)
+
+    def screen_on(self):
+        """屏幕是否亮着：True / False / None（无法判断）。
+
+        `uiautomator dump` 在息屏/锁屏时会报
+        "ERROR: null root node returned by UiTestAutomationBridge."（实测 WSA 上就是这样），
+        所以 dump 失败时要先确认并唤醒屏幕。
+        """
+        out = self.try_shell("dumpsys power", timeout=20) or \
+            self.try_shell("dumpsys display", timeout=20)
+        if not out:
+            return None
+        low = out.lower()
+        if "mwakefulness=asleep" in low or "mscreenon=false" in low or "state=off" in low:
+            return False
+        if "mwakefulness=awake" in low or "mscreenon=true" in low:
+            return True
+        return None
+
+    def wake_up(self) -> bool:
+        """唤醒屏幕并解除锁屏（WSA/模拟器息屏后 dump 会一直失败）。返回是否已亮屏。"""
+        try:
+            self.shell("input keyevent 224", timeout=15)      # KEYCODE_WAKEUP
+            time.sleep(0.8)
+            self.try_shell("wm dismiss-keyguard", timeout=15)  # 无锁屏时是 no-op
+            time.sleep(0.4)
+            self.invalidate_focus()
+        except AdbError:
+            return False
+        return self.screen_on() is not False
 
     # ------------------------------------------------------------------ 操作
     # 注：`input tap/swipe` 与 uiautomator bounds 处于同一逻辑坐标系
     # （旋转竖屏时二者同步变成 1080x1920），因此直接透传，不需要坐标变换。
     def tap(self, x: int | float, y: int | float) -> None:
         self.shell(f"input tap {int(x)} {int(y)}")
+        self.invalidate_focus()
 
     def swipe(self, x1: int | float, y1: int | float,
               x2: int | float, y2: int | float, duration_ms: int = 300) -> None:
         self.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration_ms)}")
+        self.invalidate_focus()
 
     def keyevent(self, code: int) -> None:
         self.shell(f"input keyevent {int(code)}")
+        self.invalidate_focus()
 
     def clear_text_field(self) -> None:
         """清空当前输入框：优先 ADBKeyBoard 的 ADB_CLEAR_TEXT，其次全选+删除。"""
@@ -840,7 +962,7 @@ class ADBController:
         return ""
 
     def resolve_launcher_activity(self, package: str) -> str:
-        """解析 launcher activity：cmd package → pm dump（monkey 兜底由启动逻辑负责）。"""
+        """解析 launcher activity：cmd package -> pm dump（monkey 兜底由启动逻辑负责）。"""
         for cmd in (f"cmd package resolve-activity --brief {package}",
                     f"pm resolve-activity --brief {package}"):
             out = self.try_shell(cmd, timeout=20)
@@ -917,7 +1039,7 @@ class ADBController:
         """等待 package 到达前台（typo 名保留：wait_for_activity）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.is_in_foreground(package):
+            if self.is_in_foreground(package, use_cache=False):
                 return True
             time.sleep(interval)
         return False
@@ -934,35 +1056,207 @@ class ADBController:
         return out
 
     # ------------------------------------------------------------------ UI 解析
-    def dump_ui(self, retries: int = 3, delay: float = 2.0) -> ET.Element:
-        """uiautomator dump 并解析为 XML 树。线程安全（串行化），首次 dump 偶发失败自动重试。"""
+    def dump_ui(self, retries: int | None = None, delay: float | None = None) -> ET.Element:
+        """uiautomator dump 并解析为 XML 树。线程安全（串行化），失败自动重试。
+
+        retries/delay 省略时用实例默认值（config -> adb.dump_retries/dump_delay）。
+        需要"快一点"的交互路径（点击/发送前后）显式传 retries=2, delay=0.3。
+        """
         with self._dump_lock:
-            return self._dump_ui_locked(retries, delay)
+            return self._dump_ui_locked(
+                self.dump_retries if retries is None else max(1, int(retries)),
+                self.dump_delay if delay is None else max(0.0, float(delay)))
+
+    @staticmethod
+    def _extract_xml(out: str) -> str:
+        """从 uiautomator 输出里截出 XML（/dev/tty 方案前面可能混有提示行）。"""
+        if not out:
+            return ""
+        start = out.find("<?xml")
+        if start < 0:
+            return ""
+        end = out.rfind("</hierarchy>")
+        if end < 0:
+            return ""
+        return out[start:end + len("</hierarchy>")]
+
+    @staticmethod
+    def _short_reason(text: str, limit: int = 200) -> str:
+        """把 ADB/uiautomator 的多行输出压成一行短原因（写进异常信息用）。"""
+        return " ".join(str(text or "").split())[:limit]
+
+    def _parse_dump(self, xml: str) -> ET.Element:
+        try:
+            return ET.fromstring(xml)
+        except ET.ParseError as e:
+            raise AdbError(f"UI dump XML 解析失败: {e}") from e
+
+    def _read_dump_file(self, path: str) -> tuple[str, str]:
+        """读取设备上的 dump 文件，返回 (内容, 失败说明)。
+
+        用 `exec-out cat`（二进制直出，不经过 shell 的换行/编码转换）；不可用时回退
+        `shell cat`。**失败说明里会带上真实原因**（例如 "No such file or directory"），
+        这样上层日志不再只出现误导性的 "cat: ... No such file"。
+        """
+        out, err = self._run(["exec-out", "cat", path], timeout=30, binary=True, check=False)
+        data = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
+        if "<?xml" in data:
+            return data, ""
+        alt = self.try_shell(f"cat {path}", timeout=30)
+        if "<?xml" in alt:
+            return alt, ""
+        detail = (err or "").strip() or (alt or "").strip() or data.strip()
+        return "", f"读取 {path} 失败: {self._short_reason(detail) or '文件不存在'}"
+
+    def _dump_via_tty(self) -> tuple[str, str]:
+        """快路径：`uiautomator dump /dev/tty` 直接把 XML 打到 stdout（一次 shell 调用，不落盘）。"""
+        try:
+            out = self.shell("uiautomator dump /dev/tty 2>&1", timeout=self.dump_timeout)
+        except AdbError as e:
+            return "", f"/dev/tty: {self._short_reason(str(e))}"
+        xml = self._extract_xml(out)
+        if xml:
+            return xml, ""
+        return "", f"/dev/tty: {self._short_reason(out) or '没有 XML 输出'}"
+
+    def _dump_via_file(self, compressed: bool = False) -> tuple[str, str]:
+        """文件方案：依次在多个可写目录里尝试落盘（/sdcard 不可用时自动换目录）。"""
+        flag = " --compressed" if compressed else ""
+        details: list[str] = []
+        for base in _DUMP_DIRS:
+            path = f"{base}/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
+            try:
+                self.try_shell(f"rm -f {path}", timeout=15)
+                out = self.try_shell(f"uiautomator dump{flag} {path} 2>&1",
+                                     timeout=self.dump_timeout)
+                data, why = self._read_dump_file(path)
+                self.try_shell(f"rm -f {path}", timeout=15)
+                if data:
+                    return data, ""
+                details.append(f"{base}: {why or self._short_reason(out) or '未生成文件'}")
+            except AdbError as e:
+                details.append(f"{base}: {self._short_reason(str(e))}")
+                self.try_shell(f"rm -f {path}", timeout=15)
+        return "", " | ".join(details)
+
+    def _looks_like_idle_error(self, details: list) -> bool:
+        return any("idle" in d.lower() for d in details)
+
+    def _looks_like_screen_off(self, details: list) -> bool:
+        """是否像"息屏/锁屏/安全窗口"导致的 dump 失败。
+
+        实测报错：`ERROR: null root node returned by UiTestAutomationBridge.`
+        （WSA 息屏后必然出现；也可能出现在 FLAG_SECURE 窗口上）。
+        """
+        joined = " ".join(details).lower()
+        return ("null root node" in joined or "screen is off" in joined
+                or "no root node" in joined)
+
+    def _reapply_animations(self) -> None:
+        """重设动画缩放（有些镜像/重启后会恢复默认，导致界面永不"空闲"）。"""
+        for key in ("window_animation_scale", "transition_animation_scale",
+                    "animator_duration_scale"):
+            self.try_shell(f"settings put global {key} 0", timeout=15)
+        self.logger.debug("已重新关闭系统动画（UI dump 空闲性重试）")
+
+    def has_focus_window(self) -> bool:
+        """当前是否有**任何**获得焦点的窗口。
+
+        `mCurrentFocus=null`（没有任何窗口有焦点）是 WSA 上的典型状态：
+        WSA 窗口被最小化/关闭、或虚拟显示未点亮时，uiautomator 会一直返回
+        "ERROR: null root node returned by UiTestAutomationBridge."。
+        调用方据此决定"唤醒屏幕 / 重新拉起 App"来把窗口找回来。
+        """
+        try:
+            return bool(self.get_current_focus(use_cache=False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dump_failure_message(self, details: list) -> str:
+        """组装**简短、可行动**的失败原因（完整细节进 _last_dump_detail / debug 日志）。
+
+        旧版本把三个目录的完整报错全塞进异常信息，单条日志能到 2000+ 字符、完全没法看，
+        这里只保留"原因归类 + 关键一行 + 前台状态 + 处置建议"。
+        """
+        joined = "；".join(d for d in details if d)
+        self._last_dump_detail = joined
+        if joined:
+            try:
+                self.logger.debug(f"UI dump 详细失败原因: {joined}")
+            except Exception:  # noqa: BLE001
+                pass
+        low = joined.lower()
+        focus = ""
+        try:
+            focus = self.get_current_focus(use_cache=False)
+        except Exception:  # noqa: BLE001
+            focus = ""
+        # 归类：只取最有代表性的一条原因
+        key_detail = next((d for d in details if self._short_reason(d)), "")
+        if "null root node" in low or "no root node" in low:
+            reason = "uiautomator 拿不到根节点（屏幕未点亮 / 窗口被最小化或关闭）"
+            hint = ("请让 WSA 窗口保持打开（最小化或关闭 WSA 窗口时 Android 侧没有窗口焦点，"
+                    "任何界面读取都会失败）；桥接会自动尝试唤醒屏幕并重新拉起 App")
+        elif not focus:
+            reason = "没有任何窗口获得焦点（前台为空）"
+            hint = "让 WSA 窗口保持打开，或等窗口恢复后桥接会自动继续"
+        elif "idle" in low:
+            reason = "界面一直不空闲（转场/加载动画、弹窗或键盘光标）"
+            hint = "可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面"
+        elif "no such file" in low or "not exist" in low or "文件不存在" in low:
+            reason = "uiautomator 没有写出文件（界面未空闲或 /sdcard 不可写）"
+            hint = "已自动改用 /data/local/tmp 等目录重试"
+        else:
+            reason = self._short_reason(key_detail, 120) or "未知原因"
+            hint = ""
+        parts = [f"UI dump 失败: {reason}"]
+        if key_detail and reason != self._short_reason(key_detail, 120):
+            parts.append(f"（{self._short_reason(key_detail, 100)}）")
+        if hint:
+            parts.append(f"；{hint}")
+        parts.append(f"｜前台={focus or '(无焦点窗口)'}")
+        return "".join(parts)
 
     def _dump_ui_locked(self, retries: int, delay: float) -> ET.Element:
-        """dump 当前窗口 UI 为 XML。每次用唯一文件名，先删后写再删，
-        避免 uiautomator 静默失败（rc=0、错误进 stderr，如桌面动画导致的
-        "could not get idle state"）时读到上一次的旧文件。"""
-        last: Exception | None = None
+        """dump 当前窗口 UI 为 XML（多策略 + 可读报错）。
+
+        顺序：
+          1) 快路径 `uiautomator dump /dev/tty`（一次 shell 调用，不依赖文件系统）；
+          2) 文件方案：`/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0`，
+             先删后写再读；读取用 `exec-out cat`；
+          3) 重试之间递进等待（等转场/动画结束），并重设一次动画缩放；
+          4) 最后再试一次 `--compressed`。
+        失败时抛出的信息包含 uiautomator 的**真实报错**与当前前台组件，
+        不会再只显示 "cat: ...: No such file or directory" 这种误导性原因。
+        """
+        details: list[str] = []
+        woke = False
         for i in range(retries):
-            path = f"/sdcard/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
-            try:
-                self.shell(f"rm -f {path}")
-                self.shell(f"uiautomator dump {path} 2>&1", timeout=60)
-                out = self.shell(f"cat {path}", timeout=30)
-                self.shell(f"rm -f {path}")
-                if out.strip().lstrip().startswith("<?xml"):
-                    return ET.fromstring(out)
-                last = AdbError("dump 输出为空或非 XML（界面未空闲？）")
-            except (AdbError, ET.ParseError) as e:
-                last = e
-                try:
-                    self.shell(f"rm -f {path}")
-                except AdbError:
-                    pass
+            xml, why = self._dump_via_tty()
+            if xml:
+                return self._parse_dump(xml)
+            details.append(why)
+            xml, why = self._dump_via_file()
+            if xml:
+                return self._parse_dump(xml)
+            details.append(why)
+            if i == 0 and self._looks_like_idle_error(details):
+                self._reapply_animations()
+            # 息屏/锁屏会让 uiautomator 一直返回 null root：唤醒一次再重试
+            if not woke and self._looks_like_screen_off(details):
+                woke = True
+                state = self.screen_on()
+                if state is not True:
+                    self.logger.info("界面读取失败像是屏幕未点亮（null root node），正在唤醒屏幕...")
+                    if self.wake_up():
+                        self.logger.info("已唤醒屏幕，重试读取界面")
             if i < retries - 1:
-                time.sleep(delay)
-        raise AdbError(f"UI dump 失败: {last}")
+                time.sleep(max(0.0, delay) * (i + 1))   # 递进等待：界面越不稳等越久
+        xml, why = self._dump_via_file(compressed=True)
+        if xml:
+            return self._parse_dump(xml)
+        details.append(why)
+        raise AdbError(self._dump_failure_message(details))
 
     @staticmethod
     def _node_matches(node, resource_id=None, text=None, class_name=None,
@@ -1281,12 +1575,29 @@ class ADBController:
             return False
 
     def _find_bundled_apk(self) -> str:
-        """项目目录/当前目录下捆绑的 APK（整包分发，新机器免下载）。"""
+        """打包资源目录 / 项目目录 / 当前目录下捆绑的 APK（整包分发，新机器免下载）。
+
+        冻结（Nuitka）后 `__file__` 位于解包目录，`--include-data-files` 打进包里的 APK
+        就在那里，所以两种模式都能找到；这里统一走 runtime_paths 以免遗漏 exe 旁边。
+        （旧实现用"体积 > 50KB"判断，而捆绑的 APK 只有约 18KB，会误报"找不到 APK"。）
+        """
+        try:
+            import runtime_paths
+            p = runtime_paths.bundled_apk()
+            if p is not None:
+                return str(p)
+            for name in ADBKEYBOARD_APK_NAMES:
+                for base in (Path(__file__).resolve().parent, Path.cwd()):
+                    cand = Path(base) / name
+                    if runtime_paths.looks_like_apk(cand):
+                        return str(cand)
+        except Exception:  # noqa: BLE001 退回原始扫描
+            pass
         for name in ADBKEYBOARD_APK_NAMES:
             for base in (Path(__file__).resolve().parent, Path.cwd()):
                 p = Path(base) / name
                 try:
-                    if p.exists() and p.stat().st_size > 50_000:
+                    if p.exists() and p.stat().st_size > 1024:
                         return str(p)
                 except OSError:
                     continue
@@ -1324,6 +1635,8 @@ class ADBController:
             "clipboard_ok": self.probe_clipboard(),
             "clipboard_text": self.get_clipboard(),
         })
+        if self._last_dump_detail:
+            info["last_dump_error"] = self._last_dump_detail
         return info
 
     def dump_diagnostics(self) -> str:

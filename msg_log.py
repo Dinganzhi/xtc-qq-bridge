@@ -13,10 +13,13 @@ import threading
 import time
 from pathlib import Path
 
+import runtime_paths
+
 
 class MessageLog:
     def __init__(self, path: str = "", cap: int = 1000):
-        self.path = Path(path) if path else Path(__file__).resolve().parent / "data" / "msg_log.json"
+        # 默认放可写数据目录：Nuitka onefile 下是 exe 旁边，而不是退出即删的临时目录
+        self.path = Path(path) if path else runtime_paths.data_path("msg_log.json")
         self.cap = max(50, int(cap))
         self._lock = threading.Lock()
         self._entries: list[dict] = []

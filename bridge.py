@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""消息桥接调度层：轮询小天才新消息 → 转发（当前支持 log 打印 /
+"""消息桥接调度层：轮询小天才新消息 -> 转发（当前支持 log 打印 /
 AstrBot 插件端点两种模式），并负责去重、回声过滤与 ADB 断线重连。
 
-反向（QQ→小天才）由 qq_webhook.py 调用 bridge.forward_to_xiaotiancai()，
+反向（QQ->小天才）由 qq_webhook.py 调用 bridge.forward_to_xiaotiancai()，
 webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 """
 from __future__ import annotations
@@ -18,6 +18,8 @@ from pathlib import Path
 
 from utils.deduplicate import Deduplicator, EchoFilter, HistoryFilter
 from msg_log import MessageLog
+from xiaotiancai import LOGIN_LOGGED_IN, LOGIN_NOT_LOGGED_IN, LOGIN_UNKNOWN
+import runtime_paths
 
 
 def make_forwarder(cfg: dict, logger=None):
@@ -41,9 +43,9 @@ class LogForwarder:
 
     def send(self, target_type, target_id, message: str) -> bool:
         if self.logger:
-            self.logger.info(f"[转发-占位] {target_type}:{target_id} ← {message}")
+            self.logger.info(f"[转发-占位] {target_type}:{target_id} <- {message}")
         else:
-            print(f"[转发-占位] {target_type}:{target_id} ← {message}")
+            print(f"[转发-占位] {target_type}:{target_id} <- {message}")
         return True
 
     def reply_result(self, request_id: str, message: str) -> bool:
@@ -103,26 +105,43 @@ class MessageBridge:
         self.running = False
         self._thread: threading.Thread | None = None
         self.dedup = Deduplicator()
+        # 去重/回声/消息库的状态文件统一放"可写数据目录"（Nuitka onefile 下是 exe 旁边，
+        # 放在 __file__ 旁边会写进退出即删的临时目录 -> 重启丢状态）
+        runtime_paths.ensure_dirs()
         # 回声状态写入文件：多实例/重启后共享，防止重复转发
-        store_path = str(Path(__file__).resolve().parent / "data" / "echo_cache.json")
+        store_path = str(runtime_paths.data_path("echo_cache.json"))
         self.echo = EchoFilter(store_path=store_path)
         # 长期已处理消息表（7 天持久化）：跨重启/多实例去重，杜绝死循环重复转发
-        self.history = HistoryFilter(
-            store_path=str(Path(__file__).resolve().parent / "data" / "history_cache.json"))
+        self.history = HistoryFilter(store_path=str(runtime_paths.data_path("history_cache.json")))
         # 本地消息库（/小天才 历史消息 数据源）：记录真实对话，文件持久化
-        self.msgs = MessageLog(
-            path=str(Path(__file__).resolve().parent / "data" / "msg_log.json"))
+        self.msgs = MessageLog(path=str(runtime_paths.data_path("msg_log.json")))
         self._poll_interval = float((cfg.get("xiaotiancai") or {}).get("check_interval", 2))
         self._heartbeat_interval = float((cfg.get("adb") or {}).get("heartbeat_interval", 10))
         self._login_check_interval = float(
             (cfg.get("xiaotiancai") or {}).get("login_check_interval", 600))
+        # 自动登录重试节奏：超时/临时问题快速重试，明确的账号密码错误与安全验证则拉长间隔，
+        # 避免"一次失败就永久不再尝试"（用户报告的"自动登录不生效"）。
+        self._login_retry_interval = float(
+            (cfg.get("xiaotiancai") or {}).get("login_retry_interval", 120))
+        self._login_retry_after_fail = float(
+            (cfg.get("xiaotiancai") or {}).get("login_retry_after_fail", 1800))
+        self._login_retry_after_risk = float(
+            (cfg.get("xiaotiancai") or {}).get("login_retry_after_risk", 900))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
         self._pending_login_notify = False
-        # FIFO 任务队列：QQ→小天才 发送 / 登录 由单工作线程串行执行，
+        # 自动登录节流状态
+        self._login_not_before = 0.0      # 早于该时刻不再尝试自动登录
+        self._login_inflight = False      # 已有一次登录任务在队列/执行中
+        self._warned_no_cred = False      # 未配置账密的提示只打一次
+        self._notify_seen: dict[str, float] = {}   # 通知去重：文本 -> 上次发送时刻
+        self._log_seen: dict[str, float] = {}      # 日志去重：key -> 上次打印时刻
+        self._poll_fail_streak = 0        # 连续"读不到消息"的轮数（触发界面自愈）
+        self._wsa_guard_hinted = False    # WSA 断网提示只打一次
+        # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
         self._job_queue: queue.Queue = queue.Queue()
         self._job_thread: threading.Thread | None = None
@@ -143,7 +162,7 @@ class MessageBridge:
         # 时间标签也一直不变（同一分钟/解析不出时间），仅靠 (side, text, label) 判重
         # 不足；这里标签一变（说明是用户新输入的一条）才允许再次执行。
         self._cmd_seen_text: dict[tuple[str, str], str] = {}
-        self._cmd_done_file = str(Path(__file__).resolve().parent / "data" / "xtc_cmd_done.json")
+        self._cmd_done_file = str(runtime_paths.data_path("xtc_cmd_done.json"))
         self._cmd_lock = threading.Lock()
         self._load_cmd_done()
 
@@ -196,7 +215,7 @@ class MessageBridge:
                     ident = self._cmd_pending.pop(text, None)
                     ok = self._do_cmd_job(text)
                     if ok and ident is not None:
-                        # 执行成功 → 标记为已完成（持久化），同一条消息不再重复执行
+                        # 执行成功 -> 标记为已完成（持久化），同一条消息不再重复执行
                         self._cmd_done_add(ident[0], text, ident[1])
                     # 回复失败：不标记，下一轮轮询自动重试
             except Exception as e:  # noqa: BLE001
@@ -216,8 +235,10 @@ class MessageBridge:
                         self._log("warning", "ADB 断连，尝试重连...")
                         try:
                             self.adb.ensure_connected()
+                            self._log("info", "ADB 已重连")
                         except Exception as e:  # noqa: BLE001
                             self._log("error", f"重连失败: {e}")
+                            self._hint_wsa_guard()
                             time.sleep(2)
                             continue
 
@@ -226,29 +247,45 @@ class MessageBridge:
                 try:
                     # 恢复检测：安全验证完成后自动确认并通知（无需重启）
                     if self._pending_login_notify:
-                        if self.xtc.is_logged_in():
+                        if self.xtc.login_state() == LOGIN_LOGGED_IN:
                             self._pending_login_notify = False
                             self._notify("小天才已重新登录（安全验证完成），桥接继续运行")
                     # 确保在聊天页读取（列表预览无法判断发送方，会把家长侧消息误当对方消息）；
-                    # 离开聊天页后最多每 30s 重开一次，避免频繁打断用户
+                    # 正常 30s 才重开一次（免得频繁打断用户）；连续读不到消息时逐步加快，
+                    # 并触发一次"界面自愈"（清弹窗/必要时启动 App/回聊天页）。
                     if not self.xtc.is_in_chat():
                         xtc_contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
-                        if xtc_contact and time.monotonic() - self._last_chat_open >= 30:
+                        cooldown = 30.0 if self._poll_fail_streak < 5 else 5.0
+                        if xtc_contact and time.monotonic() - self._last_chat_open >= cooldown:
                             self._last_chat_open = time.monotonic()
                             self.xtc.open_chat(xtc_contact)
                     contact, text, time_label, own_text, own_recent = \
                         self.xtc.get_latest_message()
                 finally:
                     self._op_lock.release()
+                # 连续读不到任何东西（且不在聊天页/被弹窗挡住）-> 自愈
+                if not text and not own_recent:
+                    self._poll_fail_streak += 1
+                    if self._poll_fail_streak in (6, 20) or self._poll_fail_streak % 60 == 0:
+                        with self._op_lock:
+                            state = self.xtc.recover(
+                                (self.cfg.get("target") or {}).get("xtc_contact", ""))
+                        self._log("info", f"轮询连续 {self._poll_fail_streak} 轮没有读到消息，"
+                                          f"界面自愈: {state}")
+                else:
+                    self._poll_fail_streak = 0
                 is_cmd_text = bool(self._xtc_cmd_prefix and text
                                    and text.startswith(self._xtc_cmd_prefix))
                 # xtc 侧命令（/小天才 …）：手表侧或家长侧输入均可。
-                # 1) 手表侧（对方发来）的命令 → 执行，不转发、不入消息库；
+                # 1) 手表侧（对方发来）的命令 -> 执行，不转发、不入消息库；
                 #    已被处理过（同一侧+同一文本+同一时间标签）就不再进入执行流程，
                 #    这样桥接自己发出去的"结果/帮助"被读回时也不会再被当成新命令。
                 if is_cmd_text:
                     if not self._cmd_text_handled("watch", text, time_label):
+                        self._log("info", f"[收到小天才命令] 来源=手表 内容={text!r} 时间标签={time_label or '(无)'}")
                         self._maybe_xtc_cmd("watch", text, time_label)
+                    else:
+                        self._log("debug", f"[收到小天才命令] 重复（已执行过）: {text!r}")
                 # 2) 家长侧输入的命令：可能被送达确认等新消息盖过（不再是"最新一条"），
                 #    扫最近若干条自己发的消息；跳过桥接自己转发过去的旧命令文本
                 elif own_recent:
@@ -259,9 +296,10 @@ class MessageBridge:
                             continue  # 曾经由桥接转发进聊天的文本，不视为新输入的命令
                         if self._cmd_text_handled("own", t, lbl):
                             continue  # 已经执行过这条（含桥接自己发出去的回复）
+                        self._log("info", f"[收到小天才命令] 来源=家长侧 内容={t!r} 时间标签={lbl or '(无)'}")
                         self._maybe_xtc_cmd("own", t, lbl)
                         break
-                # 普通手表消息 → 转发（命令已被上面拦截，绝不转发/入库）
+                # 普通手表消息 -> 转发（命令已被上面拦截，绝不转发/入库）
                 if text and not is_cmd_text:
                     key = ("xtc", contact or "", text)
                     if not self.history.seen("xtc", contact or "", text) \
@@ -272,6 +310,8 @@ class MessageBridge:
                         self.msgs.append("xtc", contact or "", text, t=ts,
                                          source=self._xtc_source(contact),
                                          source_id=contact or "")
+                        self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
+                                          f"时间={time_label or '(无)'} 内容={text!r}")
                         try:
                             ok = self._forward(contact, text, time_label)
                         except Exception as e:  # noqa: BLE001
@@ -284,6 +324,16 @@ class MessageBridge:
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             time.sleep(self._poll_interval)
+
+    def _hint_wsa_guard(self) -> None:
+        """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。"""
+        if self._wsa_guard_hinted:
+            return
+        self._wsa_guard_hinted = True
+        self._log("warning",
+                  "若使用 WSA / WSABuilds 且经常断网，可另开一个终端运行独立守护工具："
+                  "python tools/wsa_net_guard.py（自动重连/重置网络/必要时重启 WSA，"
+                  "详见 README「WSA 网络守护」）")
 
     def _forward(self, contact, text: str, time_label: str = "") -> bool:
         """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。"""
@@ -305,9 +355,9 @@ class MessageBridge:
                 self._log("error", f"转发异常({target_type}:{target_id}): {e}")
                 ok = False
             if ok:
-                self._log("info", f"[转发成功] {target_type}:{target_id} ← {message}")
+                self._log("info", f"[转发成功] {target_type}:{target_id} <- {message}")
             else:
-                self._log("error", f"[转发失败] {target_type}:{target_id} ← {message}")
+                self._log("error", f"[转发失败] {target_type}:{target_id} <- {message}")
                 ok_all = False
         if ok_all:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
@@ -318,9 +368,9 @@ class MessageBridge:
 
     def _format_xtc_time(self, time_label: str) -> str:
         """把 App 内的时间标签转成 [日期时间] 格式：
-        - '06:56'（当天）→ '08-31 06:56'（补当天日期）
-        - '昨天 23:42' / '8月30日 23:42' → 原样
-        - 空 → 当前时间 'MM-DD HH:MM'"""
+        - '06:56'（当天）-> '08-31 06:56'（补当天日期）
+        - '昨天 23:42' / '8月30日 23:42' -> 原样
+        - 空 -> 当前时间 'MM-DD HH:MM'"""
         label = (time_label or "").strip()
         if not label:
             return datetime.now().strftime("%m-%d %H:%M")
@@ -344,8 +394,8 @@ class MessageBridge:
         return targets
 
     def _display_name(self, contact) -> str:
-        """小天才联系人 → 本地配置的显示昵称。映射优先级：
-        target.nicknames[联系人] → target.default_nickname → App 原始名。
+        """小天才联系人 -> 本地配置的显示昵称。映射优先级：
+        target.nicknames[联系人] -> target.default_nickname -> App 原始名。
         聊天窗口模式 contact 可能为 None，此时按 target.xtc_contact 查映射。"""
         t = self.cfg.get("target") or {}
         nicknames = t.get("nicknames") or {}
@@ -359,7 +409,7 @@ class MessageBridge:
 
     # ------------------------------------------------------------------ 反向
     def qq_sender_allowed(self, qq: str, group: str = "") -> bool:
-        """QQ→小天才 接收白名单（config.yaml → webhook）：
+        """QQ->小天才 接收白名单（config.yaml -> webhook）：
         - 私聊消息：QQ 号必须在 webhook.allow_from 列表里；
         - 群聊消息：群号必须在 webhook.allow_groups 列表里；
         - 对应列表为空 = 该类消息全部拒绝（严格白名单）。
@@ -379,21 +429,36 @@ class MessageBridge:
 
     def forward_to_xiaotiancai(self, text: str, user_id: str = "",
                                group_id: str = "", request_id: str = "") -> bool:
-        """QQ → 小天才：入队（FIFO 保证多消息按顺序处理），由单工作线程串行执行。"""
+        """QQ -> 小天才：入队（FIFO 保证多消息按顺序处理），由单工作线程串行执行。"""
         if not text:
             return False
+        where = f"群 {group_id}" if group_id else (f"私聊 {user_id}" if user_id else "未知会话")
+        # 收到就打印：便于在控制台确认 QQ 命令/消息真的到达了桥接（用户报告"看不到"）
+        self._log("info", f"[收到QQ命令] 来源={where} 内容={text!r}"
+                          + (f" request_id={request_id}" if request_id else "")
+                          + f"（队列中 {self._job_queue.qsize()} 条待处理）")
         self._job_queue.put(("send", text, user_id, group_id, request_id))
         return True
 
     def _do_send_job(self, text: str, user_id: str, group_id: str, request_id: str) -> None:
-        """实际执行 QQ→小天才 发送 + 送达确认（工作线程内，按入队顺序）。"""
+        """实际执行 QQ->小天才 发送 + 送达确认（工作线程内，按入队顺序）。"""
         self.echo.mark(text)
         contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
         if not contact:
-            self._log("error", "反向转发需要 config.yaml → target.xtc_contact")
+            self._log("error", "反向转发需要 config.yaml -> target.xtc_contact")
             return
-        with self._op_lock:
-            ok = self.xtc.open_chat(contact) and self.xtc.send_message(text)
+        self._log("info", f"[QQ->小天才] 开始发送: {text[:80]!r}")
+        try:
+            with self._op_lock:
+                in_chat = self.xtc.open_chat(contact)
+                ok = in_chat and self.xtc.send_message(text)
+            if not in_chat:
+                self._log("error", "[QQ->小天才] 未能进入小天才聊天窗口，未发送")
+        except Exception as e:  # noqa: BLE001 单条发送异常不能让工作线程退出
+            self._log("warning", f"[QQ->小天才] 发送异常: {e}")
+            ok = False
+        self._log("info" if ok else "error",
+                  f"[QQ->小天才] {'发送成功' if ok else '发送失败'}: {text[:80]!r}")
         if ok:
             # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
             self.history.mark("qq2xtc", text)
@@ -417,9 +482,13 @@ class MessageBridge:
     # ------------------------------------------------------------------ 送达确认
     # 历史消息来源标签：明确每条消息是"谁从哪儿发的"
     def _xtc_source(self, contact: str = "") -> str:
-        """小天才（手表）侧来源：手表/家长侧在 App 内说的都归这里。"""
+        """小天才（手表）侧来源：手表/家长侧在 App 内说的都归这里。
+
+        注意：标签里不要出现 GBK 无法表示的符号（某些 emoji / 特殊符号）——中文 Windows 控制台
+        会因此整条日志丢失（utils/logger.py 已做兜底，这里也不主动引入）。
+        """
         who = self._display_name(contact) if contact else ""
-        return f"手表{('・' + who) if who else ''}"
+        return "手表" + (f"-{who}" if who else "")
 
     @staticmethod
     def _qq_source(user_id: str = "", group_id: str = "") -> str:
@@ -431,8 +500,8 @@ class MessageBridge:
         return "QQ"
 
     def _archive_qq_send(self, text: str, user_id: str = "", group_id: str = "") -> None:
-        """QQ → 小天才 发送成功后归档到本地消息库（带来源标签）。
-        - 发送的整条消息是插件格式 `[MM-DD HH:MM] [QQ昵称] 内容` → 拆出昵称与内容；
+        """QQ -> 小天才 发送成功后归档到本地消息库（带来源标签）。
+        - 发送的整条消息是插件格式 `[MM-DD HH:MM] [QQ昵称] 内容` -> 拆出昵称与内容；
         - 命令文本（/小天才 …）与系统提示不入库。"""
         m = re.match(r"^\[(\d{2}-\d{2} \d{2}:\d{2})\] \[(.+?)\] (.*)$", text)
         if m:
@@ -463,7 +532,7 @@ class MessageBridge:
             else:
                 return
             self._log("info" if ok else "error",
-                      f"[送达确认] {message} → {group_id or user_id}（{'成功' if ok else '失败'}）")
+                      f"[送达确认] {message} -> {group_id or user_id}（{'成功' if ok else '失败'}）")
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"送达确认发送异常: {e}")
 
@@ -487,15 +556,24 @@ class MessageBridge:
     def login_xiaotiancai(self, request_id: str = "") -> str:
         """执行账密登录（入队，由工作线程串行执行，保证与其他发送任务的顺序）。
         有 request_id 时把结果回传给插件（原会话引用+@ 回复发送人）；否则走 _notify。"""
+        if self._login_inflight:
+            self._log("info", "[自动登录] 已有一次登录任务在执行/排队，跳过重复触发")
+            if request_id:
+                self._login_reply(request_id, "小天才登录已在进行中，请稍候")
+            return "inflight"
+        self._login_inflight = True
         self._job_queue.put(("login", request_id))
         return "queued"
 
-    def _do_login_job(self, request_id: str) -> None:
+    def _has_credentials(self) -> tuple[str, str]:
         acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
-        phone = str(acc.get("phone", "")).strip()
-        password = str(acc.get("password", "")).strip()
+        return str(acc.get("phone", "")).strip(), str(acc.get("password", "")).strip()
+
+    def _do_login_job(self, request_id: str) -> None:
+        phone, password = self._has_credentials()
         if not phone or not password:
-            msg = "未配置手机号/密码（config.yaml → xiaotiancai.login.phone/password）"
+            self._login_inflight = False
+            msg = "未配置手机号/密码（config.yaml -> xiaotiancai.login.phone/password）"
             self._login_reply(request_id, "小天才登录：" + msg)
             return
         try:
@@ -504,20 +582,34 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001
             self._log("error", f"自动登录异常: {e}")
             self._login_reply(request_id, "小天才自动登录出错，请手动检查目标 Android 环境")
+            self._login_not_before = time.monotonic() + self._login_retry_interval
             return
+        finally:
+            self._login_inflight = False
+        now = time.monotonic()
         if status == "risk":
             self._pending_login_notify = True  # 等待用户手动完成安全验证
+            self._login_not_before = now + self._login_retry_after_risk
             self._login_reply(request_id, "需要安全验证：请手动打开小天才 App 所在窗口完成验证")
-            self._notify("小天才登录触发安全验证，请手动打开对应窗口完成验证")
+            self._notify_once("risk", "小天才登录触发安全验证，请手动打开对应窗口完成验证")
         elif status == "fail":
-            self._pending_login_notify = True  # 避免每 10 分钟反复重试刷屏
+            self._pending_login_notify = True
+            self._login_not_before = now + self._login_retry_after_fail
             self._login_reply(request_id, "登录失败（账号或密码错误等），请检查配置或手动登录")
-            self._notify("小天才自动登录失败（账号或密码错误等）")
+            self._notify_once("fail", "小天才自动登录失败（账号或密码错误等）")
+        elif status == "timeout":
+            # 超时/网络类临时问题：**不算失败**，按较短间隔自动重试
+            self._login_not_before = now + self._login_retry_interval
+            self._login_reply(request_id, "登录未在时限内完成（界面一直显示登录中或网络较慢），稍后自动重试")
+            self._notify_once("timeout", "小天才自动登录暂未成功（登录中/网络较慢），稍后会自动重试")
         elif status == "error":
+            self._login_not_before = now + self._login_retry_interval
             self._login_reply(request_id, "登录出错（控件未找到），请运行 tools/dump_ui.py 查看登录页")
         elif status == "ok":
+            self._login_not_before = now + self._login_check_interval
             self._login_reply(request_id, "小天才登录成功")
         elif status == "already":
+            self._login_not_before = now + self._login_check_interval
             self._login_reply(request_id, "小天才已登录，无需重复登录")
 
     def _login_reply(self, request_id: str, message: str) -> None:
@@ -554,57 +646,59 @@ class MessageBridge:
         return "queued"
 
     def _do_init_job(self, request_id: str) -> None:
-        """检测并恢复界面状态：启动 → 清理弹窗 → 登录态 → 聊天页 → 文字模式 → 清空输入框。
-        每步前都清理弹窗（settle），失败自动重试，弹窗不会中断整个初始化。"""
+        """检测并恢复界面状态（**按需执行**，不做无意义的重启/点击）：
+        清理弹窗 -> 只在前台不对时启动 -> 只在未登录时登录 -> 只在不在聊天页时进入
+        -> 只在输入框有残留时清空。"""
         msgs: list[str] = []
         try:
+            acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
+            phone = str(acc.get("phone", "")).strip()
+            password = str(acc.get("password", "")).strip()
+            contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
             with self._op_lock:
-                # 1) 启动（弹窗清理 + 重试）
-                launched = False
-                for _ in range(2):
-                    self.xtc.settle()
-                    if self.xtc.launch():
-                        launched = True
-                        break
-                    time.sleep(2.0)
-                msgs.append("启动" + ("OK" if launched else "失败"))
-                time.sleep(2.0)
-                self.xtc.settle()
-                # 2) 登录态
-                if self.xtc.is_logged_in():
-                    msgs.append("已登录")
+                # 1) 弹窗清理（一次多轮）
+                if self.xtc.settle():
+                    msgs.append("已清理弹窗")
+                # 2) App 前台：已经在前台就完全不启动（避免"已经启动还反复启动"）
+                if self.xtc.adb.is_in_foreground(self.xtc.package):
+                    msgs.append("App 已在前台")
                 else:
-                    acc = (self.cfg.get("xiaotiancai") or {}).get("login") or {}
-                    phone = str(acc.get("phone", "")).strip()
-                    password = str(acc.get("password", "")).strip()
-                    if phone and password:
-                        status = self.xtc.login(phone, password)
-                        msgs.append("登录：" + self._login_status_text(status))
-                    else:
-                        msgs.append("未登录（未配置账密，请手动登录）")
-                # 3) 进入聊天页（带重试 + 弹窗清理）
-                contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
-                chat_ok = False
-                if contact:
-                    for _ in range(3):
-                        if self.xtc.is_in_chat():
-                            chat_ok = True
+                    launched = False
+                    for _ in range(2):
+                        if self.xtc.launch():
+                            launched = True
                             break
-                        self.xtc.settle()
+                        time.sleep(1.5)
+                    msgs.append("启动" + ("OK" if launched else "失败"))
+                self.xtc.settle()
+                # 3) 登录态：明确已登录就跳过；无法判断时**不猜**，只报告
+                state = self.xtc.login_state(force=True)
+                if state == LOGIN_LOGGED_IN:
+                    msgs.append("已登录")
+                elif state == LOGIN_NOT_LOGGED_IN and phone and password:
+                    status = self.xtc.login(phone, password)
+                    msgs.append("登录：" + self._login_status_text(status))
+                elif state == LOGIN_NOT_LOGGED_IN:
+                    msgs.append("未登录（未配置账密，请手动登录）")
+                else:
+                    msgs.append("无法确认登录态（App 不在前台或界面读不到，未做登录动作）")
+                # 4) 聊天页：已经在聊天页就不导航
+                if self.xtc.is_in_chat():
+                    msgs.append("已在聊天页")
+                elif contact:
+                    chat_ok = False
+                    for _ in range(3):
                         if self.xtc.open_chat(contact):
                             chat_ok = True
                             break
-                        time.sleep(1.5)
-                msgs.append("已进入聊天" if chat_ok else ("未进入聊天" if contact else "未配置联系人"))
-                # 4) 文字模式 + 清空输入框（带重试）
-                clean = ""
-                for _ in range(3):
-                    clean = self.xtc.ensure_input_clean()
-                    if "已清空" in clean or "已就绪" in clean:
-                        break
-                    self.xtc.settle()
-                    time.sleep(1.5)
-                msgs.append(clean or "输入框处理失败")
+                        self.xtc.settle()
+                        time.sleep(1.0)
+                    msgs.append("已进入聊天" if chat_ok else "未进入聊天")
+                else:
+                    msgs.append("未配置联系人")
+                # 5) 文字模式/输入框：只有真的有残留才清空
+                if self.xtc.is_in_chat():
+                    msgs.append(self.xtc.ensure_input_clean())
             reply = "初始化完成：" + "，".join(msgs)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"初始化异常: {e}")
@@ -656,7 +750,7 @@ class MessageBridge:
 
     def _do_history_job(self, count: int, request_id: str, into_chat: bool,
                         source: str = "") -> None:
-        """工作线程内：读本地消息库 → 格式化回传（不滚动界面，不依赖聊天页状态）。"""
+        """工作线程内：读本地消息库 -> 格式化回传（不滚动界面，不依赖聊天页状态）。"""
         entries = self.msgs.recent(1000)          # 先取全部，再做来源过滤
         if source:
             entries = self._match_source(entries, source)
@@ -735,19 +829,25 @@ class MessageBridge:
 
     @staticmethod
     def _short_source(source: str) -> str:
-        """来源标签里的「手表・昵称」简化为「手表」，避免每行过长（手表上打字慢）。"""
+        """来源标签里的「手表-昵称」简化为「手表」，避免每行过长（手表上打字慢）。"""
         s = (source or "").strip()
         if s.startswith("手表"):
             return "手表"
         return s
 
     def _system_msg_prefixes(self) -> list:
+        """桥接系统提示前缀（送达确认等）。
+
+        必须过滤空串：空串会让 `str.startswith("")` 恒为真，导致**所有**消息都被当成
+        系统提示而永不转发（历史版本曾配置里带 emoji 项，删掉后要防止出现空项）。
+        """
         ui = ((self.cfg.get("xiaotiancai") or {}).get("ui") or {})
-        return ui.get("system_msg_prefixes", ["发送成功", "发送失败", "✅", "❌"])
+        prefixes = ui.get("system_msg_prefixes", ["发送成功", "发送失败"])
+        return [str(p) for p in prefixes if str(p or "").strip()]
 
     def _label_epoch(self, time_label: str, now: datetime | None = None) -> float | None:
         """把 App 时间标签解析成时间戳（本地消息库归档用）：
-        'HH:MM'→今天；'昨天 HH:MM'/'前天 HH:MM'→对应日期；'M月D日 HH:MM'→该日期。
+        'HH:MM'->今天；'昨天 HH:MM'/'前天 HH:MM'->对应日期；'M月D日 HH:MM'->该日期。
         解析失败返回 None（归档时用当前时间兜底）。显示层用时间戳输出明确日期，
         不再出现"昨天/前天"字样。"""
         label = (time_label or "").strip()
@@ -830,8 +930,8 @@ class MessageBridge:
         """命令去重入队（手表侧/家长侧输入共用）。
 
         三层去重，彻底解决"同一条命令被反复执行/反复回复"：
-        - pending：已入队未完成 → 不再重复入队；
-        - done（持久化）：身份相同（侧+文本+时间标签）→ 不再执行，重启也不重复；
+        - pending：已入队未完成 -> 不再重复入队；
+        - done（持久化）：身份相同（侧+文本+时间标签）-> 不再执行，重启也不重复；
         - **seen_text（会话级）**：同一侧的同一条命令文本，只要 App 时间标签没变，
           就不再处理（含"桥接自己发出去的回复/结果"被读回的情况）。
           标签变了说明是用户新输入的一条（哪怕文本一样），仍会执行。
@@ -861,7 +961,7 @@ class MessageBridge:
 
     def _do_cmd_job(self, text: str) -> bool:
         """执行 xtc 侧命令。返回是否成功回复（失败时调用方复位去重，允许下轮重试）。
-        语法错误 / 无法识别的子命令 / 缺参数 → 一律回复完整帮助列表。"""
+        语法错误 / 无法识别的子命令 / 缺参数 -> 一律回复完整帮助列表。"""
         raw = (text or "").strip()
         if not self._xtc_cmd_prefix or not raw.startswith(self._xtc_cmd_prefix):
             return True  # 非命令消息不应到任务里（轮询已过滤）
@@ -882,7 +982,7 @@ class MessageBridge:
             elif sub in ("提醒", "remind"):
                 reply = self._cmd_remind(args)
             else:
-                reply = self._xtc_usage()            # 无法识别 → 帮助列表
+                reply = self._xtc_usage()            # 无法识别 -> 帮助列表
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"xtc 命令执行异常: {e}")
             reply = self._xtc_usage()
@@ -978,7 +1078,7 @@ class MessageBridge:
     def _cmd_remind(self, args: str) -> str:
         parts = args.split(None, 2) if args else []
         if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
-            return self._xtc_usage()  # 参数缺失/非数字 → 帮助列表
+            return self._xtc_usage()  # 参数缺失/非数字 -> 帮助列表
         group_id, qq_id = parts[0], parts[1]
         content = parts[2] if len(parts) > 2 else ""
         allow_from, allow_groups = self._qq_scope()
@@ -1007,7 +1107,7 @@ class MessageBridge:
             msg = msg[:900] + "（过长截断）"
         contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
         if not contact:
-            self._log("error", "回复小天才需要 config.yaml → target.xtc_contact")
+            self._log("error", "回复小天才需要 config.yaml -> target.xtc_contact")
             return False
         with self._op_lock:
             if not self.xtc.is_in_chat():
@@ -1059,46 +1159,99 @@ class MessageBridge:
             "ok": "成功",
             "risk": "需安全验证（请手动完成）",
             "fail": "失败（账号或密码错误等）",
+            "timeout": "超时/网络较慢（稍后自动重试）",
             "error": "出错（控件未找到）",
         }.get(status, status)
 
     def _login_check_loop(self) -> None:
-        """检测登录态，未登录则自动登录（可被 /小天才 自动登录 关闭）。
-        首次启动：等 App 稳定后（约 5s）立即检测一次，之后每 login_check_interval 秒一次。"""
-        interval = self._login_check_interval
+        """检测登录态，未登录则自动账密登录（可被 /小天才 自动登录 关闭）。
+
+        节奏（修复"自动登录不生效"）：
+        - 启动后约 5s 立即检测一次；
+        - 未登录且配置了账密 -> 立即触发登录，并按结果设置下次可尝试时间；
+        - 登录成功 -> 按 login_check_interval（默认 600s）复查；
+        - 登录超时/网络问题 -> login_retry_interval（默认 120s）后自动重试；
+        - 明确的账号密码错误 -> login_retry_after_fail（默认 1800s）后重试；
+        - 触发安全验证 -> login_retry_after_risk（默认 900s）后重试（等用户手动完成）。
+        """
         time.sleep(5)  # 等 App 启动稳定，避免误判未登录
-        last = float("-inf")  # 首次循环立即触发检测
         while self.running:
             try:
+                if not self._auto_login_enabled:
+                    time.sleep(10)
+                    continue
                 now = time.monotonic()
-                if now - last >= interval:
-                    last = now
-                    if not self._auto_login_enabled:
-                        self._log("debug", "自动登录检测已关闭，跳过")
-                        time.sleep(10)
-                        continue
-                    if not self._op_lock.acquire(blocking=False):
-                        continue
-                    try:
-                        logged = self.xtc.is_logged_in()
-                    finally:
-                        self._op_lock.release()
-                    if not logged:
-                        if self._pending_login_notify:
-                            # 安全验证/登录失败待处理：等用户手动完成，不反复自动重试
-                            self._log("info", "小天才登录待处理（安全验证/失败），等待用户手动操作，暂不重试")
-                        else:
-                            self._log("info", "检测到小天才未登录，尝试自动登录...")
-                            self.login_xiaotiancai()
+                if self._login_inflight or now < self._login_not_before:
+                    time.sleep(5)
+                    continue
+                if not self._op_lock.acquire(blocking=False):
+                    time.sleep(5)
+                    continue
+                try:
+                    state = self.xtc.login_state(force=True)
+                finally:
+                    self._op_lock.release()
+                action = self._auto_login_decision(state)
+                if action == "none":
+                    if state == LOGIN_UNKNOWN:
+                        # 无法判断（App 不在前台 / 息屏 / 界面读不到）：**不去登录**，
+                        # 只稍后再看。旧实现把这种情况当成"未登录"，于是已登录也报未登录。
+                        self._log_once("login_unknown",
+                                       "无法确认小天才登录态（App 不在前台或界面暂时读不到），"
+                                       "跳过本轮自动登录")
+                        self._login_not_before = now + 60
                     else:
                         if self._pending_login_notify:
                             self._pending_login_notify = False
-                            self._notify("小天才已重新登录（安全验证完成），桥接继续运行")
-                        else:
-                            self._log("debug", "小天才登录态正常")
+                            self._notify("小天才已重新登录，桥接继续运行")
+                        self._login_not_before = now + self._login_check_interval
+                        self._log("debug", "小天才登录态正常")
+                    time.sleep(10)
+                    continue
+                if action == "no_cred":
+                    if not self._warned_no_cred:
+                        self._warned_no_cred = True
+                        self._log("warning",
+                                  "检测到小天才未登录，但没有配置账密"
+                                  "（config.yaml -> xiaotiancai.login.phone / password）"
+                                  "-> 自动登录不会生效，请手动登录或补齐配置")
+                    self._login_not_before = now + self._login_check_interval
+                    time.sleep(10)
+                    continue
+                self._log("info", "检测到小天才未登录，触发自动登录（手机号+密码）...")
+                self.login_xiaotiancai()
             except Exception as e:  # noqa: BLE001
                 self._log("warning", f"自动登录检测异常: {e}")
-            time.sleep(10)
+            time.sleep(5)
+
+    def _auto_login_decision(self, state: str) -> str:
+        """根据登录态决定自动登录动作（纯函数，便于测试）：
+
+        - 'logged_in'      -> none（什么都不做）
+        - 'unknown'        -> none（**不能**当成未登录，否则会误触发登录流程）
+        - 'not_logged_in'  -> login（已配置账密）/ no_cred（未配置账密，提示一次）
+        """
+        if state in (LOGIN_LOGGED_IN, LOGIN_UNKNOWN):
+            return "none"
+        phone, password = self._has_credentials()
+        return "login" if (phone and password) else "no_cred"
+
+    def _log_once(self, key: str, text: str, interval: float = 600.0) -> None:
+        """同类日志按 key 节流（避免每 5 秒刷屏）。"""
+        now = time.monotonic()
+        if now - self._log_seen.get(key, float("-inf")) < interval:
+            return
+        self._log_seen[key] = now
+        self._log("info", text)
+
+    def _notify_once(self, key: str, text: str, interval: float = 600.0) -> None:
+        """同一类通知在 interval 秒内只发一次（避免刷屏）。"""
+        now = time.monotonic()
+        if now - self._notify_seen.get(key, float("-inf")) < interval:
+            self._log("debug", f"[通知去重] {text}")
+            return
+        self._notify_seen[key] = now
+        self._notify(text)
 
     def _notify(self, text: str) -> None:
         """发送登录相关通知到 QQ（target.notify_qq，缺省用 qq_private 第一个）。"""
@@ -1109,9 +1262,9 @@ class MessageBridge:
         try:
             ok = self.forwarder.send("private", target, text)
             if ok:
-                self._log("info", f"[通知] private:{target} ← {text}")
+                self._log("info", f"[通知] private:{target} <- {text}")
             else:
-                self._log("error", f"[通知失败] private:{target} ← {text}")
+                self._log("error", f"[通知失败] private:{target} <- {text}")
         except Exception as e:  # noqa: BLE001
             self._log("error", f"通知发送异常: {e}")
 
