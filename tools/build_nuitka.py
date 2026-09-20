@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import re
@@ -330,6 +331,93 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------- 中间目录 / 并行保护
+TEMP_DIR_SUFFIXES = (".build", ".onefile-build", ".dist")
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着（只查询，不发任何信号）。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            k32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_build_lock(out_dir: Path):
+    """同一个输出目录不允许并行编译，用锁文件挡住（并行会撞 Nuitka 的断言）。
+
+    返回锁文件路径；若确认已有另一个编译在跑则返回 None。
+    上次异常退出留下的锁不会被永久卡住：pid 已经不存在的锁会被自动接管。
+    """
+    lock = out_dir / ".build.lock"
+    if lock.exists():
+        data = {}
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        pid = int(data.get("pid") or 0)
+        if _pid_alive(pid):
+            print(f"[中止] 另一个编译正在进行（pid={pid}，开始于 {data.get('started', '未知')}）。")
+            print("       同一个输出目录不能并行编译，等它结束再跑；")
+            print(f"       若确认它已经死了，删掉 {lock} 后重试。")
+            return None
+        print(f"[提示] 忽略上次残留的编译锁（pid={pid} 已不在）")
+    lock.write_text(json.dumps({"pid": os.getpid(),
+                                "started": time.strftime("%Y-%m-%d %H:%M:%S")},
+                               ensure_ascii=False), encoding="utf-8")
+    return lock
+
+
+def release_build_lock(lock) -> None:
+    if lock is None:
+        return
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+
+
+def clean_stale_dirs(out_dir: Path, target: str) -> list[str]:
+    """删掉该目标上次编译留下的中间目录。
+
+    Nuitka 写 C 源文件时会断言"文件不存在"，所以只要上次编译被打断
+    （Ctrl+C、崩溃、或两个编译并行写同一个输出目录），残留的
+    `module.__main__.c` 就会让下一次编译直接崩在 AssertionError 上：
+        AssertionError: ...\\dist\\main.build\\module.__main__.c
+    """
+    stem = Path(TARGETS[target][0]).stem
+    removed: list[str] = []
+    for suffix in TEMP_DIR_SUFFIXES:
+        p = out_dir / (stem + suffix)
+        if not p.exists():
+            continue
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        if not p.exists():
+            removed.append(p.name)
+    return removed
+
+
 def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     """编译后冒烟测试（不需要设备）：把产物复制到干净目录里运行自检命令。
 
@@ -457,13 +545,22 @@ def main(argv=None) -> int:
         return 1
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    lock = acquire_build_lock(out_dir)
+    if lock is None:
+        return 1
     rc_all = 0
     for t in targets:
         print(f"\n===== 编译 {t}：{TARGETS[t][2]} =====")
+        stale = clean_stale_dirs(out_dir, t)
+        if stale:
+            print(f"[清理] 上次残留的中间目录：{', '.join(stale)}")
         rc = run(build_command(info, t, args.mode, out_dir, args))
         if rc != 0:
             rc_all = rc
             print(f"[失败] {t} 编译失败（退出码 {rc}）")
+            # 失败往往把中间目录写了一半；留着下次就会撞 Nuitka 的断言，所以清掉
+            if clean_stale_dirs(out_dir, t):
+                print(f"[清理] 已清掉 {t} 的半成品中间目录，修好问题后可直接重跑")
             continue
         for art in collect_artifacts(out_dir, t, args.mode):
             if art.is_file():
@@ -478,6 +575,7 @@ def main(argv=None) -> int:
                 if not run_smoke(t, art, args.mode):
                     rc_all = rc_all or 1
                     print(f"[冒烟] {t} 冒烟测试未通过（可用 --no-smoke 跳过）")
+    release_build_lock(lock)
     if rc_all == 0:
         print(f"\n全部完成。产物在 {out_dir}")
         print("提示：把 exe 放到任意目录运行 `--paths` 可确认配置/日志位置；"
