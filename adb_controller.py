@@ -454,6 +454,11 @@ class ADBController:
         self.focus_ttl = max(0.0, float(focus_ttl or 0.0))
         self._focus_cache: tuple[float, str] = (0.0, "")
         self._activity_cache: tuple[float, str] = (0.0, "")
+        # 曾经出现过"屏幕未点亮 -> null root"时置位：此后每次 dump 前先确认/唤醒屏幕，
+        # 避免每次都先用 3~8 秒去撞 uiautomator 失败（实机 WSA 上单次 dump 从 45s 降到 2s）。
+        self._screen_suspect = False
+        # 上次成功的 dump 策略名（见 _dump_strategies）：记住后不再每次都先撞失败
+        self._dump_strategy = ""
         self._sdk: int | None = None
         self._clipboard_ok: bool | None = None
         self._adbkeyboard_ok: bool | None = None
@@ -908,6 +913,29 @@ class ADBController:
             return False
         return self.screen_on() is not False
 
+    def keep_awake(self) -> bool:
+        """让子系统**保持常亮**（桥接运行期间）。
+
+        实机（WSA）测到：虚拟屏会在闲置后进入 Asleep，随后 `uiautomator` 一直返回
+        "null root node"，每次读取都要先唤醒（单次 dump 从 1s 变成 20~45s）。
+        这里用两条最通用的设置把屏幕钉住：
+          * `svc power stayon true` —— 充电/连接时常亮（WSA 恒为"已连接"）
+          * `settings put system screen_off_timeout` 设成极大值 —— 永不自动息屏
+        并用一次 WAKEUP 立即点亮。
+        """
+        ok = False
+        for cmd, timeout in (("svc power stayon true", 15),
+                            ("settings put system screen_off_timeout 2147483647", 15),
+                            ("settings put system screen_dim_timeout 2147483647", 15)):
+            out = self.try_shell(cmd, timeout=timeout)
+            low = (out or "").lower()
+            if out is not None and "exception" not in low and "error" not in low:
+                ok = True
+        if self.screen_on() is not True:
+            self.wake_up()
+        self._screen_suspect = self.screen_on() is not True
+        return ok
+
     # ------------------------------------------------------------------ 操作
     # 注：`input tap/swipe` 与 uiautomator bounds 处于同一逻辑坐标系
     # （旋转竖屏时二者同步变成 1080x1920），因此直接透传，不需要坐标变换。
@@ -1108,16 +1136,55 @@ class ADBController:
         detail = (err or "").strip() or (alt or "").strip() or data.strip()
         return "", f"读取 {path} 失败: {self._short_reason(detail) or '文件不存在'}"
 
-    def _dump_via_tty(self) -> tuple[str, str]:
+    def _dump_via_tty(self, compressed: bool = False) -> tuple[str, str]:
         """快路径：`uiautomator dump /dev/tty` 直接把 XML 打到 stdout（一次 shell 调用，不落盘）。"""
+        flag = " --compressed" if compressed else ""
         try:
-            out = self.shell("uiautomator dump /dev/tty 2>&1", timeout=self.dump_timeout)
+            out = self.shell(f"uiautomator dump{flag} /dev/tty 2>&1", timeout=self.dump_timeout)
         except AdbError as e:
-            return "", f"/dev/tty: {self._short_reason(str(e))}"
+            return "", f"/dev/tty{flag}: {self._short_reason(str(e))}"
         xml = self._extract_xml(out)
         if xml:
             return xml, ""
-        return "", f"/dev/tty: {self._short_reason(out) or '没有 XML 输出'}"
+        return "", f"/dev/tty{flag}: {self._short_reason(out) or '没有 XML 输出'}"
+
+    def _dump_via_file_combined(self, compressed: bool = True) -> tuple[str, str]:
+        """一次 shell 调用完成"dump 落盘 -> 读回 -> 删文件"。
+
+        比"rm -> dump -> exec-out cat -> rm"少 3 次 adb 进程开销（每次约 0.2~0.3s），
+        在 WSA 上实测量级从 ~3.5s 降到 ~1.8s。文件名仍然唯一，不会读到旧文件。
+        """
+        flag = " --compressed" if compressed else ""
+        details = []
+        for base in _DUMP_DIRS:
+            path = f"{base}/xtc_dump_{os.getpid()}_{int(time.time() * 1000)}.xml"
+            try:
+                out = self.shell(f"uiautomator dump{flag} {path} 2>&1; cat {path} 2>&1; rm -f {path}",
+                                 timeout=self.dump_timeout + 30)
+            except AdbError as e:
+                details.append(f"{base}: {self._short_reason(str(e))}")
+                continue
+            xml = self._extract_xml(out)
+            if xml:
+                return xml, ""
+            details.append(f"{base}: {self._short_reason(out) or '没有 XML 输出'}")
+        return "", " | ".join(details)
+
+    def _dump_strategies(self) -> list:
+        """按"上次成功的先试"的顺序返回 dump 策略。
+
+        不同镜像差别很大（实机 WSA：普通 dump 会被系统 Killed，`--compressed` 才稳定），
+        记住成功的那个就能避免每次都先去撞失败、白等几秒。
+        """
+        strategies = [
+            ("file-compressed", lambda: self._dump_via_file_combined(True)),
+            ("tty", lambda: self._dump_via_tty(False)),
+            ("file", lambda: self._dump_via_file(False)),
+            ("tty-compressed", lambda: self._dump_via_tty(True)),
+        ]
+        if self._dump_strategy:
+            strategies.sort(key=lambda s: 0 if s[0] == self._dump_strategy else 1)
+        return strategies
 
     def _dump_via_file(self, compressed: bool = False) -> tuple[str, str]:
         """文件方案：依次在多个可写目录里尝试落盘（/sdcard 不可用时自动换目录）。"""
@@ -1231,31 +1298,44 @@ class ADBController:
         """
         details: list[str] = []
         woke = False
+        thin: ET.Element | None = None
+        # 已知这块屏会睡着：先确认/唤醒，别拿 uiautomator 去试错（省下好几秒）
+        if self._screen_suspect and self.screen_on() is False:
+            self.logger.info("屏幕处于息屏状态，先唤醒再读取界面")
+            self.wake_up()
         for i in range(retries):
-            xml, why = self._dump_via_tty()
-            if xml:
-                return self._parse_dump(xml)
-            details.append(why)
-            xml, why = self._dump_via_file()
-            if xml:
-                return self._parse_dump(xml)
-            details.append(why)
+            for name, fn in self._dump_strategies():
+                xml, why = fn()
+                if xml:
+                    root = self._parse_dump(xml)
+                    n = len(list(root.iter("node")))
+                    if n >= 3:                      # 正常界面
+                        if self._dump_strategy != name:
+                            self.logger.debug(f"UI dump 使用策略: {name}")
+                        self._dump_strategy = name
+                        return root
+                    # 只有 0~2 个节点的"空树"：多数是页面还在切换/刚登录完的过渡帧，
+                    # 直接照着它判断会得出"不在聊天页/找不到联系人"的错结论（实机踩过）
+                    thin = root
+                    details.append(f"{name}: 空树（仅 {n} 节点，界面可能还在切换）")
+                    continue
+                details.append(f"{name}: {why}")
+                if self._looks_like_screen_off([why]):
+                    # 根节点拿不到：换目录/换压缩都没用，先唤醒屏幕（本轮回退到下一策略）
+                    self._screen_suspect = True
+                    if not woke:
+                        woke = True
+                        self.logger.info("界面读取失败像是屏幕未点亮（null root node），正在唤醒屏幕...")
+                        if self.wake_up():
+                            self.logger.info("已唤醒屏幕，重试读取界面")
+                    break
             if i == 0 and self._looks_like_idle_error(details):
                 self._reapply_animations()
-            # 息屏/锁屏会让 uiautomator 一直返回 null root：唤醒一次再重试
-            if not woke and self._looks_like_screen_off(details):
-                woke = True
-                state = self.screen_on()
-                if state is not True:
-                    self.logger.info("界面读取失败像是屏幕未点亮（null root node），正在唤醒屏幕...")
-                    if self.wake_up():
-                        self.logger.info("已唤醒屏幕，重试读取界面")
             if i < retries - 1:
-                time.sleep(max(0.0, delay) * (i + 1))   # 递进等待：界面越不稳等越久
-        xml, why = self._dump_via_file(compressed=True)
-        if xml:
-            return self._parse_dump(xml)
-        details.append(why)
+                time.sleep(max(0.3, delay) * (i + 1))   # 递进等待：界面越不稳等越久
+        if thin is not None:
+            self.logger.warning("界面反复只读到 0~2 个节点（页面仍在切换/加载），先按空界面处理")
+            return thin
         raise AdbError(self._dump_failure_message(details))
 
     @staticmethod

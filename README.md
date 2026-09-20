@@ -195,6 +195,8 @@ project/
 |   `-- deduplicate.py       # LRU 去重 + 文件化回声过滤
 |-- tools/
 |   |-- dump_ui.py           # 实机 UI 探测（填映射表用）
+|   |-- ui_report.py         # 把当前界面控件导出成文本文件（排查控件 id / 中文不乱码）
+|   |-- live_probe.py        # 实机一键体检：连接/界面/登录态/联系人/读取/注入（不发真实消息）
 |   |-- selftest.py          # 环境自检（不依赖配置）
 |   |-- wsa_net_guard.py     # WSA/WSABuilds 网络守护（独立程序，可单独常驻或注册计划任务）
 |   |-- wsa_guard.bat        # Windows 双击启动上面的守护（纯 ASCII）
@@ -221,6 +223,11 @@ project/
 > - `python tools/test_reported_bugs.py` —— 回归测试（历史来源 / 命令去重 / 登录判定 / 发送确认 / 弹窗 / 自动登录 / 日志）
 > - `python tools/test_paths.py` —— 运行路径解析（源码/冻结、配置与日志落点、捆绑 APK 识别）
 > - `python tools/wsa_net_guard.py --test` —— WSA 守护的分级修复逻辑自测
+>
+> 想在**真机/模拟器**上快速体检一遍（不发真实消息）：`python tools/live_probe.py`
+> —— 依次检查 adb 连接、界面读取、登录态、弹窗清理、聊天页判定、联系人匹配、读取消息、
+> 文本注入（输入后自动清空、**不点发送**）。排查控件 id 可用 `python tools/ui_report.py`，
+> 它会把当前界面的控件清单写到 `logs/ui_dump_report.txt`（避免控制台中文乱码）。
 >
 > **`.bat` 文件必须保持纯 ASCII 英文**：中文（尤其配合 `chcp 65001`）会让 cmd 解析
 > 出错并报「命令未找到」之类的错误。Shell 脚本保持 LF 行尾，`.bat` 保持 CRLF 行尾。

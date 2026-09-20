@@ -397,16 +397,22 @@ class DumpAdb(FakeAdb):
 
 
 def test_ui_dump_tty_fast_path() -> None:
-    """快路径：`uiautomator dump /dev/tty` 一次调用拿到 XML（不落盘、不 cat）。"""
+    """`/dev/tty` 快路径本身可用，且"上次成功的策略"会被优先尝试（自适应）。
+
+    策略顺序按设备自适应（实机 WSA 上普通 dump 会被 Killed、只有 --compressed 稳定），
+    所以这里分别验证：① tty 解析可用；② 记住的策略排在最前；③ dump_ui 整体能拿到树。
+    """
     ctl, _ = make_controller()
     ctl.serial = "127.0.0.1:58526"
     fake = DumpAdb(tty_xml=chat_xml(""))
     ctl._run = fake.run  # type: ignore[method-assign]
+    xml, why = ctl._dump_via_tty(False)
+    check("/dev/tty 快路径能解析出 XML", bool(xml) and not why, why[:60])
     root = ctl.dump_ui(retries=1)
-    check("快路径返回 XML 树", len(list(root.iter("node"))) > 0)
-    check("只试了 /dev/tty（没有落盘尝试）",
-          len(fake.tty_calls) == 1 and not fake.file_calls,
-          f"tty={len(fake.tty_calls)} file={len(fake.file_calls)}")
+    check("dump_ui 返回 XML 树", len(list(root.iter("node"))) > 0)
+    check("记住了成功的策略", bool(ctl._dump_strategy), ctl._dump_strategy)
+    names = [n for n, _ in ctl._dump_strategies()]
+    check("上次成功的策略排在最前", names[0] == ctl._dump_strategy, str(names))
 
 
 def test_ui_dump_idle_error_is_readable() -> None:

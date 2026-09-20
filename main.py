@@ -262,6 +262,14 @@ def main() -> None:
                 pass
         log.info("已关闭系统动画（uiautomator dump 稳定性）")
 
+    # 保持子系统屏幕常亮：WSA 的虚拟屏闲置后会 Asleep，之后 uiautomator 一直报
+    # "null root node"，每次读界面都要先唤醒（实机单次 dump 从 1s 变 20~45s）。
+    if adb_cfg.get("keep_awake", True):
+        if adb.keep_awake():
+            log.info("已请求子系统保持常亮（避免息屏后 uiautomator 读不到界面）")
+        else:
+            log.warning("保持常亮设置未生效（镜像可能不允许写设置）；息屏时桥接会自动唤醒屏幕")
+
     from xiaotiancai import Xiaotiancai
     xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=log)
     xtc.launch()

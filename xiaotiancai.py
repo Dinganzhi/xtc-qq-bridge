@@ -85,6 +85,9 @@ _STRONG_LOGIN_ERRORS = ("密码错误", "密码不正确", "账号或密码错�
 
 _DEFAULT_JUNK = ["发送", "表情", "语音", "拍照", "更多", "已读", "撤回", "按住说话",
                  "试试和宝贝聊天吧", "试试将作业要求发送给宝贝吧"]
+# 输入框为空时会显示"占位提示"（hint），dump 出来的 text 就是这段文案；
+# 必须当成"空"，否则清残留/发送确认都会把它误当成用户输入（实机测试发现）。
+_DEFAULT_INPUT_HINTS = ("发送文字", "发送消息", "输入内容", "说点什么", "输入消息", "发消息")
 
 # 登录态三态（模块级常量，bridge 等模块直接引用，避免依赖具体实例）
 LOGIN_LOGGED_IN = "logged_in"
@@ -531,21 +534,33 @@ class Xiaotiancai:
                          f"登录表单输入未确认：输入框内容={final_rows!r}"
                          "（运行 python tools/dump_ui.py 查看登录页控件）")
                 return "error"
-            # 5) 勾选协议（若存在且未勾选）
+            # 5) 勾选协议：只有**明确未勾选**（checked=false）才点，
+            #    属性缺失时不乱点（避免把已勾选的又取消，实机上会被"请勾选协议"拦住）
             root = self._dump_fast()
             cb = self._first(
                 self.adb.find_element(root, class_name="CheckBox"),
                 self.adb.find_element(root, resource_id="com.xtc.watch:id/cb_protocol"))
-            if cb is not None and cb.get("checked") != "true":
+            if cb is not None and (cb.get("checked", "") or "").lower() == "false":
+                self.log("debug", "勾选用户协议")
                 self.adb.tap_element(cb)
                 time.sleep(0.4)
             # 6) 点登录（先收起键盘——输入密码后键盘仍打开，会挡住/截获点击）
-            #    未离开账密登录页说明点击被吞，重试最多 3 次
+            #    未离开账密登录页说明点击被吞，重试最多 3 次；
+            #    若被"请勾选协议"拦住，则补勾一次再点。
             self.adb.keyevent(4)
             time.sleep(0.5)
             tapped = False
             for attempt in range(1, 4):
                 root = self._dump_fast()
+                if self._needs_protocol_agree(root):
+                    cb2 = self._first(
+                        self.adb.find_element(root, class_name="CheckBox"),
+                        self.adb.find_element(root, resource_id="com.xtc.watch:id/cb_protocol"))
+                    if cb2 is not None:
+                        self.log("info", "登录提示需要同意协议，补勾一次后重试")
+                        self.adb.tap_element(cb2)
+                        time.sleep(0.5)
+                        root = self._dump_fast()
                 btn = self._find_login_button(root)
                 if btn is None:
                     break  # 页面已跳转（登录中/验证页/成功）
@@ -644,20 +659,33 @@ class Xiaotiancai:
             self.adb.tap((x1 + x2) // 2, (y1 + y2) // 2)
 
     def _find_login_button(self, root: ET.Element):
-        """登录按钮：优先精确文本"登录"；其次 id 结尾为 login 的按钮
-        （注意：不能用"id 含 login"——tv_login_area_title/tv_login_account 等
-        标签控件 id 也含 login，会误命中）。"""
+        """登录按钮：精确文本"登录" -> id 末段是 login/btn_login 的控件 -> content-desc。
+
+        实机（WSA + 小天才）实测：登录按钮是**无文本的可点击 RelativeLayout**
+        （`rl_login_login`，clickable=true）。旧实现要求 class 含 "Text"/"Button"，
+        于是"表单填好了却说未找到登录按钮"。现在只要 id 命中且**可点击**就认。
+        （仍不能用"id 含 login"——tv_login_area_title / tv_login_bottom 等标签也含 login。）
+        """
         n = self.adb.find_element(root, text="登录")
         if n is not None:
             return n
         for node in root.iter("node"):
-            tail = self._id_tail(node)
-            if tail.endswith("login") or "login_btn" in tail or "btn_login" in tail:
-                if "Text" in node.get("class", "") or "Button" in node.get("class", ""):
-                    return node
+            tail = self._id_tail(node).lower()
+            if not (tail.endswith("login") or "login_btn" in tail or "btn_login" in tail):
+                continue
+            cls = node.get("class", "")
+            if ("Text" in cls or "Button" in cls
+                    or (node.get("clickable", "") or "") == "true"):
+                return node
         return self._first(
             self.adb.find_element(root, content_desc="登录"),
             None)
+
+    @staticmethod
+    def _needs_protocol_agree(root: ET.Element) -> bool:
+        """是否提示"需要勾选同意协议"（实机上未勾选时点登录会这样拦）。"""
+        joined = "".join((n.get("text") or "") for n in root.iter("node"))
+        return ("协议" in joined) and any(w in joined for w in ("请勾选", "请先", "未勾选", "勾选同意"))
 
     def _detect_risk(self, root: ET.Element) -> str:
         """检测安全验证（账号风险）界面，返回命中的标记文案；无则返回 ''。
@@ -1023,7 +1051,23 @@ class Xiaotiancai:
             return False
         if self.is_in_chat():
             return True
+        # 0) App 不在前台（例如 WSA 停在主屏/别的窗口）-> 先把它拉到前台，
+        #    否则会在 WSA 主屏上找联系人，然后报"找不到联系人"（实机测试发现的坑）。
+        if not self.adb.is_in_foreground(self.package):
+            self.log("info", f"小天才 App 不在前台（当前={self.current_activity() or '未知'}），先启动它")
+            if not self.launch():
+                self.log("warning", "打开聊天失败：小天才 App 没能拉到前台")
+                return False
+            self._dismiss_blockers()
+            if self.is_in_chat():
+                return True
         self._dismiss_blockers()
+        # 读到界面之前先看一眼登录态：未登录时没必要去找联系人
+        # （实机测试：未登录时在登录页反复找联系人会白等 40 多秒）
+        if self.login_state(force=True) == self.NOT_LOGGED_IN:
+            self.log("warning", f"打开聊天失败：小天才 App 未登录（当前在登录页），"
+                                f"登录后才能进入与 {contact!r} 的聊天")
+            return False
         # 读界面（失败自动收键盘重试；仍失败就本轮放弃，交给外层稍后重试，
         # 不再抛出 "cat: ... No such file" 这种误导性 ERROR）
         root = self._dump_with_retry(2)
@@ -1031,6 +1075,10 @@ class Xiaotiancai:
             self.log("warning", f"打开聊天暂缓：连续读不到界面控件（联系人 {contact}），"
                                 "稍后会自动重试（若反复出现，多为界面一直不空闲，"
                                 "可调大 adb.dump_retries / adb.dump_delay）")
+            return False
+        if len(list(root.iter("node"))) < 3:
+            # 刚登录完/页面切换中的空树：别照着它去"找联系人"，那只会得出错结论
+            self.log("info", "打开聊天暂缓：界面还在切换/加载（只读到空树），稍后自动重试")
             return False
         try:
             # 进来先确认一次：万一 Activity 名不认识，界面特征也能证明"已经在聊天页"
@@ -1046,8 +1094,14 @@ class Xiaotiancai:
                 node, _visible = self._scroll_find_contact(contact, root)
             if node is None:
                 visible = self._visible_contact_names(root)
-                page = ("消息列表" if visible
-                        else f"当前页面不像消息列表（前台={self.current_activity() or '未知'}）")
+                if not self.adb.is_in_foreground(self.package):
+                    page = f"小天才 App 不在前台（当前={self.current_activity() or '未知'}）"
+                elif self.login_state(force=True) == self.NOT_LOGGED_IN:
+                    page = "小天才 App 未登录（当前在登录页），登录后才能进入聊天"
+                elif visible:
+                    page = "消息列表"
+                else:
+                    page = f"当前页面不像消息列表（前台={self.current_activity() or '未知'}）"
                 self.log("warning",
                          f"找不到联系人 {contact!r}：{page}；"
                          f"当前可见联系人: {'、'.join(visible) or '(无)'}"
@@ -1269,7 +1323,7 @@ class Xiaotiancai:
         edit = self._find_input(root)
         if edit is None:
             return ""
-        return edit.get("text", "") or ""
+        return self._input_text_of(edit)
 
     def input_verifier(self, text: str):
         """给 adb.input_text 用的校验回调：输入框里已出现目标文本，或发送按钮已出现
@@ -1283,7 +1337,7 @@ class Xiaotiancai:
                 return True  # dump 失败无法判定，不阻塞发送流程
             edit = self._find_input(root)
             if edit is not None:
-                cur = edit.get("text", "") or ""
+                cur = self._input_text_of(edit)
                 if needle and needle in cur:
                     return True
                 if cur.strip():
@@ -1308,7 +1362,7 @@ class Xiaotiancai:
         edit = self._find_input(root)
         if edit is None:
             return
-        cur = (edit.get("text", "") or "").strip()
+        cur = self._input_text_of(edit).strip()
         if not cur:
             return
         self.adb.tap_element(edit)
@@ -1472,7 +1526,7 @@ class Xiaotiancai:
             if edit is None:
                 last = "未找到输入框，无法确认"
                 continue
-            cur = (edit.get("text", "") or "")
+            cur = self._input_text_of(edit)
             needle = (text or "").strip()
             if needle and cur and needle in cur:
                 return False, "输入框仍留有内容"
@@ -1487,6 +1541,16 @@ class Xiaotiancai:
                 self.adb.tap_element(n)
                 return True
         return False
+
+    def _input_text_of(self, edit) -> str:
+        """输入框的**真实**文本：把空输入框显示的占位提示（hint）当成空串。
+
+        实机（WSA + 小天才）测到：输入框为空时 dump 出的 text 是 "发送文字"，
+        旧逻辑会把它当作用户残留内容，于是反复清空/影响发送确认判定。
+        """
+        t = (edit.get("text", "") or "") if edit is not None else ""
+        hints = tuple(self.ui.get("input_hint_texts", _DEFAULT_INPUT_HINTS))
+        return "" if t.strip() in hints else t
 
     def _find_input(self, root: ET.Element):
         rid = self.ui.get("input_resource_id", "")
@@ -1537,8 +1601,8 @@ class Xiaotiancai:
                     edit = self._find_input(root)
             if edit is None:
                 return "未找到输入框（可能不在聊天页或界面异常）"
-            # 已经空了就不要重复点键盘（少一次点击/40 次按键）
-            if (edit.get("text", "") or "").strip():
+            # 已经空了就不要重复点键盘（少一次点击/40 次按键）；占位提示文案算"空"
+            if self._input_text_of(edit).strip():
                 self.adb.tap_element(edit)
                 time.sleep(self._delay)
                 for _ in range(40):

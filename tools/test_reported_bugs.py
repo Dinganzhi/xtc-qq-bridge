@@ -957,6 +957,61 @@ def test_window_recovery_and_compact_dump_error() -> None:
           "null root node" in ctl._last_dump_detail)
 
 
+def test_open_chat_launches_app_when_not_foreground() -> None:
+    """实机发现的坑：WSA 停在主屏时，open_chat 必须先拉起 App，而不是在主屏上找联系人。"""
+    list_xml = message_list_xml([("李四", "早"), ("屑猹不喝茶", "晚上吃啥")])
+
+    class HomeThenApp(FakeAdb):
+        """一开始前台是 WSA 主屏（launcher），launch_app 后才变成 App 的列表页。"""
+
+        def __init__(self):
+            super().__init__(node_xml(n(text="WSA 主屏")),
+                             focus="com.microsoft.windows.homeapp/PlaceholderActivity")
+            self.launched = 0
+
+        def launch_app(self, package: str, activity: str = "", **kw) -> str:
+            self.launched += 1
+            self.calls.append(f"am start {package}")
+            self.focus = f"{package}/.MainActivity"
+            self.xml = list_xml
+            return ".MainActivity"
+
+        def tap_element(self, node) -> None:
+            super().tap_element(node)
+            # 点联系人后就进入聊天页（否则等待进聊天会白等到超时）
+            self.xml = chat_page_xml()
+            self.focus = "com.xtc.watch/.ChatActivity"
+
+    adb = HomeThenApp()
+    xtc = Xiaotiancai(adb, {"ui": {"interaction_delay": 0.1}})
+    ok = xtc.open_chat("屑猹不喝茶")
+    check("App 不在前台时先拉起再找联系人", adb.launched == 1, f"launched={adb.launched}")
+    check("拉起后能找到联系人并进入聊天", ok is True, f"ok={ok} focus={adb.focus}")
+
+
+def test_input_hint_text_is_not_residue() -> None:
+    """实机发现：输入框为空时 dump 出的是占位提示（发送文字），不能被当成残留内容。"""
+    xml = node_xml(
+        n(cls="android.widget.EditText", text="发送文字", bounds="[40,1700][900,1800]",
+          rid="com.xtc.watch:id/et_chat_text_content") +
+        n(cls="android.widget.TextView", text="发送", bounds="[920,1700][1060,1800]",
+          rid="com.xtc.watch:id/tv_send_view"))
+    adb = FakeAdb(xml, focus="com.xtc.watch/.ChatActivity")
+    xtc = Xiaotiancai(adb, {"ui": {"interaction_delay": 0.1}})
+    check("占位提示被当成空输入框", xtc.chat_input_text() == "", repr(xtc.chat_input_text()))
+    node = ET.fromstring(xml).iter("node")
+    edit = [n for n in node if (n.get("resource-id") or "").endswith("et_chat_text_content")][0]
+    check("_input_text_of 把 hint 归一成空串", xtc._input_text_of(edit) == "")
+    check("提示文案可配置", Xiaotiancai(adb, {"ui": {"input_hint_texts": ["发送文字"]}})
+          ._input_text_of(edit) == "")
+    # 真的输入内容时不能被吞掉
+    edit2 = ET.fromstring(node_xml(
+        n(cls="android.widget.EditText", text="晚上回家吃饭",
+          rid="com.xtc.watch:id/et_chat_text_content"))).iter("node")
+    e2 = list(edit2)[0]
+    check("真实内容不会被当成提示", xtc._input_text_of(e2) == "晚上回家吃饭")
+
+
 # ------------------------------------------------------------------ 11. 自动登录要会重试
 class _FakeXtcLogin:
     def __init__(self, status: str):
@@ -1131,6 +1186,8 @@ def main() -> int:
                test_activity_level_focus_ignores_ime,
                test_screen_off_detection_and_wake,
                test_window_recovery_and_compact_dump_error,
+               test_open_chat_launches_app_when_not_foreground,
+               test_input_hint_text_is_not_residue,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
