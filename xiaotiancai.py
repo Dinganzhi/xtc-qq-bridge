@@ -170,9 +170,18 @@ class Xiaotiancai:
         except Exception:  # noqa: BLE001 个别实现没有 ime_shown
             pass
         try:
-            if not self.adb.has_focus_window():
-                self.log("info", "当前没有任何窗口获得焦点（WSA 窗口可能被最小化/关闭或屏幕未点亮），"
-                                 "正在唤醒屏幕并重新拉起小天才 App ...")
+            # 两种情况都要把窗口找回来：
+            #   ① 没有任何窗口有焦点（mCurrentFocus=null，见实时日志）
+            #   ② 前台是**别的 App**（例如 WSA 主屏 com.microsoft.windows.homeapp，
+            #      用户日志里就是这个场景）——此时 dump 同样会失败
+            foreign = False
+            if self.adb.has_focus_window():
+                foreign = not self.adb.is_in_foreground(self.package)
+            needs = (not self.adb.has_focus_window()) or foreign
+            if needs:
+                why = "前台是其它窗口" if foreign else "没有任何窗口获得焦点"
+                self.log("info", f"{why}（可能是 WSA 窗口被最小化/关闭、屏幕未点亮，"
+                                 f"或 App 没在前台），正在唤醒屏幕并重新拉起小天才 App ...")
                 if self.adb.screen_on() is not True:
                     self.adb.wake_up()
                 self.adb.invalidate_focus()

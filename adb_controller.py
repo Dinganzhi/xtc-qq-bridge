@@ -111,6 +111,13 @@ _EMULATOR_COMMON_PORTS = [5555, 16384, 7555, 21503, 62001, 62025, 5556]
 #   /data/local/tmp 对 shell 用户一定可写，作为兜底。
 _DUMP_DIRS = ("/sdcard", "/data/local/tmp", "/storage/emulated/0")
 
+# 抢到窗口焦点但**不代表 App 退到后台**的叠加层（输入法、系统弹窗等）。
+# 判断"App 是否占着屏幕"时要放行这些包，否则键盘一弹就误判未登录/不在前台。
+_SYSTEM_OVERLAY_MARKERS = (
+    "inputmethod", "adbkeyboard", "com.android.systemui", "permissioncontroller",
+    "packageinstaller", "android.system", "com.android.internal",
+)
+
 # 没有在线设备时可尝试自动拉起的模拟器/容器（Linux 优先 Waydroid）：
 #   命令 -> (可执行文件候选, 参数列表)
 _LAUNCHERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -871,17 +878,28 @@ class ADBController:
         self._activity_cache = (0.0, "")
 
     def is_in_foreground(self, package: str, use_cache: bool = True) -> bool:
-        """App 是否在前台。
+        """App 是否真的"占着屏幕"（可以对着它操作界面）。
 
-        看 **Activity** 而不是窗口焦点：输入法/系统弹窗抢占焦点时 App 依然在前台
-        （旧实现因此会在键盘弹出后误判"App 不在前台/未登录"）。
-        只有连 Activity 信息都拿不到时，才退回窗口焦点判断。
+        这里要同时看**两层信息**，缺一不可（两个坑都是实机踩出来的）：
+        * 只看窗口焦点（mCurrentFocus）：输入法一弹出就抢走焦点，会误判"App 不在前台/未登录"；
+        * 只看 Activity：WSA 主屏（com.microsoft.windows.homeapp）抢到窗口时，
+          Activity 仍是小天才的，于是误判"已在前台"，不去把它拉到前台——
+          结果 uiautomator 只能 dump 到 WSA 主屏（4 个节点），随后报"找不到联系人"。
+
+        规则：Activity 必须是目标包；窗口要么也是目标包、要么是**输入法/系统弹窗**这类
+        叠加层（此时仍算在前台，弹窗清理也正需要读到它）；窗口是**别的 App** 则不算。
         """
         act = self.get_current_activity(use_cache=use_cache)
-        if act:
-            return act.startswith(package)
-        focus = self.get_current_focus(use_cache=use_cache)
-        return bool(focus) and focus.startswith(package)
+        win = self.get_current_focus(use_cache=use_cache)
+        if act and not act.startswith(package):
+            return bool(win) and win.startswith(package)
+        if not act:
+            return bool(win) and win.startswith(package)
+        # Activity 是本 App：再看窗口
+        if not win or win.startswith(package):
+            return True
+        win_pkg = win.split("/", 1)[0].lower()
+        return any(m in win_pkg for m in _SYSTEM_OVERLAY_MARKERS)
 
     def screen_on(self):
         """屏幕是否亮着：True / False / None（无法判断）。

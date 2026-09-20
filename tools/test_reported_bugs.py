@@ -1012,6 +1012,37 @@ def test_input_hint_text_is_not_residue() -> None:
     check("真实内容不会被当成提示", xtc._input_text_of(e2) == "晚上回家吃饭")
 
 
+def test_foreground_logic_two_layers() -> None:
+    """前台判定要同时看 Activity 与窗口（实机两个坑）：
+
+    * 输入法抢焦点 -> 仍算在前台（否则键盘一弹就误判未登录）；
+    * 别的 App（如 WSA 主屏 com.microsoft.windows.homeapp）抢到窗口 -> **不算**在前台
+      （否则不会把它拉回前台，uiautomator 只能 dump 到 WSA 主屏，然后报"找不到联系人"）。
+    """
+    def ctl(activity: str, window: str):
+        c = object.__new__(ADBController)
+        c.get_current_activity = lambda use_cache=True: activity       # type: ignore[method-assign]
+        c.get_current_focus = lambda use_cache=True: window            # type: ignore[method-assign]
+        return c
+
+    app = "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatActivity"
+    check("Activity 与窗口都是 App -> 在前台", ctl(app, app).is_in_foreground("com.xtc.watch"))
+    check("窗口是输入法 -> 仍算在前台",
+          ctl(app, "com.android.adbkeyboard/com.android.adbkeyboard.AdbIME")
+          .is_in_foreground("com.xtc.watch"))
+    check("窗口是系统弹窗 -> 仍算在前台（弹窗清理需要）",
+          ctl(app, "com.android.permissioncontroller/.GrantPermissionsActivity")
+          .is_in_foreground("com.xtc.watch"))
+    check("窗口是别的 App（WSA 主屏）-> 不算在前台（实机日志场景）",
+          ctl(app, "com.microsoft.windows.homeapp/com.microsoft.windows.home.Home")
+          .is_in_foreground("com.xtc.watch") is False)
+    check("App 的 Activity 都不是 -> 不算在前台",
+          ctl("com.microsoft.windows.homeapp/Home", "com.microsoft.windows.homeapp/Home")
+          .is_in_foreground("com.xtc.watch") is False)
+    check("只拿到 Activity、没有窗口信息 -> 按 Activity 判",
+          ctl(app, "").is_in_foreground("com.xtc.watch"))
+
+
 # ------------------------------------------------------------------ 11. 自动登录要会重试
 class _FakeXtcLogin:
     def __init__(self, status: str):
@@ -1188,6 +1219,7 @@ def main() -> int:
                test_window_recovery_and_compact_dump_error,
                test_open_chat_launches_app_when_not_foreground,
                test_input_hint_text_is_not_residue,
+               test_foreground_logic_two_layers,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")

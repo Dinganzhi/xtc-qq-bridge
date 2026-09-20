@@ -69,18 +69,27 @@ def main() -> int:
     check("设备在线", True, f"serial={adb.serial} 屏幕={adb.get_screen_size()}")
 
     # 2) 窗口/屏幕/焦点（null root 场景的两个前提）
+    adb.keep_awake()          # 与 main.py 启动时一致：保持常亮，避免息屏后读不到界面
     act = adb.get_current_activity()
     win = adb.get_current_focus()
     check("Activity 解析", bool(act), f"activity={act or '(空)'}")
     check("窗口焦点", adb.has_focus_window(), f"window={win or '(无焦点窗口)'}")
-    check("屏幕状态", adb.screen_on() is not False, f"screen_on={adb.screen_on()}")
+    if adb.screen_on() is not True:
+        print("[INFO] 屏幕当前是息屏状态（已请求保持常亮；读取界面时会自动唤醒）")
+
+    # 2.5) 与真实启动顺序一致：确保小天才 App 在前台（桥接启动时也会做这一步）
+    xtc = Xiaotiancai(adb, {"ui": {}}, logger=log)
+    fg = adb.is_in_foreground(xtc.package)
+    check("App 在前台", True if fg else xtc.launch(),
+          f"启动前={act or '(空)'} -> 现在={xtc.current_activity() or '(空)'}")
 
     # 3) UI dump（快路径/多目录/exec-out）
     t0 = time.time()
     root = None
     try:
         root = adb.dump_ui(retries=2, delay=0.4)
-        check("UI dump", True, f"{len(list(root.iter('node')))} 节点，{time.time() - t0:.1f}s")
+        check("UI dump", True,
+              f"{len(list(root.iter('node')))} 节点，{time.time() - t0:.1f}s，策略={adb._dump_strategy}")
     except AdbError as e:
         check("UI dump", False, f"{e}")
     check("ADBKeyBoard", adb.adbkeyboard_ready(), f"ime={adb.current_ime() or '(未知)'}")
@@ -90,7 +99,6 @@ def main() -> int:
           f"（WSA 上通常为 False，属预期；不影响中文输入）")
 
     # 4) 登录态三态（本次修复重点）
-    xtc = Xiaotiancai(adb, {"ui": {}}, logger=log)
     state = xtc.login_state(force=True)
     check("登录态三态判定", state in ("logged_in", "not_logged_in", "unknown"),
           f"state={state} activity={xtc.current_activity()}")
