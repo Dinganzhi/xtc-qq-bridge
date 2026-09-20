@@ -1,15 +1,16 @@
 name: build-release
 
 # 触发方式：
-#   - 推送到 main            -> 只跑测试（不编译，省时间）
+#   - 推送到 main / dev      -> 只跑测试（不编译，省时间）
 #   - 打 tag（v*）           -> 只编译 + 上传 Actions 产物，**不会**自动发 Release
 #   - 手动 workflow_dispatch -> 编译 + 上传 Actions 产物；必须显式勾选 publish 才创建 Release
 #
-# 说明：本项目约定“没有明确指示就不发布正式版”，所以发布这一步只能由人在
+# 分支约定：日常开发推 dev，main 只保留确认发布的正式版（确认发布时才把 dev 合并进 main）。
+# 本项目约定“没有明确指示就不发布正式版”，所以发布这一步只能由人在
 # Actions 页面手动勾选 publish 触发，打 tag 不会自动发布。
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
