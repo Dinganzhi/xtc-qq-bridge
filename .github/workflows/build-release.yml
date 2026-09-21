@@ -126,20 +126,22 @@ jobs:
         shell: bash
         run: ls -la dist
 
-      - name: Rename artifacts with platform/arch suffix
+      - name: Collect artifacts
         shell: bash
         run: |
           set -e
           mkdir -p upload
-          for f in dist/*.exe dist/*bridge* dist/*guard*; do
+          # 产物文件名里**已经**带 <版本>-<系统>-<架构>（见 tools/build_nuitka.py 的
+          # product_name），所以这里只做搬运，绝不能再拼一次平台后缀——之前那样拼出来的
+          # 名字是 `...-linux-arm64-linux-arm64`、`...exe-windows-x86_64`。
+          for f in dist/*; do
             [ -e "$f" ] || continue
             base=$(basename "$f")
             case "$base" in
-              *.dist) cp -r "$f" "upload/${base%.dist}-${{ matrix.artifact }}.dist" ;;
-              *)      cp -r "$f" "upload/${base}-${{ matrix.artifact}}" ;;
+              *.build|*.onefile-build) continue ;;   # 中间目录，不进包
             esac
+            cp -r "$f" "upload/$base"
           done
-          cp dist/*.sha256 upload/ 2>/dev/null || true
           ls -la upload
 
       - name: Upload artifacts
