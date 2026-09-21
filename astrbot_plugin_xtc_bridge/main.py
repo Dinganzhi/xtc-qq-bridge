@@ -380,27 +380,34 @@ class Main(star.Star):
             asyncio.run_coroutine_threadsafe(self._do_send(*item), self._loop)
         self._pending.clear()
 
-    async def _do_send(self, target_type: str, target_id: str, text: str) -> bool:
+    async def _do_send(self, target_type: str, target_id: str, text: str):
+        """把消息发到 QQ。返回 (是否成功, 失败原因)。
+
+        带出原因很重要：桥接侧只看到 ok=false 时无法区分"QQ/NapCat 没连上"
+        和"目标不存在"，日志会误导排查方向。
+        """
         platform = self.config.get("platform_id") or ""
         if not platform and self._platform_ids:
             platform = next(iter(self._platform_ids))
         if not platform:
-            self._lg().error(
-                "[xtc_qq_bridge] 无法确定平台 ID：请先让 QQ 给机器人发一条消息，"
-                "或在插件配置里填写 platform_id（可让机器人执行 /sid 查看）"
-            )
-            return False
+            err = ("无法确定平台 ID：请先让 QQ 给机器人发一条消息，"
+                   "或在插件配置里填写 platform_id（可让机器人执行 /sid 查看）")
+            self._lg().error(f"[xtc_qq_bridge] {err}")
+            return False, err
         msg_type = "GroupMessage" if target_type == "group" else "FriendMessage"
         session = f"{platform}:{msg_type}:{target_id}"
         chain = MessageChain().message(text)
         try:
             ok = await self.context.send_message(session, chain)
             if not ok:
-                self._lg().error(f"[xtc_qq_bridge] 发送失败：未找到平台 {platform}")
-            return ok
+                err = f"未找到平台 {platform}（AstrBot 的 QQ 适配器可能不在线）"
+                self._lg().error(f"[xtc_qq_bridge] 发送失败：{err}")
+                return False, err
+            return True, ""
         except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"[:300]
             self._lg().exception(f"[xtc_qq_bridge] 发送异常: {e}")
-            return False
+            return False, err
 
     # ------------------------------------------------------------------ QQ 数据服务（xtc 侧命令用）
     # 说明：通过 aiocqhttp 适配器实例的 .bot（CQHttp）调 OneBot v11 API。
@@ -677,9 +684,13 @@ class _HttpHandler(BaseHTTPRequestHandler):
             future = self.plugin._on_forward_request(target_type, target_id, text)
             if future is not None:
                 try:
-                    ok = bool(future.result(timeout=30))
-                except Exception:  # noqa: BLE001 超时/异常视为失败
-                    ok = False
-                self._json({"ok": ok, "accepted": ok})
+                    res = future.result(timeout=30)
+                except Exception as e:  # noqa: BLE001 超时/异常视为失败
+                    res = (False, f"等待发送结果超时或异常: {type(e).__name__}")
+                if isinstance(res, tuple):        # 新版：(ok, error)
+                    ok, err = bool(res[0]), str(res[1] if len(res) > 1 else "")
+                else:                             # 兼容旧版返回 bool
+                    ok, err = bool(res), ""
+                self._json({"ok": ok, "accepted": ok, "error": err})
                 return
         self._json({"ok": True, "accepted": True})

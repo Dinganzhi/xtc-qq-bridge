@@ -1320,6 +1320,69 @@ def test_start_enqueues_auto_init() -> None:
         cleanup(root)
 
 
+def test_plugin_send_reports_real_reason() -> None:
+    """转发失败必须带出真实原因：QQ 侧发不出去 / 超时 / token 不对 是三种不同的病。
+
+    早先只报"插件未启动？检查 http_port/token"，而插件其实好好的、真正原因是
+    QQ/NapCat 侧 ActionFailed（用户照着提示排查不到点上）。
+    """
+    import socket
+    import urllib.error
+    import plugin_client as pcmod
+
+    class _Resp:
+        def __init__(self, body: str, status: int = 200):
+            self._b = body.encode("utf-8")
+            self.status = status
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    orig = pcmod.urllib.request.urlopen
+    try:
+        pcmod.urllib.request.urlopen = lambda *a, **k: _Resp(
+            '{"ok": false, "accepted": false, "error": "ActionFailed: retcode=1200 sendMsg Timeout"}')
+        ok, why = pcmod.PluginClient().send_detail("private", "1", "hi")
+        check("QQ 侧失败时带出插件给的 error", ok is False and "retcode=1200" in why, why)
+
+        def _timeout(*a, **k):
+            raise socket.timeout("timed out")
+
+        pcmod.urllib.request.urlopen = _timeout
+        ok2, why2 = pcmod.PluginClient().send_detail("private", "1", "hi")
+        check("超时提示指向 QQ/NapCat 卡住", ok2 is False and "NapCat" in why2, why2)
+
+        def _401(*a, **k):
+            raise urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
+
+        pcmod.urllib.request.urlopen = _401
+        ok3, why3 = pcmod.PluginClient().send_detail("private", "1", "hi")
+        check("401 提示 token 不匹配", ok3 is False and "token" in why3, why3)
+
+        def _refused(*a, **k):
+            raise urllib.error.URLError("connection refused")
+
+        pcmod.urllib.request.urlopen = _refused
+        ok5, why5 = pcmod.PluginClient().send_detail("private", "1", "hi")
+        check("连不上插件时提示检查 AstrBot/插件", ok5 is False and "AstrBot" in why5, why5)
+
+        pcmod.urllib.request.urlopen = lambda *a, **k: _Resp('{"ok": true, "accepted": true}')
+        ok4, why4 = pcmod.PluginClient().send_detail("group", "1", "hi")
+        check("成功时没有原因文本", ok4 is True and why4 == "", f"ok={ok4} why={why4!r}")
+    finally:
+        pcmod.urllib.request.urlopen = orig
+
+    check("占位转发器也提供 send_detail（bridge 统一走它）",
+          bridge_mod.make_forwarder({"forward": {"mode": "log"}}).send_detail("private", "1", "x")
+          == (True, ""))
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1343,7 +1406,7 @@ def main() -> int:
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
                test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
                test_time_label_fallbacks, test_latest_message_retries_when_labels_missing,
-               test_start_enqueues_auto_init,
+               test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:

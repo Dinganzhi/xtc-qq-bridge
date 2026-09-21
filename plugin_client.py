@@ -4,16 +4,22 @@
 
 注意：AstrBot 插件尚未就绪时，config.yaml 的 forward.mode 保持 "log"；
 插件就绪后改为 "plugin" 并填写 base_url / token。
+
+**超时说明**：插件要等 QQ 侧真实发送结果才回包（避免"假成功"），最长 30 秒；
+所以这里的超时必须比它长——早先默认 10 秒，会把"发得慢但成功"误判成失败
+（桥接还会因此重试，造成重复消息）。
 """
 from __future__ import annotations
 
 import json
+import socket
+import urllib.error
 import urllib.request
 
 
 class PluginClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11452", token: str = "",
-                 timeout: float = 10.0):
+                 timeout: float = 35.0):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
@@ -28,6 +34,16 @@ class PluginClient:
             return False
 
     def send(self, target_type: str, target_id, message: str) -> bool:
+        return self.send_detail(target_type, target_id, message)[0]
+
+    def send_detail(self, target_type: str, target_id, message: str) -> tuple:
+        """发送并返回 (是否成功, 失败原因)。
+
+        为什么要返回原因：早先失败只报"插件未启动？检查 http_port/token"，
+        但插件明明是好的、真正的原因是 QQ 侧（NapCat/QQNT）发不出去——
+        错误信息把人带偏了。这里把 HTTP 状态码、插件返回的 error、以及
+        连接/超时的真实异常都带出来。
+        """
         payload = {
             "target_type": target_type,   # "private" | "group"
             "target_id": str(target_id),
@@ -40,9 +56,34 @@ class PluginClient:
                      "X-Bridge-Token": self.token})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return r.status == 200
-        except Exception:  # noqa: BLE001
-            return False
+                body = r.read().decode("utf-8", errors="replace")
+                if r.status != 200:
+                    return False, f"插件返回 HTTP {r.status}: {body[:200]}"
+                try:
+                    obj = json.loads(body) if body.strip() else {}
+                except ValueError:
+                    return False, f"插件返回的不是 JSON: {body[:200]}"
+                if obj.get("ok") is False or obj.get("accepted") is False:
+                    return False, f"QQ 侧发送失败: {obj.get('error') or obj or body[:200]}"
+                return True, ""
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            if e.code == 401:
+                return False, ("插件拒绝：token 不匹配（检查 config.yaml 的 "
+                               "forward.plugin.token 与插件配置里的 token）")
+            return False, f"插件返回 HTTP {e.code}: {detail}"
+        except (socket.timeout, TimeoutError):
+            return False, (f"等插件回包超时（{self.timeout:.0f}s）：插件要等 QQ 侧真实发送结果，"
+                           "说明 QQ/NapCat 那边卡住了（重启 NapCat/QQ 通常即可）")
+        except urllib.error.URLError as e:
+            return False, (f"连不上插件 {self.base_url}（{e.reason}）：确认 AstrBot 已启动且"
+                           "插件已加载（http_port/token 见插件配置）")
+        except Exception as e:  # noqa: BLE001
+            return False, f"转发异常: {type(e).__name__}: {e}"
 
     def send_private(self, user_id, message: str) -> bool:
         return self.send("private", user_id, message)

@@ -48,6 +48,9 @@ class LogForwarder:
             print(f"[转发-占位] {target_type}:{target_id} <- {message}")
         return True
 
+    def send_detail(self, target_type, target_id, message: str) -> tuple:
+        return self.send(target_type, target_id, message), ""
+
     def reply_result(self, request_id: str, message: str) -> bool:
         if self.logger:
             self.logger.info(f"[占位-回传] {request_id}: {message}")
@@ -72,15 +75,20 @@ class PluginForwarder:
         self._err_log_interval = 60.0  # 同一故障最多 60s 报一次，避免刷屏
 
     def send(self, target_type, target_id, message: str) -> bool:
-        ok = self.client.send(target_type, target_id, message)
+        ok, detail = self.send_detail(target_type, target_id, message)
         if not ok and self.logger:
             now = time.monotonic()
             if now - self._last_err_log >= self._err_log_interval:
-                self.logger.error(
-                    "转发到 AstrBot 插件失败（插件未启动？检查 forward.plugin 配置与插件 http_port/token）"
-                )
+                self.logger.error(f"转发到 AstrBot 插件失败：{detail or '未知原因'}")
                 self._last_err_log = now
         return ok
+
+    def send_detail(self, target_type, target_id, message: str) -> tuple:
+        """转发并带出真实失败原因（QQ 侧发不出去 / 超时 / 连不上插件 是三种完全不同的病）。"""
+        fn = getattr(self.client, "send_detail", None)
+        if fn is None:                       # 兼容旧的 client
+            return self.client.send(target_type, target_id, message), ""
+        return fn(target_type, target_id, message)
 
     def reply_result(self, request_id: str, message: str) -> bool:
         return self.client.reply_result(request_id, message)
@@ -358,15 +366,21 @@ class MessageBridge:
         message = f"[{time_str}] [{nickname}] {text}"
         ok_all = True
         for target_type, target_id in targets:
+            why = ""
             try:
-                ok = self.forwarder.send(target_type, target_id, message)
+                send_fn = getattr(self.forwarder, "send_detail", None)
+                if send_fn is not None:
+                    ok, why = send_fn(target_type, target_id, message)
+                else:
+                    ok = self.forwarder.send(target_type, target_id, message)
             except Exception as e:  # noqa: BLE001
                 self._log("error", f"转发异常({target_type}:{target_id}): {e}")
-                ok = False
+                ok, why = False, f"{type(e).__name__}: {e}"
             if ok:
                 self._log("info", f"[转发成功] {target_type}:{target_id} <- {message}")
             else:
-                self._log("error", f"[转发失败] {target_type}:{target_id} <- {message}")
+                self._log("error", f"[转发失败] {target_type}:{target_id} <- {message}"
+                                   + (f"  原因: {why}" if why else ""))
                 ok_all = False
         if ok_all:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
