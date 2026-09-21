@@ -123,9 +123,12 @@ class Xiaotiancai:
             self._send_retries = max(1, int(self.ui.get("send_retries", 2)))
         except (TypeError, ValueError):
             self._send_retries = 2
-        self._net_retry_ts = 0.0     # 网络弹窗"重试"按钮的点击冷却
-        self._last_dump_warn = 0.0   # "读不到界面"告警的节流时间戳
-        self._last_label_retry = 0.0  # "快照里没有时间标签"的补救重读节流
+        # 注意：这些"上次做某事"的时间戳一律用 -inf 作初值，**不能写 0.0**。
+        # time.monotonic() 的零点任意（Linux 上是开机时长），刚开机/刚启动的机器上
+        # now - 0.0 可能小于节流间隔，导致该做的事被当成"刚做过"而跳过。
+        self._net_retry_ts = float("-inf")     # 网络弹窗"重试"按钮的点击冷却
+        self._last_dump_warn = float("-inf")   # "读不到界面"告警的节流时间戳
+        self._last_label_retry = float("-inf")  # "快照里没有时间标签"的补救重读节流
         self._throttle: dict[str, float] = {}   # 同类失败告警节流：key -> 上次打印时刻
         self.last_open_reason = ""   # 最近一次 open_chat 失败的原因（桥接据此去重打印）
 
@@ -141,7 +144,7 @@ class Xiaotiancai:
         联系人不在当前页），不节流就会把日志刷成"老是提示找不到联系人"。
         """
         now = time.monotonic()
-        if now - self._throttle.get(key, 0.0) >= interval:
+        if now - self._throttle.get(key, float("-inf")) >= interval:
             self._throttle[key] = now
             self.log("warning", msg)
         else:

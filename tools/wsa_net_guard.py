@@ -410,18 +410,18 @@ class WsaNetGuard:
         self.adb = Adb(self.adb_path, self.serial, logger)
         self.streak = 0
         self.level = 0
-        self.last_reboot = 0.0
+        self.last_reboot = float("-inf")   # 初值 -inf：monotonic 零点任意，0.0 会被误判成"刚重启过"
         self.recoveries = 0
         self.fixes: list = []
         # 网络探测状态：ping/nc 是否可用（None=还没试过）、最后一次 ping 输出（诊断用）
         self._ping_usable: bool | None = None
         self._nc_usable: bool | None = None
         self._ping_evidence = ""
-        self._last_unknown_log = 0.0
+        self._last_unknown_log = float("-inf")
         # 联网验证（PARTIAL_CONNECTIVITY）修复：默认开启，10 分钟最多修一次
         self.fix_validation_enabled = bool(c.get("fix_validation", True))
         self.validation_fix_cooldown = float(c.get("validation_fix_cooldown", 600) or 600)
-        self._last_validation_fix = 0.0
+        self._last_validation_fix = float("-inf")
 
     # -------------------------------------------------- 日志
     def log(self, level: str, msg: str) -> None:

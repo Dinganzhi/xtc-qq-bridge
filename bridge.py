@@ -71,7 +71,7 @@ class PluginForwarder:
     def __init__(self, client, logger=None):
         self.client = client
         self.logger = logger
-        self._last_err_log = 0.0
+        self._last_err_log = float("-inf")   # 初值用 -inf：monotonic 零点任意，0.0 会误判成"刚报过"
         self._err_log_interval = 60.0  # 同一故障最多 60s 报一次，避免刷屏
 
     def send(self, target_type, target_id, message: str) -> bool:
@@ -154,7 +154,7 @@ class MessageBridge:
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
         self._job_queue: queue.Queue = queue.Queue()
         self._job_thread: threading.Thread | None = None
-        self._last_chat_open = 0.0  # 聊天窗口重开冷却（避免频繁打扰用户导航）
+        self._last_chat_open = float("-inf")  # 聊天窗口重开冷却（初值 -inf：见上）
         # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
         self._auto_login_enabled = bool(
             (cfg.get("xiaotiancai") or {}).get("auto_login", True))
@@ -243,7 +243,7 @@ class MessageBridge:
 
     # ------------------------------------------------------------------ 轮询
     def _poll_loop(self) -> None:
-        last_heartbeat = 0.0
+        last_heartbeat = float("-inf")   # 首轮就做一次 ADB 心跳检查（monotonic 零点任意）
         while self.running:
             try:
                 now = time.monotonic()

@@ -1539,6 +1539,40 @@ def test_state_logged_once_and_warnings_throttled() -> None:
         cleanup(root)
 
 
+def test_monotonic_sentinels_survive_fresh_boot() -> None:
+    """刚开机的机器上（monotonic 还很小）该做的事不能被"节流"吞掉。
+
+    真实事故：CI 在新启动的 Linux runner 上跑（monotonic = 开机时长，只有几十秒），
+    "上次时刻"初值写 0.0 时 `now - 0.0 >= 间隔` 不成立 -> 该告警的被降级成 debug、
+    该进聊天的被跳过。修法：一律用 -inf 作初值。
+    """
+    import xiaotiancai as xmod
+    real_monotonic = xmod.time.monotonic
+    rec = Recorder()
+    try:
+        xmod.time.monotonic = lambda: 5.0          # 模拟"刚开机 5 秒"
+        xtc = Xiaotiancai(FakeAdb(), {"ui": {}}, logger=rec)
+        for _ in range(3):
+            xtc._warn_throttled("k", "同样的失败")
+        check("刚开机时第一次失败仍会 warning",
+              len([x for x in rec.lines if x.startswith("[warning]")]) == 1,
+              str(rec.lines))
+        check("_last_dump_warn 初值是 -inf（不是 0.0）",
+              xtc._last_dump_warn == float("-inf"), repr(xtc._last_dump_warn))
+
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=xtc, forwarder=None, logger=rec)
+        check("bridge 聊天窗口冷却初值是 -inf",
+              br._last_chat_open == float("-inf"), repr(br._last_chat_open))
+        # 刚开机 5 秒时也该允许立刻进聊天（而不是等 uptime 超过 30s）
+        cooldown = 30.0
+        allowed = xmod.time.monotonic() - br._last_chat_open >= cooldown
+        check("刚开机时也允许立刻进入聊天", allowed,
+              f"monotonic=5.0 last={br._last_chat_open}")
+    finally:
+        xmod.time.monotonic = real_monotonic
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1565,6 +1599,7 @@ def main() -> int:
                test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
                test_no_delivery_confirm_on_forward_failure,
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
+               test_monotonic_sentinels_survive_fresh_boot,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:
