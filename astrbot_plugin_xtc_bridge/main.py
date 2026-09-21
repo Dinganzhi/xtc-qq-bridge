@@ -693,4 +693,6 @@ class _HttpHandler(BaseHTTPRequestHandler):
                     ok, err = bool(res), ""
                 self._json({"ok": ok, "accepted": ok, "error": err})
                 return
-        self._json({"ok": True, "accepted": True})
+        # 走到这里说明事件循环还没起来，消息只是**排队**（不是已发送）。
+        # 必须如实标注 queued：桥接据此不发"发送成功"送达确认，避免误报。
+        self._json({"ok": True, "accepted": True, "queued": True})

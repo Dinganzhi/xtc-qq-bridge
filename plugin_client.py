@@ -65,6 +65,9 @@ class PluginClient:
                     return False, f"插件返回的不是 JSON: {body[:200]}"
                 if obj.get("ok") is False or obj.get("accepted") is False:
                     return False, f"QQ 侧发送失败: {obj.get('error') or obj or body[:200]}"
+                if obj.get("queued"):
+                    # 插件刚起来、事件循环还没跑：消息只是排队，**没有真的发出去**
+                    return True, "queued"
                 return True, ""
         except urllib.error.HTTPError as e:
             detail = ""

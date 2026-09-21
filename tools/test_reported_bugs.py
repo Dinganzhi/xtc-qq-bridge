@@ -1403,6 +1403,12 @@ def test_plugin_send_reports_real_reason() -> None:
         ok5, why5 = pcmod.PluginClient().send_detail("private", "1", "hi")
         check("连不上插件时提示检查 AstrBot/插件", ok5 is False and "AstrBot" in why5, why5)
 
+        pcmod.urllib.request.urlopen = lambda *a, **k: _Resp(
+            '{"ok": true, "accepted": true, "queued": true}')
+        ok6, why6 = pcmod.PluginClient().send_detail("private", "1", "hi")
+        check("插件仅排队时标注 queued（不当作已送达）",
+              ok6 is True and why6 == "queued", f"ok={ok6} why={why6!r}")
+
         pcmod.urllib.request.urlopen = lambda *a, **k: _Resp('{"ok": true, "accepted": true}')
         ok4, why4 = pcmod.PluginClient().send_detail("group", "1", "hi")
         check("成功时没有原因文本", ok4 is True and why4 == "", f"ok={ok4} why={why4!r}")
@@ -1412,6 +1418,57 @@ def test_plugin_send_reports_real_reason() -> None:
     check("占位转发器也提供 send_detail（bridge 统一走它）",
           bridge_mod.make_forwarder({"forward": {"mode": "log"}}).send_detail("private", "1", "x")
           == (True, ""))
+
+
+def test_no_delivery_confirm_on_forward_failure() -> None:
+    """转发到 QQ 失败（或只排队）时，绝不能在小天才侧回「发送成功」送达确认。
+
+    用户报告：小天才→QQ 明明发送失败，手表聊天里却出现"发送成功：…"。
+    根因是旧客户端把 HTTP 200 当成功（插件失败也是 200 + {"ok": false}）。
+    """
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self, ok: bool, detail: str = ""):
+            self.ok = ok
+            self.detail = detail
+
+        def send(self, t, i, m):
+            return self.ok
+
+        def send_detail(self, t, i, m):
+            return self.ok, self.detail
+
+    class _Xtc:
+        def __init__(self):
+            self.sent: list = []
+
+        def is_in_chat(self):
+            return True
+
+        def send_message(self, text):
+            self.sent.append(text)
+            return True
+
+    cfg = {"target": {"xtc_contact": "张三", "qq_private": "2218631043"},
+           "xiaotiancai": {"ui": {}}, "webhook": {}}
+    cases = ((False, "QQ 侧发送失败: ActionFailed retcode=1200", False, "转发失败"),
+             (True, "queued", False, "只排队未确认"),
+             (True, "", True, "真成功"))
+    for ok, detail, expect, name in cases:
+        xtc = _Xtc()
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=xtc,
+                                      forwarder=_Fwd(ok, detail), logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        try:
+            br._forward("屑猹不喝茶", "测试消息", "23:47")
+        except Exception as e:  # noqa: BLE001
+            check(f"{name}: 转发链路不抛异常", False, f"{type(e).__name__}: {e}")
+            continue
+        check(f"{name} -> 送达确认={'有' if expect else '无'}",
+              bool(xtc.sent) == expect, f"sent={xtc.sent}")
+    cleanup(root)
 
 
 def main() -> int:
@@ -1438,6 +1495,7 @@ def main() -> int:
                test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
                test_time_label_is_per_message, test_latest_message_retries_when_labels_missing,
                test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
+               test_no_delivery_confirm_on_forward_failure,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:

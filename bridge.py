@@ -365,6 +365,7 @@ class MessageBridge:
         nickname = self._display_name(contact)
         message = f"[{time_str}] [{nickname}] {text}"
         ok_all = True
+        queued = False
         for target_type, target_id in targets:
             why = ""
             try:
@@ -376,17 +377,29 @@ class MessageBridge:
             except Exception as e:  # noqa: BLE001
                 self._log("error", f"转发异常({target_type}:{target_id}): {e}")
                 ok, why = False, f"{type(e).__name__}: {e}"
+            if ok and why == "queued":
+                # 插件只把消息排进队列（事件循环还没起来）：没真的发出去，
+                # 不能报"转发成功"，更不能发"发送成功"的送达确认
+                queued = True
+                self._log("warning", f"[转发未确认] {target_type}:{target_id} "
+                                     "插件刚启动，消息只是排队（未确认已发出）")
+                continue
             if ok:
                 self._log("info", f"[转发成功] {target_type}:{target_id} <- {message}")
             else:
                 self._log("error", f"[转发失败] {target_type}:{target_id} <- {message}"
                                    + (f"  原因: {why}" if why else ""))
                 ok_all = False
-        if ok_all:
+        if ok_all and not queued:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
             self.echo.mark(text)
             self.echo.mark(message)
             self._confirm_xtc_delivery(message)  # 小天才侧送达确认（发送成功：<内容>）
+        elif ok_all and queued:
+            # 已交出去但没确认：同样记历史避免重复，但不发"发送成功"（不撒谎）
+            self.echo.mark(text)
+            self.echo.mark(message)
+            self._log("info", "小天才侧送达确认已跳过：本次转发未确认（插件排队中）")
         return ok_all
 
     def _format_xtc_time(self, time_label: str) -> str:
