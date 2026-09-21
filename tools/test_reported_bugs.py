@@ -1251,10 +1251,11 @@ def test_content_desc_exact_match() -> None:
 
 
 def test_time_label_is_per_message() -> None:
-    """时间标签必须是**这条消息自己的**时间（气泡上方最近的标签）。
+    """时间必须是**每条消息自己的**时间，不能把组首的标签发给组内其它消息。
 
-    回归点：09-20 曾加过"找不到上方标签就退而取最近/同一行标签"的兜底，
-    结果列表上方滚出屏幕的消息会拿到**它下面那条消息**的时间，转发时间张冠李戴。
+    实测事故（09-20 23:47）：一个时间组里的三条消息
+    test / 我去？ / 晚安（检测于 23:50、23:52、23:53）全被安上组首的 23:47。
+    小天才只在一个时间组的第一条消息上方画标签，所以标签只能归它下面第一条消息。
     """
     xtc, _ = make_xtc("", ui_cfg={})
     bubble = ET.fromstring(n(bounds="[786,351][922,531]"))
@@ -1262,15 +1263,31 @@ def test_time_label_is_per_message() -> None:
     got = xtc._label_for_bubble(bubble, dates)
     check("取气泡上方最近的标签（不是最上面那个）", got == "08:08", f"got={got!r}")
 
-    # 标签全在气泡下方（消息自己的标签已滚出屏幕）：必须返回空，
-    # 让上层用"当前时间"，绝不能借用下面那条消息的时间
+    # 标签全在气泡下方：必须返回空，让上层用"当前时间"
     below = [(700, 725, "23:59"), (760, 785, "23:58")]
-    got2 = xtc._label_for_bubble(bubble, below)
-    check("气泡下方/后面的标签一律不用（防张冠李戴）", got2 == "", f"got={got2!r}")
+    check("气泡下方/后面的标签一律不用（防张冠李戴）",
+          xtc._label_for_bubble(bubble, below) == "")
 
-    # 与气泡同一水平行的标签也不再采用（老版本同样不用）
-    got3 = xtc._label_for_bubble(bubble, [(351, 376, "08:08")])
-    check("同一行的标签不采用（与旧版本一致）", got3 == "", f"got={got3!r}")
+    # 同一个时间组：标签只属于紧挨它下面的那条消息
+    group_label = [(200, 225, "23:47")]
+    first = ET.fromstring(n(bounds="[786,250][922,320]"))     # 组首，紧贴标签下方
+    second = ET.fromstring(n(bounds="[786,400][922,470]"))    # 组内第二条
+    third = ET.fromstring(n(bounds="[786,520][922,590]"))     # 组内第三条
+    allb = [first, second, third]
+    check("组首拿到组时间", xtc._label_for_bubble(first, group_label, allb) == "23:47",
+          repr(xtc._label_for_bubble(first, group_label, allb)))
+    check("组内第二条不再共用组首时间（用户报的 bug）",
+          xtc._label_for_bubble(second, group_label, allb) == "",
+          repr(xtc._label_for_bubble(second, group_label, allb)))
+    check("组内第三条同样不共用", xtc._label_for_bubble(third, group_label, allb) == "",
+          repr(xtc._label_for_bubble(third, group_label, allb)))
+
+    # 每条消息各有一个标签时，都取到自己的
+    per = [(200, 225, "23:47"), (380, 405, "23:52"), (500, 525, "23:53")]
+    check("每条各有标签时各取各的",
+          (xtc._label_for_bubble(first, per, allb),
+           xtc._label_for_bubble(second, per, allb),
+           xtc._label_for_bubble(third, per, allb)) == ("23:47", "23:52", "23:53"))
 
     check("确实没有标签时返回空串", xtc._label_for_bubble(bubble, []) == "")
     check("_date_count 能数出标签数",

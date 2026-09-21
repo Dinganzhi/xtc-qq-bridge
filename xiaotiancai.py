@@ -1834,28 +1834,46 @@ class Xiaotiancai:
         if not candidates:
             return (None, None, "")
         n, t, y_bottom = max(candidates, key=lambda c: c[2])
-        return (None, t, self._label_for_bubble(n, dates))
+        # 归属判定要知道**所有**气泡（含自己发的），所以单独收集一份
+        all_bubbles = [x for x in root.iter("node")
+                       if self._id_tail(x) == "chat_msg_item_content"
+                       and self._bounds(x) is not None]
+        return (None, t, self._label_for_bubble(n, dates, all_bubbles))
 
-    def _label_for_bubble(self, bubble, dates: list) -> str:
-        """取**这条消息自己的**时间标签（dates = [(top, bottom, text)]，按 top 升序）。
+    def _label_for_bubble(self, bubble, dates: list, all_bubbles: list | None = None) -> str:
+        """取**这条消息自己的**时间（dates = [(top, bottom, text)]，按 top 升序）。
 
-        规则只有一条：取"位于该气泡上方、且最靠下"的那个标签。
-        小天才 App 给每条消息在气泡上方画自己的时间，所以"上方最近的标签"
-        就是这条消息的时间（实测：早上好❤ 上方 06:59、表情图 上方 19:17）。
+        小天才只在一个"时间组"的第一条消息上方画一个时间标签，组内后续消息
+        **没有**自己的标签。所以规则是两条：
+        ① 找位于该气泡上方、最靠下的那个标签；
+        ② 这个标签必须**真的属于它**——标签下方第一条气泡必须是它自己。
+           否则说明标签是上面那条消息的，本条没有自己的时间，返回 ""。
 
-        **不要加"找不到就退而取最近标签"的兜底**（09-20 加过，是错的）：
-        列表上方滚出屏幕的消息拿不到自己的标签，退而取最近标签会取到
-        **它下面那条消息**的时间，转发时间就张冠李戴了。
-        拿不到就返回 ""，由上层按"当前时间"处理——对刚到达的消息这反而正确。
+        为什么必须做 ②：没有它就会出现"三条消息全是 23:47"——实测日志
+            [09-20 23:47] test / 我去？ / 晚安
+        三条不同消息（检测时刻 23:50、23:52、23:53）都被安上了组首的 23:47。
+        返回 "" 时上层用"当前时间"，对刚收到的消息就是它自己的到达时间，
+        每条各不相同（这也是 09-15 老版本的行为）。
         """
         b = self._bounds(bubble)
         if not b or not dates:
             return ""
         top = b[1]
-        for _d_top, d_bottom, d_text in reversed(dates):
-            if d_bottom <= top + 5:        # 标签底边在气泡上方
-                return d_text
-        return ""
+        chosen = None
+        for d_top, d_bottom, d_text in reversed(dates):   # dates 按 top 升序
+            if d_bottom <= top + 5:                       # 标签底边在气泡上方
+                chosen = (d_top, d_bottom, d_text)
+                break
+        if chosen is None:
+            return ""
+        if not all_bubbles:            # 拿不到其它气泡时退回旧行为
+            return chosen[2]
+        label_bottom = chosen[1]
+        below = [ob[1] for ob in (self._bounds(x) for x in all_bubbles)
+                 if ob is not None and ob[1] >= label_bottom - 5]
+        if below and min(below) != top:
+            return ""                  # 这个标签是它上面那条消息的
+        return chosen[2]
 
     def _date_count(self, root: ET.Element) -> int:
         return sum(1 for n in root.iter("node")
