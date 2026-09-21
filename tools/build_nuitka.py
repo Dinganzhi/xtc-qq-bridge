@@ -124,6 +124,27 @@ def product_name(target: str, version: str) -> str:
     return f"{base}-{version}-{host_os()}-{host_arch()}"
 
 
+def numeric_version(version: str) -> str:
+    """把 `1.0.0-alpha.1` 这类版本号转成 Nuitka 的 --file-version 能接受的形式。
+
+    Nuitka 的 --file-version / --product-version 只接受**纯数字**（最多 4 段），
+    带 `-alpha.1` 后缀会直接报
+        FATAL: Invalid version number --file-version='1.0.0-alpha.1'.
+    并让整个编译立刻失败（CI 六平台全挂就是这么来的）。
+    产物文件名仍然用完整版本号；这里只给 Windows 版本资源用数字形式：
+        1.0.0-alpha.1 -> 1.0.0.1     1.0.0 -> 1.0.0.0     2.1-beta.3 -> 2.1.0.3
+    """
+    raw = (version or "").strip()
+    m = re.match(r"^(\d+(?:\.\d+)*)", raw)
+    parts = [int(x) for x in (m.group(1).split(".") if m else ["0"])][:3]
+    while len(parts) < 3:
+        parts.append(0)
+    # 预发布序号放进第 4 段，正式版为 0（Windows 版本字段上限 65535）
+    pre = re.search(r"(?:alpha|beta|rc)\.?(\d+)", raw, re.I)
+    parts.append(int(pre.group(1)) if pre else 0)
+    return ".".join(str(max(0, min(p, 65535))) for p in parts)
+
+
 def _has_module(name: str) -> bool:
     try:
         __import__(name)
@@ -297,7 +318,9 @@ def build_command(info: NuitkaInfo, target: str, mode: str, out_dir: Path,
         cmd += _data_dir_args(src, dst)
     if info.supports("--company-name"):
         cmd += [f"--company-name={COMPANY}", f"--product-name={PRODUCT}"]
-        cmd += [f"--file-version={version}", f"--product-version={version}"]
+        # 版本资源必须是纯数字：1.0.0-alpha.1 -> 1.0.0.1（否则 Nuitka 直接 FATAL）
+        num_ver = numeric_version(version)
+        cmd += [f"--file-version={num_ver}", f"--product-version={num_ver}"]
         cmd += [f"--copyright=Apache-2.0"]
     if os.name == "nt" and info.supports("--windows-console-mode"):
         cmd += ["--windows-console-mode=force"]        # CLI 工具必须保留控制台

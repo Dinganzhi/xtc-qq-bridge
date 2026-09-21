@@ -1573,6 +1573,35 @@ def test_monotonic_sentinels_survive_fresh_boot() -> None:
         xmod.time.monotonic = real_monotonic
 
 
+def test_nuitka_version_args_are_numeric() -> None:
+    """预发布版本号必须转成纯数字再交给 Nuitka。
+
+    真实事故：打 tag 1.0.0-alpha.1 后 CI 六平台**全部**失败，只有一行
+        FATAL: Invalid version number --file-version='1.0.0-alpha.1'.
+    Nuitka 的 --file-version/--product-version 只接受数字，产物文件名才用完整版本号。
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path.cwd() / "tools"))
+    import build_nuitka as b
+
+    check("1.0.0-alpha.1 -> 1.0.0.1", b.numeric_version("1.0.0-alpha.1") == "1.0.0.1",
+          b.numeric_version("1.0.0-alpha.1"))
+    check("1.0.0 -> 1.0.0.0", b.numeric_version("1.0.0") == "1.0.0.0",
+          b.numeric_version("1.0.0"))
+    check("2.1-beta.3 -> 2.1.0.3", b.numeric_version("2.1-beta.3") == "2.1.0.3",
+          b.numeric_version("2.1-beta.3"))
+    check("1.0.0-rc.2 -> 1.0.0.2", b.numeric_version("1.0.0-rc.2") == "1.0.0.2",
+          b.numeric_version("1.0.0-rc.2"))
+    check("结果全是纯数字点分",
+          all(p.isdigit() for p in b.numeric_version("1.0.0-alpha.1").split(".")),
+          b.numeric_version("1.0.0-alpha.1"))
+    check("异常输入也不炸", b.numeric_version("") == "0.0.0.0", b.numeric_version(""))
+    check("产物文件名仍用完整版本号（不带 v）",
+          b.product_name("bridge", "1.0.0-alpha.1").endswith("-1.0.0-alpha.1-windows-x86_64")
+          or "1.0.0-alpha.1" in b.product_name("bridge", "1.0.0-alpha.1"),
+          b.product_name("bridge", "1.0.0-alpha.1"))
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1600,6 +1629,7 @@ def main() -> int:
                test_no_delivery_confirm_on_forward_failure,
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
                test_monotonic_sentinels_survive_fresh_boot,
+               test_nuitka_version_args_are_numeric,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:
