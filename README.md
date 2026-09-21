@@ -814,10 +814,11 @@ python tools/wsa_net_guard.py --test
 
 | 产物 | 入口 | 说明 |
 |---|---|---|
-| `xtc-qq-bridge-v<版本>-<系统>-<架构>[.exe]` | `main.py` | 桥接主程序 |
-| `xtc-wsa-guard-v<版本>-<系统>-<架构>[.exe]` | `tools/wsa_net_guard.py` | WSA/WSABuilds 网络守护（独立程序） |
+| `xtc-qq-bridge-<版本>-<系统>-<架构>[.exe]` | `main.py` | 桥接主程序 |
+| `xtc-wsa-guard-<版本>-<系统>-<架构>[.exe]` | `tools/wsa_net_guard.py` | WSA/WSABuilds 网络守护（独立程序） |
 
-命名规范示例：`xtc-qq-bridge-v1.1.0-windows-x86_64.exe`、`xtc-wsa-guard-v1.1.0-linux-arm64`。
+命名规范示例：`xtc-qq-bridge-1.0.0-windows-x86_64.exe`、`xtc-wsa-guard-1.0.0-linux-arm64`
+（版本号不带 `v` 前缀，与 tag 一致，例如 tag `1.0.0-alpha.1`）。
 
 ## 1. 本地一键编译
 
@@ -863,7 +864,7 @@ python tools/build_nuitka.py --out dist --jobs 8 --lto yes
 把 exe 放到任意目录（例如 D:\xtc\），第一次运行：
 
 D:\xtc\
-|-- xtc-qq-bridge-v1.1.0-windows-x86_64.exe   # 你的程序
+|-- xtc-qq-bridge-1.0.0-windows-x86_64.exe   # 你的程序
 |-- config.yaml        # 首次运行自动从模板生成（编辑它：QQ 号/联系人/账密/token）
 |-- logs\bridge.log    # 日志（写在 exe 旁边，不会随临时目录被删）
 `-- data\             # 消息库/去重状态（重启不丢）

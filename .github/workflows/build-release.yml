@@ -2,7 +2,7 @@ name: build-release
 
 # 触发方式：
 #   - 推送到 main / dev      -> 只跑测试（不编译，省时间）
-#   - 打 tag（v*）           -> 只编译 + 上传 Actions 产物，**不会**自动发 Release
+#   - 打 tag（v* 或 1.0.0 这类裸版本号）-> 只编译 + 上传 Actions 产物，**不会**自动发 Release
 #   - 手动 workflow_dispatch -> 编译 + 上传 Actions 产物；必须显式勾选 publish 才创建 Release
 #
 # 分支约定：日常开发推 dev，main 只保留确认发布的正式版（确认发布时才把 dev 合并进 main）。
@@ -11,7 +11,8 @@ name: build-release
 on:
   push:
     branches: [main, dev]
-    tags: ["v*"]
+    # 同时支持 v1.2.0 与裸版本号 1.0.0-alpha.1（本项目 tag 不带 v）
+    tags: ["v*", "*.*.*"]
   workflow_dispatch:
     inputs:
       mode:

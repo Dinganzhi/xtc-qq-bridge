@@ -120,7 +120,8 @@ def host_arch() -> str:
 
 def product_name(target: str, version: str) -> str:
     base = "xtc-qq-bridge" if target == "bridge" else "xtc-wsa-guard"
-    return f"{base}-v{version}-{host_os()}-{host_arch()}"
+    # 版本号不加 v 前缀（与 tag 一致：tag 就叫 1.0.0-alpha.1）
+    return f"{base}-{version}-{host_os()}-{host_arch()}"
 
 
 def _has_module(name: str) -> bool:
