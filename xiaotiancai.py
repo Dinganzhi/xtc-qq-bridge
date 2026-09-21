@@ -126,11 +126,81 @@ class Xiaotiancai:
         self._net_retry_ts = 0.0     # 网络弹窗"重试"按钮的点击冷却
         self._last_dump_warn = 0.0   # "读不到界面"告警的节流时间戳
         self._last_label_retry = 0.0  # "快照里没有时间标签"的补救重读节流
+        self._throttle: dict[str, float] = {}   # 同类失败告警节流：key -> 上次打印时刻
+        self.last_open_reason = ""   # 最近一次 open_chat 失败的原因（桥接据此去重打印）
 
     def log(self, level: str, msg: str):
         if self.logger is None:
             return
         getattr(self.logger, level, self.logger.info)(msg)
+
+    def _warn_throttled(self, key: str, msg: str, interval: float = 300.0) -> None:
+        """同一类失败在 interval 秒内只打一次 warning，其余降为 debug。
+
+        轮询每 2 秒跑一轮，失败原因又往往是"状态问题"（未登录、不在前台、
+        联系人不在当前页），不节流就会把日志刷成"老是提示找不到联系人"。
+        """
+        now = time.monotonic()
+        if now - self._throttle.get(key, 0.0) >= interval:
+            self._throttle[key] = now
+            self.log("warning", msg)
+        else:
+            self.log("debug", msg)
+
+    # ------------------------------------------------------------------ 状态判定
+    def app_state_with_root(self, attempts: int = 2) -> tuple:
+        """读一次界面并判定状态，返回 (state, root)。
+
+        state 取值见 STATE_* 常量。读不到界面时 root 可能为 None。
+        """
+        root = self._dump_with_retry(attempts)
+        return self.app_state(root), root
+
+    @staticmethod
+    def _tree_is_empty(root: ET.Element) -> bool:
+        """界面快照是不是"空的"（UI 还没渲染好/dump 到了空树）。
+
+        不能用"节点数 < 3"来判断：登录页有时只有两三个控件，会被误判成读不到。
+        真正的空树是所有节点都没有文本、描述、id、也不可点击。
+        """
+        for n in root.iter("node"):
+            if (n.get("text") or "").strip() or (n.get("content-desc") or "").strip():
+                return False
+            if (n.get("resource-id") or "").strip():
+                return False
+            if str(n.get("clickable", "")).lower() == "true":
+                return False
+        return True
+
+    def app_state(self, root: ET.Element | None = None) -> str:
+        """判定"App 现在到底处于什么状态"，供桥接做状态机与日志。
+
+        为什么需要它：以前轮询只问"在不在聊天页"，不在就去 open_chat，
+        于是在登录页/别的页面上反复找联系人，报一堆"找不到联系人"，
+        既没有判断状态也没法对症处理。
+
+        顺序：先看前台（不在前台时界面根本不是小天才的）-> 再看能不能读到界面
+        -> 登录/安全验证页 -> 聊天页 -> 消息列表 -> 其它页面。
+        """
+        try:
+            if not self.adb.is_in_foreground(self.package):
+                return self.STATE_BACKGROUND
+        except AdbError:
+            return self.STATE_BLIND
+        if root is None:
+            root = self._dump_with_retry(1)
+        if root is None or self._tree_is_empty(root):
+            return self.STATE_BLIND
+        try:
+            if self.looks_like_chat_page(root):
+                return self.STATE_CHAT
+            if self._looks_like_login_page(root):
+                return self.STATE_LOGIN
+            if self.looks_like_message_list(root):
+                return self.STATE_LIST
+        except Exception:  # noqa: BLE001 判定异常按"读不到"处理
+            return self.STATE_BLIND
+        return self.STATE_OTHER
 
     def _dump_fast(self) -> ET.Element:
         """交互路径的快速 UI dump（2 次尝试、很短的等待）。
@@ -239,6 +309,23 @@ class Xiaotiancai:
     LOGGED_IN = LOGIN_LOGGED_IN
     NOT_LOGGED_IN = LOGIN_NOT_LOGGED_IN
     LOGIN_UNKNOWN = LOGIN_UNKNOWN
+
+    # App 状态机（app_state 的返回值）：桥接据此决定"该做什么"，而不是一味重试
+    STATE_CHAT = "chat"              # 已在聊天窗口
+    STATE_LIST = "list"              # 消息列表（这里才该找联系人）
+    STATE_LOGIN = "login"            # 登录页/安全验证页（等登录，别找联系人）
+    STATE_OTHER = "other"            # 其它页面（首页/设置/详情等）
+    STATE_BACKGROUND = "background"  # App 不在前台
+    STATE_BLIND = "blind"            # 读不到界面（息屏/界面不空闲/dump 失败）
+
+    STATE_TEXT = {
+        STATE_CHAT: "聊天窗口",
+        STATE_LIST: "消息列表",
+        STATE_LOGIN: "登录/验证页",
+        STATE_OTHER: "小天才其它页面",
+        STATE_BACKGROUND: "App 不在前台",
+        STATE_BLIND: "读不到界面",
+    }
 
     def login_state(self, force: bool = False, root: ET.Element | None = None) -> str:
         """判断登录态，返回 'logged_in' / 'not_logged_in' / 'unknown'。
@@ -1080,20 +1167,23 @@ class Xiaotiancai:
         # 读到界面之前先看一眼登录态：未登录时没必要去找联系人
         # （实机测试：未登录时在登录页反复找联系人会白等 40 多秒）
         if self.login_state(force=True) == self.NOT_LOGGED_IN:
-            self.log("warning", f"打开聊天失败：小天才 App 未登录（当前在登录页），"
-                                f"登录后才能进入与 {contact!r} 的聊天")
+            self.last_open_reason = (f"小天才 App 未登录（当前在登录页），"
+                                     f"登录后才能进入与 {contact!r} 的聊天")
+            self._warn_throttled("open_chat_not_logged_in", "打开聊天失败：" + self.last_open_reason)
             return False
         # 读界面（失败自动收键盘重试；仍失败就本轮放弃，交给外层稍后重试，
         # 不再抛出 "cat: ... No such file" 这种误导性 ERROR）
         root = self._dump_with_retry(2)
         if root is None:
-            self.log("warning", f"打开聊天暂缓：连续读不到界面控件（联系人 {contact}），"
-                                "稍后会自动重试（若反复出现，多为界面一直不空闲，"
-                                "可调大 adb.dump_retries / adb.dump_delay）")
+            self.last_open_reason = (f"连续读不到界面控件（联系人 {contact}），稍后会自动重试"
+                                     "（若反复出现，多为界面一直不空闲，"
+                                     "可调大 adb.dump_retries / adb.dump_delay）")
+            self._warn_throttled("open_chat_no_dump", "打开聊天暂缓：" + self.last_open_reason)
             return False
         if len(list(root.iter("node"))) < 3:
             # 刚登录完/页面切换中的空树：别照着它去"找联系人"，那只会得出错结论
-            self.log("info", "打开聊天暂缓：界面还在切换/加载（只读到空树），稍后自动重试")
+            self.last_open_reason = "界面还在切换/加载（只读到空树）"
+            self.log("info", f"打开聊天暂缓：{self.last_open_reason}，稍后自动重试")
             return False
         try:
             # 进来先确认一次：万一 Activity 名不认识，界面特征也能证明"已经在聊天页"
@@ -1117,10 +1207,12 @@ class Xiaotiancai:
                     page = "消息列表"
                 else:
                     page = f"当前页面不像消息列表（前台={self.current_activity() or '未知'}）"
-                self.log("warning",
-                         f"找不到联系人 {contact!r}：{page}；"
-                         f"当前可见联系人: {'、'.join(visible) or '(无)'}"
-                         "（可改 config.yaml -> target.xtc_contact 或 ui.contact_name_ids）")
+                self.last_open_reason = (
+                    f"找不到联系人 {contact!r}：{page}；"
+                    f"当前可见联系人: {'、'.join(visible) or '(无)'}"
+                    "（可改 config.yaml -> target.xtc_contact 或 ui.contact_name_ids）")
+                # 轮询每 2 秒一次，这类失败会连续发生 -> 同因 5 分钟只报一次
+                self._warn_throttled("open_chat_not_found", self.last_open_reason)
                 return False
             self.adb.tap_element(node)
 
@@ -1726,9 +1818,12 @@ class Xiaotiancai:
         return False
 
     # ------------------------------------------------------------------ 读取消息
-    def get_latest_message(self):
+    def get_latest_message(self, root: ET.Element | None = None):
         """返回 (contact, text, time_label, own_text, own_recent)；无法确定时
         (None, None, "", "", [])。
+
+        root: 可传入调用方已经读好的界面快照（轮询层会先 app_state 判状态再复用），
+              省掉一次 uiautomator dump——WSA 上单次 dump 要 3 秒左右。
 
         own_text = 最新一条"自己发的"消息文本；
         own_recent = 最近若干条自己发的消息 [(text, time_label)]（新->旧，供 xtc 侧
@@ -1743,7 +1838,7 @@ class Xiaotiancai:
             # 一次 dump 同时用于登录态判断与消息解析（登录态有缓存，避免重复 dump）；
             # 读不到界面（界面一直不空闲等）→ 返回空，交给轮询层稍后重试/自愈，
             # 不抛异常也不刷 ERROR 日志。
-            root = self._dump_with_retry(2)
+            root = root if root is not None else self._dump_with_retry(2)
             if root is None:
                 return (None, None, "", "", [])
             if self.is_in_chat(root):

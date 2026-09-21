@@ -1471,6 +1471,74 @@ def test_no_delivery_confirm_on_forward_failure() -> None:
     cleanup(root)
 
 
+def test_app_state_machine() -> None:
+    """状态判定：聊天页/列表/登录页/不在前台/读不到，五种要分得清。
+
+    用户反馈"不能判断当前状态，还老是提示找不到联系人"——以前轮询只问
+    "在不在聊天页"，不在就去 open_chat，于是在登录页上反复找联系人。
+    """
+    ui = {"interaction_delay": 0.01}
+
+    def state_of(xml: str, focus: str = "com.xtc.watch/.MainActivity") -> str:
+        adb = FakeAdb(xml, focus)
+        adb.dump_ui = lambda retries=3, delay=2.0: ET.fromstring(xml)
+        return Xiaotiancai(adb, {"ui": ui}).app_state()
+
+    chat = chat_page_xml("晚上回家吃饭")
+    lst = message_list_xml([("李四", "早"), ("王五", "晚安")])
+    check("聊天页 -> chat", state_of(chat) == Xiaotiancai.STATE_CHAT, state_of(chat))
+    check("消息列表 -> list", state_of(lst) == Xiaotiancai.STATE_LIST, state_of(lst))
+    check("App 不在前台 -> background",
+          state_of(chat, "com.microsoft.windows.homeapp/.Home")
+          == Xiaotiancai.STATE_BACKGROUND)
+    check("空树/读不到 -> blind", state_of(node_xml("")) == Xiaotiancai.STATE_BLIND)
+
+    login_xml = node_xml(
+        n(cls="android.widget.EditText", text="", password="true",
+          rid="com.xtc.watch:id/et_password", bounds="[100,300][700,380]")
+        + n(cls="android.widget.Button", text="登录", bounds="[100,400][700,470]"))
+    check("密码框/登录按钮 -> login",
+          state_of(login_xml) == Xiaotiancai.STATE_LOGIN, state_of(login_xml))
+
+    other = node_xml(n(cls="android.widget.TextView", text="设置", bounds="[0,0][100,50]")
+                     + n(cls="android.widget.TextView", text="关于", bounds="[0,60][100,110]")
+                     + n(cls="android.widget.TextView", text="退出", bounds="[0,120][100,170]"))
+    check("其它页面 -> other", state_of(other) == Xiaotiancai.STATE_OTHER, state_of(other))
+    check("状态有中文说明", Xiaotiancai.STATE_TEXT.get(Xiaotiancai.STATE_LOGIN) == "登录/验证页")
+
+
+def test_state_logged_once_and_warnings_throttled() -> None:
+    """状态只在变化时记一条；同一失败原因不刷屏。"""
+    root = tmp_root()
+    rec = Recorder()
+    br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                  adb=None, xtc=None, forwarder=None, logger=rec)
+    br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+    br._cmd_done_file = str(_paths(root)["done"])
+    br.xtc = Xiaotiancai(FakeAdb(), {"ui": {}}, logger=rec)
+    try:
+        br._log_state(Xiaotiancai.STATE_LOGIN)
+        br._log_state(Xiaotiancai.STATE_LOGIN)
+        n_login = sum(1 for x in rec.lines if "小天才状态: 登录/验证页" in x)
+        check("同一状态只记一次", n_login == 1, str(rec.lines))
+        check("刚进入该状态时不再立刻重复提醒",
+              not any("持续为" in x for x in rec.lines), str(rec.lines))
+        br._log_state(Xiaotiancai.STATE_CHAT)
+        check("状态变化会再记一条",
+              any("小天才状态: 聊天窗口" in x for x in rec.lines), str(rec.lines))
+
+        rec.lines.clear()
+        xtc = br.xtc
+        for _ in range(5):
+            xtc._warn_throttled("k", "同样的失败")
+        warns = [x for x in rec.lines if x.startswith("[warning]")]
+        check("同类失败 5 分钟内只 warning 一次", len(warns) == 1, str(rec.lines))
+        check("其余降为 debug", len([x for x in rec.lines if x.startswith("[debug]")]) == 4,
+              str(rec.lines))
+    finally:
+        cleanup(root)
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1496,6 +1564,7 @@ def main() -> int:
                test_time_label_is_per_message, test_latest_message_retries_when_labels_missing,
                test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
                test_no_delivery_confirm_on_forward_failure,
+               test_app_state_machine, test_state_logged_once_and_warnings_throttled,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:

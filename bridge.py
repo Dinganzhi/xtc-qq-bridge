@@ -148,6 +148,7 @@ class MessageBridge:
         self._notify_seen: dict[str, float] = {}   # 通知去重：文本 -> 上次发送时刻
         self._log_seen: dict[str, float] = {}      # 日志去重：key -> 上次打印时刻
         self._poll_fail_streak = 0        # 连续"读不到消息"的轮数（触发界面自愈）
+        self._last_state = ""             # 上一次判定的 App 状态（用于"状态变化才记日志"）
         self._wsa_guard_hinted = False    # WSA 断网提示只打一次
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
@@ -267,17 +268,30 @@ class MessageBridge:
                         if self.xtc.login_state() == LOGIN_LOGGED_IN:
                             self._pending_login_notify = False
                             self._notify("小天才已重新登录（安全验证完成），桥接继续运行")
-                    # 确保在聊天页读取（列表预览无法判断发送方，会把家长侧消息误当对方消息）；
-                    # 正常 30s 才重开一次（免得频繁打断用户）；连续读不到消息时逐步加快，
-                    # 并触发一次"界面自愈"（清弹窗/必要时启动 App/回聊天页）。
-                    if not self.xtc.is_in_chat():
-                        xtc_contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
-                        cooldown = 30.0 if self._poll_fail_streak < 5 else 5.0
-                        if xtc_contact and time.monotonic() - self._last_chat_open >= cooldown:
-                            self._last_chat_open = time.monotonic()
-                            self.xtc.open_chat(xtc_contact)
-                    contact, text, time_label, own_text, own_recent = \
-                        self.xtc.get_latest_message()
+                    # 先判状态再决定做什么（以前只问"在不在聊天页"，于是在登录页/
+                    # 别的页面上反复找联系人，刷一堆"找不到联系人"且不对症）。
+                    state, root = self.xtc.app_state_with_root(2)
+                    self._log_state(state)
+                    xtc_contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+                    if state == self.xtc.STATE_CHAT:
+                        contact, text, time_label, own_text, own_recent = \
+                            self.xtc.get_latest_message(root)
+                    else:
+                        contact, text, time_label, own_text, own_recent = (None, None, "", "", [])
+                        if state == self.xtc.STATE_LOGIN:
+                            # 登录/安全验证页：等登录线程处理，绝不在这里找联系人
+                            self._log_once("state_login",
+                                           "当前在小天才登录/安全验证页，等待登录完成"
+                                           "（此时不会去找联系人）", interval=600)
+                        elif state in (self.xtc.STATE_LIST, self.xtc.STATE_OTHER):
+                            cooldown = 30.0 if self._poll_fail_streak < 5 else 5.0
+                            if xtc_contact and time.monotonic() - self._last_chat_open >= cooldown:
+                                self._last_chat_open = time.monotonic()
+                                if not self.xtc.open_chat(xtc_contact):
+                                    reason = self.xtc.last_open_reason or "未知原因"
+                                    # 同一原因 5 分钟只报一次，避免轮询刷屏
+                                    self._log_once(f"open_chat:{reason[:24]}",
+                                                   f"进入聊天失败：{reason}", interval=300)
                 finally:
                     self._op_lock.release()
                 # 连续读不到任何东西（且不在聊天页/被弹窗挡住）-> 自愈
@@ -1279,6 +1293,22 @@ class MessageBridge:
             return
         self._log_seen[key] = now
         self._log("info", text)
+
+    def _log_state(self, state: str) -> None:
+        """状态变化时记一条 INFO；长时间停在非聊天状态则每 10 分钟提醒一次。
+
+        目的：日志里能一眼看出"当时到底处于什么状态"，而不是满屏重复的失败告警
+        （用户反馈"不能判断当前状态，还老是提示找不到联系人"）。
+        """
+        text = self.xtc.STATE_TEXT.get(state, state)
+        if state != self._last_state:
+            self._last_state = state
+            self._log("info", f"小天才状态: {text}")
+            # 从现在起算 10 分钟，避免"状态没变"时立刻又提醒一次
+            self._log_seen[f"stuck:{state}"] = time.monotonic()
+            return
+        if state not in (self.xtc.STATE_CHAT,):
+            self._log_once(f"stuck:{state}", f"小天才状态持续为「{text}」", interval=600.0)
 
     def _notify_once(self, key: str, text: str, interval: float = 600.0) -> None:
         """同一类通知在 interval 秒内只发一次（避免刷屏）。"""

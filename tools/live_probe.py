@@ -83,7 +83,11 @@ def main() -> int:
     check("App 在前台", True if fg else xtc.launch(),
           f"启动前={act or '(空)'} -> 现在={xtc.current_activity() or '(空)'}")
 
-    # 3) UI dump（快路径/多目录/exec-out）
+    # 2.6) App 状态判定（桥接状态机的基础：chat/list/login/other/background/blind）
+    state = xtc.app_state()
+    check("App 状态判定", True,
+          f"state={state}（{Xiaotiancai.STATE_TEXT.get(state, state)}）")
+
     t0 = time.time()
     root = None
     try:
