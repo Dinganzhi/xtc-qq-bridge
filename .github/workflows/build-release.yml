@@ -77,7 +77,8 @@ jobs:
           - os: macos-14
             artifact: macos-arm64
             mode: onefile
-          - os: macos-13
+          # macos-13（Intel）已被 GitHub 退役，改用 macos-15-intel
+          - os: macos-15-intel
             artifact: macos-x86_64
             mode: onefile
     runs-on: ${{ matrix.os }}
