@@ -24,6 +24,18 @@ on:
         description: "是否创建/更新 GitHub Release（默认否；只有明确要发布时才勾选）"
         type: boolean
         default: false
+      tag_name:
+        description: "发布到哪个 tag（如 1.0.0-alpha.1；勾了 publish 必填，否则会把分支名当 tag）"
+        type: string
+        default: ""
+      prerelease:
+        description: "预发布版？alpha/beta/rc 保持 true；稳定版改 false"
+        type: boolean
+        default: true
+      body_path:
+        description: "Release Notes 文件路径（仓库内，如 .github/release-notes/1.0.0-alpha.1.md；留空则自动生成）"
+        type: string
+        default: ""
 
 permissions:
   contents: write        # 发布 Release 需要
@@ -139,21 +151,52 @@ jobs:
 
   # ---------------------------------------------------------------- 发布
   # 只有手动触发并显式勾选 publish=true 才会跑，打 tag 不会自动发布。
+  # 产物与校验和都在 CI 里生成并直接挂到 Release 上，无需本地下载。
   release:
     name: publish release
     needs: build
     if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Package AstrBot plugin (zip)
+        shell: bash
+        run: |
+          set -e
+          ver="${{ inputs.tag_name || github.ref_name }}"
+          # 版本号可能带 v 前缀，插件包名统一成"不带 v"的形式，与产物命名一致
+          ver="${ver#v}"
+          cd astrbot_plugin_xtc_bridge/.. && zip -r "artifacts/astrbot_plugin_xtc_bridge-${ver}.zip" astrbot_plugin_xtc_bridge -x '*/__pycache__/*' >/dev/null
+          ls -la artifacts
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -e
+          cd artifacts
+          # 去掉每个产物自带的 .sha256（内容重复），统一生成一份汇总校验文件
+          find . -maxdepth 1 -name '*.sha256' -delete
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: List files
         run: ls -la artifacts
+
       - name: Create/Update release
         uses: softprops/action-gh-release@v3
         with:
+          # dispatch 时必须给 tag_name（否则会把分支名当 tag）
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          name: ${{ inputs.tag_name || github.ref_name }}
+          # alpha/beta/rc 勾选预发布；稳定版把 prerelease 输入设为 false
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: "false"
+          body_path: ${{ inputs.body_path }}
+          generate_release_notes: ${{ inputs.body_path == '' }}
           files: artifacts/*
-          generate_release_notes: true
           fail_on_unmatched_files: false
