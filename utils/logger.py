@@ -18,6 +18,25 @@ from logging.handlers import RotatingFileHandler
 _FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
+def make_console_tolerant() -> None:
+    """让普通 print() 在非 UTF-8 控制台上也不会因为中文而崩。
+
+    为什么需要：日志走的是 StreamHandler（已用 _tolerant_stream 兜底），但程序里
+    还有大量 print()（横幅、--verify 输出、编译脚本进度）。在 Windows CI 的
+    cp1252 控制台上，print 中文会直接抛
+        UnicodeEncodeError: 'charmap' codec can't encode characters ...
+    导致编译/自检整个失败（实测：Windows 两个平台的 CI 编译就是这么挂的）。
+    这里只改 errors（保留原编码），失败就静默跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(errors="replace")   # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 老版本/被替换的流：只能放弃
+            pass
+
+
 def _tolerant_stream(stream):
     """让标准流在遇到无法编码的字符时用 ? 代替，而不是抛异常丢日志。"""
     if stream is None:

@@ -29,6 +29,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_paths                      # noqa: E402
 from version import __version__           # noqa: E402
 
+try:                                      # 非 UTF-8 控制台（Windows cp1252）下 print 中文不崩
+    from utils.logger import make_console_tolerant
+    make_console_tolerant()
+except Exception:  # noqa: BLE001 兜底失败不影响主流程
+    pass
+
 
 def read_text_auto(path: str) -> str:
     """读配置文本：优先 UTF-8（含 BOM），失败再按系统 ANSI（中文 Windows = GBK）读。

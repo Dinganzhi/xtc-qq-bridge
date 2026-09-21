@@ -40,6 +40,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 非 UTF-8 控制台兜底：Windows CI 的 cp1252 下 print 中文会抛 UnicodeEncodeError，
+# 直接把整个编译判失败（Windows 两个平台的 CI 就是这么挂的）。
+try:
+    from utils.logger import make_console_tolerant
+    make_console_tolerant()
+except Exception:  # noqa: BLE001
+    pass
+
 # ---------------------------------------------------------------- 常量
 TARGETS = {
     # 名字: (入口脚本, 是否带控制台, 说明)
@@ -168,7 +176,7 @@ class NuitkaInfo:
         self.nuitka_cmd = [sys.executable, "-m", "nuitka"]
         try:
             out = subprocess.run([*self.nuitka_cmd, "--version"], capture_output=True,
-                                 text=True, timeout=180, env=nuitka_env())
+                                 text=True, errors="replace", timeout=180, env=nuitka_env())
         except (OSError, subprocess.SubprocessError) as e:
             self.help_text = f"(nuitka --version 失败: {e})"
             return self
@@ -473,7 +481,8 @@ def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     ok = True
     for extra in cmds:
         try:
-            p = subprocess.run([str(exe), *extra], capture_output=True, text=True, timeout=300)
+            p = subprocess.run([str(exe), *extra], capture_output=True, text=True,
+                               errors="replace", timeout=300)
         except (OSError, subprocess.SubprocessError) as e:
             print(f"[冒烟] {' '.join(extra)} 运行失败: {e}")
             ok = False

@@ -65,8 +65,10 @@ except Exception:  # noqa: BLE001
 from adb_controller import (IS_WINDOWS, AdbError, _WSA_COMMON_PORTS,  # noqa: E402
                             _is_wsa_serial, find_adb, launch_wsa, platform_tag,
                             wsa_adb_port, wsa_connection_info, wsa_installed)
-from utils.logger import setup_logger  # noqa: E402
+from utils.logger import make_console_tolerant, setup_logger  # noqa: E402
 import runtime_paths  # noqa: E402
+
+make_console_tolerant()   # 非 UTF-8 控制台下 print 中文不崩（Windows cp1252）
 
 # 状态/日志都写在"可写数据目录"：Nuitka onefile 下是 exe 旁边（而不是临时解包目录）
 runtime_paths.ensure_dirs()
