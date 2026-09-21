@@ -1837,28 +1837,25 @@ class Xiaotiancai:
         return (None, t, self._label_for_bubble(n, dates))
 
     def _label_for_bubble(self, bubble, dates: list) -> str:
-        """给某个气泡挑时间标签（dates = [(top, bottom, text)]，按 top 升序）。
+        """取**这条消息自己的**时间标签（dates = [(top, bottom, text)]，按 top 升序）。
 
-        ① 优先"最靠下且仍在该气泡上方"的标签（同一时间段只有组首上方有标签）；
-        ② 有些版本把时间画在气泡同一行（左右并排），取垂直区间有重叠的标签；
-        ③ 都不匹配时（标签被虚拟列表回收、气泡被输入栏遮挡等）取垂直中心最近的标签。
-        返回 "" 表示这次界面快照里确实没有任何可用的时间信息。
+        规则只有一条：取"位于该气泡上方、且最靠下"的那个标签。
+        小天才 App 给每条消息在气泡上方画自己的时间，所以"上方最近的标签"
+        就是这条消息的时间（实测：早上好❤ 上方 06:59、表情图 上方 19:17）。
 
-        为什么这么费劲：拿不到标签时上层会退化成"当前时间"，用户遇到过
-        "8 点发的消息被按当前时间转发"。
+        **不要加"找不到就退而取最近标签"的兜底**（09-20 加过，是错的）：
+        列表上方滚出屏幕的消息拿不到自己的标签，退而取最近标签会取到
+        **它下面那条消息**的时间，转发时间就张冠李戴了。
+        拿不到就返回 ""，由上层按"当前时间"处理——对刚到达的消息这反而正确。
         """
         b = self._bounds(bubble)
         if not b or not dates:
             return ""
-        top, bottom = b[1], b[3]
-        for _d_top, d_bottom, d_text in reversed(dates):   # ② 之前先满足 ①
-            if d_bottom <= top + 5:
+        top = b[1]
+        for _d_top, d_bottom, d_text in reversed(dates):
+            if d_bottom <= top + 5:        # 标签底边在气泡上方
                 return d_text
-        row = [d for d in dates if d[0] < bottom and d[1] > top]
-        if row:
-            return max(row, key=lambda d: d[1])[2]
-        center = (top + bottom) / 2
-        return min(dates, key=lambda d: abs((d[0] + d[1]) / 2 - center))[2]
+        return ""
 
     def _date_count(self, root: ET.Element) -> int:
         return sum(1 for n in root.iter("node")

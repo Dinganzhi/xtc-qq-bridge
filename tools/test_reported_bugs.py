@@ -1250,19 +1250,33 @@ def test_content_desc_exact_match() -> None:
           adb.find_element(root, content_desc="发送", content_desc_contains=False) is None)
 
 
-def test_time_label_fallbacks() -> None:
-    """时间标签：上方优先 / 同一行 / 垂直最近，都取不到才返回空串。"""
+def test_time_label_is_per_message() -> None:
+    """时间标签必须是**这条消息自己的**时间（气泡上方最近的标签）。
+
+    回归点：09-20 曾加过"找不到上方标签就退而取最近/同一行标签"的兜底，
+    结果列表上方滚出屏幕的消息会拿到**它下面那条消息**的时间，转发时间张冠李戴。
+    """
     xtc, _ = make_xtc("", ui_cfg={})
     bubble = ET.fromstring(n(bounds="[786,351][922,531]"))
     dates = [(123, 148, "07:06"), (312, 337, "08:08"), (565, 590, "22:20")]
     got = xtc._label_for_bubble(bubble, dates)
     check("取气泡上方最近的标签（不是最上面那个）", got == "08:08", f"got={got!r}")
-    got2 = xtc._label_for_bubble(bubble, [(351, 376, "08:08")])
-    check("时间画在气泡同一行时也能取到", got2 == "08:08", f"got={got2!r}")
-    got3 = xtc._label_for_bubble(bubble, [(700, 725, "23:59")])
-    check("都不匹配时退化为垂直最近的标签", got3 == "23:59", f"got={got3!r}")
-    got4 = xtc._label_for_bubble(bubble, [])
-    check("确实没有标签时返回空串", got4 == "", f"got={got4!r}")
+
+    # 标签全在气泡下方（消息自己的标签已滚出屏幕）：必须返回空，
+    # 让上层用"当前时间"，绝不能借用下面那条消息的时间
+    below = [(700, 725, "23:59"), (760, 785, "23:58")]
+    got2 = xtc._label_for_bubble(bubble, below)
+    check("气泡下方/后面的标签一律不用（防张冠李戴）", got2 == "", f"got={got2!r}")
+
+    # 与气泡同一水平行的标签也不再采用（老版本同样不用）
+    got3 = xtc._label_for_bubble(bubble, [(351, 376, "08:08")])
+    check("同一行的标签不采用（与旧版本一致）", got3 == "", f"got={got3!r}")
+
+    check("确实没有标签时返回空串", xtc._label_for_bubble(bubble, []) == "")
+    check("_date_count 能数出标签数",
+          xtc._date_count(ET.fromstring(node_xml(
+              n(cls="android.widget.TextView", text="08:08",
+                rid="com.xtc.watch:id/tv_chat_msg_item_date")))) == 1)
 
 
 class SeqAdb(FakeAdb):
@@ -1405,7 +1419,7 @@ def main() -> int:
                test_foreground_logic_two_layers,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
                test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
-               test_time_label_fallbacks, test_latest_message_retries_when_labels_missing,
+               test_time_label_is_per_message, test_latest_message_retries_when_labels_missing,
                test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
