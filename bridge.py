@@ -357,10 +357,15 @@ class MessageBridge:
             time.sleep(self._poll_interval)
 
     def _hint_wsa_guard(self) -> None:
-        """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。"""
+        """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。
+
+        守护只适用于 Windows：WSA 是 Windows 独有组件，别的平台上没有它可用。
+        """
         if self._wsa_guard_hinted:
             return
         self._wsa_guard_hinted = True
+        if os.name != "nt":
+            return
         self._log("warning",
                   "若使用 WSA / WSABuilds 且经常断网，可另开一个终端运行独立守护工具："
                   "python tools/wsa_net_guard.py（自动重连/重置网络/必要时重启 WSA，"

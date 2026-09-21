@@ -11,8 +11,9 @@
 双向消息桥接、账密自动登录、登录态检测、安全验证提醒与自动恢复、弹窗自动清理与界面自愈。
 
 > **一键安装**：Windows 双击 `install.bat`；Linux / macOS 执行 `bash install.sh`（详见「一键安装」）。
-> **WSA/WSABuilds 经常断网**：另开一个终端跑 `python tools/wsa_net_guard.py`
+> **WSA/WSABuilds 经常断网（仅 Windows）**：另开一个终端跑 `python tools/wsa_net_guard.py`
 > （独立守护工具，分级修复：重连 -> 网络复位 -> 重启子系统，见「WSA 网络守护」）。
+> WSA 是 Windows 独有组件，所以这个守护**只在 Windows 上有意义**，也不会为其它平台提供产物。
 > **不想装 Python**：可用 Nuitka 编成机器码单文件（Windows / Linux，x86_64 / arm64）——
 > `build.bat` 或 `bash build.sh` 一条命令出产物，详见「五、编译成单文件可执行程序」。
 
@@ -47,7 +48,7 @@
 | **同时连多个设备** | 多设备并存时日志会提示；**请在 `adb.serial` 显式指定**要用的那个（如 `"127.0.0.1:5555"`） |
 | **镜像差异** | 已做防御式处理：无 `cmd clipboard`（自动走 ADBKeyBoard）、`ime set` 不生效（自动双写 settings）、`mCurrentFocus` 为空（自动回退 `topResumedActivity`）等，一般无需干预 |
 | **小天才 App 需自行安装** | 每个环境都要装小天才 App 并登录家长账号；界面控件 id 与运行环境无关（同一 APK） |
-| **WSA 断网是环境问题** | WSA / WSABuilds 长时间运行后子系统网络栈会失效。桥接自身会重连 ADB，但**网络栈死了要靠独立守护工具救**：见「WSA 网络守护」 |
+| **WSA 断网是环境问题（仅 Windows）** | WSA / WSABuilds 长时间运行后子系统网络栈会失效。桥接自身会重连 ADB，但**网络栈死了要靠独立守护工具救**：见「WSA 网络守护」。WSA 是 Windows 独有组件，别的平台没有这个问题 |
 
 ## 2. 各平台接入指引
 
@@ -70,7 +71,7 @@
 - 首次连接若报 `10061`（Hyper-V 抢占端口）：管理员执行
   `netsh int ipv4 add excludedportrange protocol=tcp startport=58526 numberofports=1` 后重启电脑。
 - WSA 与宿主剪贴板共享：桥接运行期间**不要复制别的内容**再手动粘贴，调试时容易被误导。
-- **WSA / WSABuilds 隔三差五断网**：用 `python tools/wsa_net_guard.py` 常驻守护（见「WSA 网络守护」）。
+- **WSA / WSABuilds 隔三差五断网（仅 Windows）**：用 `python tools/wsa_net_guard.py` 常驻守护（见「WSA 网络守护」）。
 </details>
 
 <details>
@@ -151,7 +152,7 @@
 | 4. 打印当前界面控件 | `python main.py --debug dump-ui` |
 | 5. 打开 config.yaml | — |
 | 6. 查看日志 | `logs/bridge.log` 末尾 40 行 |
-| 7. WSA 网络守护状态 | `python tools/wsa_net_guard.py --status` |
+| 7. WSA 网络守护状态（仅 Windows） | `python tools/wsa_net_guard.py --status` |
 | 8. 运行 WSA 网络守护 | `python tools/wsa_net_guard.py`（常驻，Ctrl+C 退出） |
 
 也支持参数透传（不进菜单，直接跑完退出）：
@@ -204,7 +205,7 @@ project/
 |   |-- ui_report.py         # 把当前界面控件导出成文本文件（排查控件 id / 中文不乱码）
 |   |-- live_probe.py        # 实机一键体检：连接/界面/登录态/联系人/读取/注入（不发真实消息）
 |   |-- selftest.py          # 环境自检（不依赖配置）
-|   |-- wsa_net_guard.py     # WSA/WSABuilds 网络守护（独立程序，可单独常驻或注册计划任务）
+|   |-- wsa_net_guard.py     # WSA/WSABuilds 网络守护（独立程序，可单独常驻或注册计划任务；仅 Windows）
 |   |-- wsa_guard.bat        # Windows 双击启动上面的守护（纯 ASCII）
 |   |-- build_nuitka.py      # 编译驱动：一键编出单文件机器码（Windows/Linux/macOS 通用）
 |   |-- build_in_docker.sh   # 在 Docker 里编译 Linux 版（免装本机工具链）
@@ -282,7 +283,7 @@ project/
 | `xiaotiancai.ui.login_progress_markers` | "登录中/正在验证/请稍候"等进度文案（**出现即不判失败**） |
 | `xiaotiancai.ui.system_msg_prefixes` | 桥接系统提示前缀（发送成功/发送失败），读取时跳过不转发 |
 | `webhook.allow_from` / `allow_groups` | 接收白名单（私聊/群聊） |
-| `wsa_guard.*` | WSA 网络守护参数（只被 `tools/wsa_net_guard.py` 读取） |
+| `wsa_guard.*` | WSA 网络守护参数（只被 `tools/wsa_net_guard.py` 读取；仅 Windows） |
 | `wsa_guard.ping_command` | 自定义 ICMP 探测命令（`{host}` 占位）；留空自动尝试多种 ping 写法 |
 | `wsa_guard.tcp_targets` / `tcp_timeout` | TCP 探测目标（`host:port`）与超时；**WSA 上靠它判断断网**（ICMP 被屏蔽） |
 
@@ -375,7 +376,7 @@ webhook:
   allow_from: []               # 私聊白名单：允许触发 /小天才 的 QQ 号（空=该类全部拒绝）
   allow_groups: []             # 群聊白名单：允许触发 /小天才 的群号（空=该类全部拒绝）
 
-# ---------- WSA / WSABuilds 网络守护（独立工具，可选） ----------
+# ---------- WSA / WSABuilds 网络守护（独立工具，可选，仅 Windows） ----------
 wsa_guard:
   interval: 30
   ping_hosts: ["223.5.5.5", "8.8.8.8"]
@@ -391,12 +392,16 @@ wsa_guard:
 > （除非把配置写成 JSON），而 `tools/wsa_net_guard.py` 会退化成"只解析 `wsa_guard` 段"，
 > 不受影响。
 
-## 3. WSA / WSABuilds 网络守护（独立工具）
+## 3. WSA / WSABuilds 网络守护（独立工具，仅 Windows）
 
 WSA（含 WSABuilds / MagiskOnWSA）跑久了会"隔三差五断网"：宿主侧 adb 还在、`adb devices` 时有时无，
 但 Android 子系统里的网络栈已经不通——表现就是界面读不到、消息发不出去、`uiautomator` 一直失败。
 这**不是桥接程序的 bug**，靠桥接自己重连也救不回来，所以单独提供了一个守护程序
 `tools/wsa_net_guard.py`：**和主程序完全分开**，各跑各的，互不依赖。
+
+> **仅 Windows**：WSA（Windows Subsystem for Android）是 Windows 独有组件，Linux / macOS 上
+> 既没有 WSA 也没有对应的宿主网络，这个守护在那里没有意义——编译脚本会自动跳过它
+> （非 Windows 平台只编主程序），本项目的 Release 也只为 Windows 提供守护产物。
 
 **检测 + 分级修复（由轻到重，成功后自动退回日常监测）**
 
@@ -810,14 +815,14 @@ python tools/wsa_net_guard.py --test
 把整个项目编译成**机器码单文件**：目标机器**不需要装 Python**，双击/直接运行即可。
 用 [Nuitka](https://nuitka.net/) 编译（真编译成 C 再编成原生可执行文件）。
 
-产物（本项目会编出两个）：
+产物（主程序所有平台都有；守护只在 Windows 上编）：
 
 | 产物 | 入口 | 说明 |
 |---|---|---|
-| `xtc-qq-bridge-<版本>-<系统>-<架构>[.exe]` | `main.py` | 桥接主程序 |
-| `xtc-wsa-guard-<版本>-<系统>-<架构>[.exe]` | `tools/wsa_net_guard.py` | WSA/WSABuilds 网络守护（独立程序） |
+| `xtc-qq-bridge-<版本>-<系统>-<架构>[.exe]` | `main.py` | 桥接主程序（Windows / Linux / macOS） |
+| `xtc-wsa-guard-<版本>-windows-<架构>.exe` | `tools/wsa_net_guard.py` | WSA 网络守护（**仅 Windows**） |
 
-命名规范示例：`xtc-qq-bridge-1.0.0-windows-x86_64.exe`、`xtc-wsa-guard-1.0.0-linux-arm64`
+命名规范示例：`xtc-qq-bridge-1.0.0-windows-x86_64.exe`、`xtc-wsa-guard-1.0.0-windows-x86_64.exe`
 （版本号不带 `v` 前缀，与 tag 一致，例如 tag `1.0.0-alpha.1`）。
 
 ## 1. 本地一键编译

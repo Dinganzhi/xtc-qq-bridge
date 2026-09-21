@@ -52,7 +52,8 @@ except Exception:  # noqa: BLE001
 TARGETS = {
     # 名字: (入口脚本, 是否带控制台, 说明)
     "bridge": ("main.py", True, "小天才 <-> QQ 桥接主程序"),
-    "guard": ("tools/wsa_net_guard.py", True, "WSA / WSABuilds 网络守护（独立程序）"),
+    # 守护只适用于 Windows（WSA 是 Windows 独有组件）；其它平台会自动跳过
+    "guard": ("tools/wsa_net_guard.py", True, "WSA / WSABuilds 网络守护（仅 Windows）"),
 }
 # 只读资源：源 -> 包内目标（--include-data-files 的 "源=目标" 形式）
 #   注意：目标不能写 "."（Nuitka 会报 illegal suffix），必须是文件名/子目录名。
@@ -124,6 +125,26 @@ def host_arch() -> str:
     if m in ("i386", "i686", "x86"):
         return "x86"
     return re.sub(r"[^a-z0-9]+", "_", m) or "unknown"
+
+
+def select_targets(requested: str, is_windows: bool | None = None) -> tuple:
+    """按平台决定编译哪些目标，返回 (targets, 提示文本)。
+
+    WSA 网络守护只适用于 Windows：WSA（Windows Subsystem for Android）是 Windows
+    独有组件，Linux / macOS 上既没有 WSA 也没有对应的宿主网络，编出来毫无意义
+    （之前 CI 给 macOS/Linux 也编了守护产物，是错的）。
+    - `--target all`   非 Windows -> 只编 bridge，并给出跳过提示
+    - `--target guard` 非 Windows -> 返回空列表（调用方按"明确拒绝"处理）
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    targets = ["bridge", "guard"] if requested == "all" else [requested]
+    if "guard" in targets and not is_windows:
+        if requested == "guard":
+            return [], ("WSA 网络守护只适用于 Windows（WSA 是 Windows 独有组件），"
+                        "本平台不提供该产物。")
+        return ["bridge"], "WSA 网络守护只适用于 Windows，本平台只编译主程序。"
+    return targets, ""
 
 
 def product_name(target: str, version: str) -> str:
@@ -562,7 +583,11 @@ def main(argv=None) -> int:
     print(f"  输出目录    : {out_dir}")
     print("------------------")
 
-    targets = ["bridge", "guard"] if args.target == "all" else [args.target]
+    targets, note = select_targets(args.target)
+    if note:
+        print(("\n[中止] " if not targets else "\n[跳过] ") + note)
+    if not targets:
+        return 2
     if args.dry_run:
         for t in targets:
             cmd = build_command(info, t, args.mode, out_dir, args)
