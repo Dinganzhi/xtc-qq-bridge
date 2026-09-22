@@ -271,9 +271,11 @@ project/
 | `xiaotiancai.login_retry_after_fail` | 明确账号/密码错误后的重试间隔（秒，默认 1800） |
 | `xiaotiancai.login_retry_after_risk` | 触发安全验证后的重试间隔（秒，默认 900） |
 | `xiaotiancai.login_state_ttl` | 登录态缓存秒数（默认 5，减少界面 dump） |
-| `xiaotiancai.catchup_missed` | 是否补发"弹窗挡住/界面读不到期间到达"的消息（默认 `true`） |
-| `xiaotiancai.catchup_max` | 单次最多补发几条（默认 5，防止一次刷屏） |
-| `xiaotiancai.catchup_slack` | 补发的时间容差秒数（默认 90；启动前的历史消息不补发） |
+| `xiaotiancai.catchup_missed` | 是否补发漏掉的消息（默认 `true`）：从最新一条往回走，撞到库里已有的就停 |
+| `xiaotiancai.catchup_max` | 单次最多补几条（默认 0 = 不限制；设了上限就分批补，下一轮继续） |
+| `msg_log.cap` | 本地消息库最多保留多少条（默认 5000；`0` = 不限制） |
+| `msg_log.shard_size` | 每多少条新建一个分库文件（默认 2000；`0` = 不分库，单文件 `msg_log.json`） |
+| `msg_log.read_shards` | 启动时加载最新几个分库做判定（默认 1；判定"库里有没有"只需要最新那个） |
 | `xiaotiancai.ui.message_tab_texts` | 找不到联系人时依次尝试切换的 Tab 文案（默认 微聊/消息/聊天） |
 | `xiaotiancai.ui.contact_name_ids` | 消息列表里"联系人名"控件 id（末段）；按它匹配最可靠 |
 | `xiaotiancai.ui.contact_preview_ids` | 消息列表行"预览"控件 id；用来判断当前页到底是不是列表 |
@@ -707,6 +709,11 @@ python tools/wsa_net_guard.py --test
 - 只在聊天窗口内读取：列表预览无法可靠判断发送方（家长侧手动发送的消息也会出现在预览里），
   会被误当成对方消息转发。
 - 界面更新后优先调整 `config.yaml -> xiaotiancai.ui`，不要改代码。
+- **漏消息补发（撞库即停）**：每轮读完最新一条后，会从最新往回逐条检查——
+  和消息库里已有的那条一样就**停**；不一样就转发，然后继续往上看，直到撞上库里已有的一条。
+  这样弹窗挡住界面、界面一时读不到、以及桥接启动前积压在聊天里的消息都会按时间顺序补齐，
+  不会像"只取最新一条"那样把中间几条永久漏掉。
+  消息库见 `config.yaml -> msg_log`（条数上限 / 分库 / 只读最新分库）。
 
 ## 4. 文本注入方案（已在真机实测，每一步都校验结果）
 

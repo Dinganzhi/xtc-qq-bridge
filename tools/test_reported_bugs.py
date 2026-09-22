@@ -1632,34 +1632,14 @@ def test_guard_is_windows_only() -> None:
     check("Windows 上显式要 guard 正常", t_guard_win == ["guard"])
 
 
-def test_catchup_missed_messages() -> None:
-    """弹窗挡住期间漏掉的消息，恢复后要补发。
-
-    用户实测：更新弹窗弹出期间有 2~3 条消息没读到，手动关掉弹窗后桥接也没有补发。
-    根因是轮询每轮只取"最新一条"，恢复后那些消息早已不是最新，于是永久漏掉。
-    """
-    from datetime import datetime
-
-    root = tmp_root()
-    label = datetime.now().strftime("%H:%M")
-
-    class _Fwd:
-        def __init__(self):
-            self.sent: list = []
-
-        def send(self, t, i, m):
-            self.sent.append(m)
-            return True
-
-        def send_detail(self, t, i, m):
-            self.sent.append(m)
-            return True, ""
-
+def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
+                    catchup_max: int = 0):
+    """搭一个只测补发逻辑的桥接：假 xtc 提供气泡列表，消息库预先塞入 known。"""
     class _Xtc:
         STATE_CHAT = "chat"
 
-        def __init__(self, bubbles):
-            self.bubbles = list(bubbles)
+        def __init__(self, items):
+            self.bubbles = list(items)
 
         def _chat_bubbles(self, root, include_own=False):
             return list(self.bubbles)
@@ -1672,51 +1652,148 @@ def test_catchup_missed_messages() -> None:
 
     cfg = {"target": {"xtc_contact": "张三", "qq_private": "2218631043"},
            "xiaotiancai": {}, "webhook": {}}
-    fwd = _Fwd()
-    br = bridge_mod.MessageBridge(cfg, adb=None, xtc=_Xtc([]), forwarder=fwd, logger=None)
-    br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
-    br._cmd_done_file = str(_paths(root)["done"])
-    br._started_at = time.time() - 3600        # 一小时前启动：这些消息属于本次运行期间
+    br = bridge_mod.MessageBridge(cfg, adb=None, xtc=_Xtc(bubbles), forwarder=fwd, logger=None)
+    # 用本用例专属的状态文件：否则会读到真实 data/ 里的历史/回声缓存
+    # （之前就因此让"撞库"判定误命中，用例之间互相污染）
+    prefix = f".bugtest{_SEQ['n']}_"
+    br.msgs = MessageLog(path=str(root / f"{prefix}msg_log.json"))
+    br.history = bridge_mod.HistoryFilter(store_path=str(root / f"{prefix}history.json"))
+    br.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo.json"))
+    br._cmd_done_file = str(root / f"{prefix}cmd_done.json")
+    br._catchup_max = catchup_max
+    for t in (known or []):
+        br.msgs.append("xtc", "屑猹不喝茶", t)
+    return br
+
+
+def test_backlog_walk_until_known() -> None:
+    """补发逻辑：从最新往回走，库里没有的补齐，撞到库里已有的就停。
+
+    用户要求的就是这个：发完最新一条后看上一条，和库里一样就停；
+    不一样就转发再往上，直到撞上库里已有的一条。
+    """
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self, ok=True):
+            self.sent: list = []
+            self.ok = ok
+
+        def send(self, t, i, m):
+            self.sent.append(m)
+            return self.ok
+
+        def send_detail(self, t, i, m):
+            self.sent.append(m)
+            return self.ok, ""
+
+    def bubbles(*texts):
+        return [{"text": t, "time_label": "19:52"} for t in texts]
+
     try:
-        br.xtc = _Xtc([{"text": "第一条", "time_label": label},
-                       {"text": "第二条", "time_label": label},
-                       {"text": "第三条", "time_label": label}])
-        n = br._forward_missed(None, "屑猹不喝茶", "第三条")   # 第三条是最新，由正常流程转发
-        check("漏掉的 2 条被补发", n == 2 and len(fwd.sent) == 2, f"n={n} sent={fwd.sent}")
-        check("补发顺序是旧 -> 新",
-              "第一条" in fwd.sent[0] and "第二条" in fwd.sent[1], str(fwd.sent))
-        check("最新那条不会被重复补发",
-              all("第三条" not in m for m in fwd.sent), str(fwd.sent))
+        fwd = _Fwd()
+        br = _backlog_bridge(root, fwd, bubbles("老消息", "漏掉的1", "漏掉的2", "最新一条"),
+                             known=["老消息"])
+        n = br._forward_backlog(None, "屑猹不喝茶")
+        check("撞到库里已有的那条就停，只补它上面的", n == 3, f"n={n} sent={fwd.sent}")
+        check("按 旧 -> 新 顺序补发",
+              ["漏掉的1" in fwd.sent[0], "漏掉的2" in fwd.sent[1], "最新一条" in fwd.sent[2]]
+              == [True, True, True], str(fwd.sent))
+        check("已经有的那条不会被重复补发",
+              all("老消息" not in m for m in fwd.sent), str(fwd.sent))
 
         fwd.sent.clear()
-        n2 = br._forward_missed(None, "屑猹不喝茶", "第三条")
-        check("已转发过的不再补发", n2 == 0 and not fwd.sent, f"n={n2} sent={fwd.sent}")
+        n2 = br._forward_backlog(None, "屑猹不喝茶")
+        check("补发过的都进了库，再跑一次不再补", n2 == 0 and not fwd.sent,
+              f"n={n2} sent={fwd.sent}")
 
-        br._started_at = time.time() + 7200    # 启动时刻在未来 -> 今天的时间标签都算"启动前"
-        fwd.sent.clear()
-        n3 = br._forward_missed(None, "屑猹不喝茶", "第三条")
-        check("启动之前的历史消息不补发", n3 == 0 and not fwd.sent, f"n={n3} sent={fwd.sent}")
+        # 启动前积压：库是空的（等于全新装），可见的消息按用户要求也要补
+        fwd2 = _Fwd()
+        br2 = _backlog_bridge(root, fwd2, bubbles("积压1", "积压2"))
+        n3 = br2._forward_backlog(None, "屑猹不喝茶")
+        check("启动前积压的消息也补（不再按启动时刻过滤）",
+              n3 == 2 and len(fwd2.sent) == 2, f"n={n3} sent={fwd2.sent}")
 
-        br._started_at = time.time() - 3600
-        br.xtc = _Xtc([{"text": "发送成功：x", "time_label": label},
-                       {"text": "真消息", "time_label": label}])
-        fwd.sent.clear()
-        n4 = br._forward_missed(None, "屑猹不喝茶", "")
-        check("系统提示（送达确认）不补发",
-              n4 == 1 and all("发送成功" not in m for m in fwd.sent), f"n={n4} sent={fwd.sent}")
+        # 命令文本与系统提示：跳过、不作为停止边界
+        fwd3 = _Fwd()
+        br3 = _backlog_bridge(root, fwd3,
+                              bubbles("已知", "发送成功：x", "/小天才 帮助", "新消息"),
+                              known=["已知"])
+        n4 = br3._forward_backlog(None, "屑猹不喝茶")
+        check("命令与系统提示被跳过且不算边界",
+              n4 == 1 and "新消息" in fwd3.sent[0], f"n={n4} sent={fwd3.sent}")
 
-        br._catchup_max = 1                    # 上限：只补最早的一条
-        br.xtc = _Xtc([{"text": "a1", "time_label": label},
-                       {"text": "a2", "time_label": label},
-                       {"text": "a3", "time_label": label}])
-        fwd.sent.clear()
-        n5 = br._forward_missed(None, "屑猹不喝茶", "a3")
-        check("超过上限时只补最早的几条", n5 == 1 and "a1" in fwd.sent[0], f"n={n5} sent={fwd.sent}")
+        # 转发失败：不入库（所以之后还会被当成"库里没有"重试），但受 120 秒节流保护
+        fwd4 = _Fwd(ok=False)
+        br4 = _backlog_bridge(root, fwd4, bubbles("会失败的"))
+        check("转发失败时不入库", br4._forward_backlog(None, "屑猹不喝茶") == 0)
+        check("失败的消息没进消息库（之后还会重试）",
+              br4.msgs.seen("会失败的", "xtc") is False)
+        br4.dedup = bridge_mod.Deduplicator()      # 模拟 120 秒节流窗口过去
+        fwd4.ok = True
+        n5 = br4._forward_backlog(None, "屑猹不喝茶")
+        check("节流窗口过后会重试", n5 == 1, f"n={n5}")
 
-        br._catchup_enabled = False
-        fwd.sent.clear()
+        # 上限：只补最早的一批，剩下的下一轮继续
+        fwd5 = _Fwd()
+        br5 = _backlog_bridge(root, fwd5, bubbles("b1", "b2", "b3"), catchup_max=1)
+        n6 = br5._forward_backlog(None, "屑猹不喝茶")
+        check("超过上限时先补最早的，其余的下一轮继续",
+              n6 == 1 and "b1" in fwd5.sent[0], f"n={n6} sent={fwd5.sent}")
+        n7 = br5._forward_backlog(None, "屑猹不喝茶")
+        check("下一轮接着补（顺序不乱）",
+              n7 == 1 and "b2" in fwd5.sent[1], f"n={n7} sent={fwd5.sent}")
+
+        br5._catchup_enabled = False
+        fwd5.sent.clear()
         check("开关关闭时不补发",
-              br._forward_missed(None, "屑猹不喝茶", "a3") == 0 and not fwd.sent)
+              br5._forward_backlog(None, "屑猹不喝茶") == 0 and not fwd5.sent)
+    finally:
+        cleanup(root)
+
+
+def test_msg_log_sharding_and_cap() -> None:
+    """消息库：分库（只读最新库）+ 条数上限（0 = 不限制）。"""
+    root = tmp_root()
+    try:
+        # 分库：每 3 条换一个新文件，只加载最新那个
+        ml = MessageLog(path=str(root / ".bugtest-shard.json"), cap=0, shard_size=3)
+        for i in range(7):
+            ml.append("xtc", "张三", f"m{i}")
+        check("按分库大小切开", ml.shard_count() == 3, f"shards={ml.shard_count()}")
+        check("默认只加载最新分库", len(ml.recent(1)) == 1 and ml.count() == 7,
+              f"count={ml.count()}")
+        check("最新分库里的消息能查到", ml.seen("m6") is True)
+        check("更新前的同一分库也能查到（同库内）", ml.seen("m4") is True)
+        check("翻更老的分库由 recent 惰性加载",
+              [e["text"] for e in ml.recent(7)] == [f"m{i}" for i in range(7)],
+              str([e["text"] for e in ml.recent(7)]))
+
+        # 重开一个实例：只加载最新分库，但 recent 能翻到老的
+        ml2 = MessageLog(path=str(root / ".bugtest-shard.json"), cap=0, shard_size=3)
+        check("重启后仍只加载最新分库", ml2.seen("m6") is True, "m6")
+        check("重启后 recent 仍能翻出全量", ml2.count() == 7, f"count={ml2.count()}")
+
+        # 条数上限（不分库）
+        ml3 = MessageLog(path=str(root / ".bugtest-cap.json"), cap=5, shard_size=0)
+        for i in range(12):
+            ml3.append("xtc", "张三", f"c{i}")
+        check("不分库时按条数上限截断", ml3.count() == 5, f"count={ml3.count()}")
+        check("保留的是最新的", [e["text"] for e in ml3.recent(5)] ==
+              [f"c{i}" for i in range(7, 12)], str([e["text"] for e in ml3.recent(5)]))
+
+        # 0 = 不限制
+        ml4 = MessageLog(path=str(root / ".bugtest-unlimited.json"), cap=0, shard_size=0)
+        for i in range(30):
+            ml4.append("xtc", "张三", f"u{i}")
+        check("cap=0 表示不限制", ml4.count() == 30, f"count={ml4.count()}")
+
+        # 分库时的上限按分库粒度控制：最多 ceil(cap/shard_size) 个分库
+        ml5 = MessageLog(path=str(root / ".bugtest-shardcap.json"), cap=6, shard_size=3)
+        for i in range(30):
+            ml5.append("xtc", "张三", f"s{i}")
+        check("分库时按上限删掉最老的分库", ml5.shard_count() == 2,
+              f"shards={ml5.shard_count()}")
     finally:
         cleanup(root)
 
@@ -1749,7 +1826,8 @@ def main() -> int:
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
                test_monotonic_sentinels_survive_fresh_boot,
                test_nuitka_version_args_are_numeric, test_guard_is_windows_only,
-               test_catchup_missed_messages,
+               test_backlog_walk_until_known,
+               test_msg_log_sharding_and_cap,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:

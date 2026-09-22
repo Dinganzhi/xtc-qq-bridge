@@ -32,6 +32,13 @@ forward:
     base_url: "http://127.0.0.1:11452"           # 与插件配置 http_port 一致
     token: "change-me-bridge-token"              # 与插件配置 token 一致（建议改随机串）
 
+# ---------- 本地消息库（历史消息 + "这条消息库里有没有"的判定库） ----------
+# 桥接靠它判断"哪些消息已经处理过"：从最新一条往回走，撞到库里已有的就停。
+msg_log:
+  cap: 5000                                      # 最多保留多少条；0 = 不限制
+  shard_size: 2000                               # 每 2000 条新建一个分库文件；0 = 不分库（单文件）
+  read_shards: 1                                 # 启动时加载最新几个分库做判定（判定只需最新库）
+
 # ---------- 桥接目标 ----------
 target:
   xtc_contact: ""                                # 小天才 App 里的联系人昵称（如“小宝”）
@@ -54,11 +61,9 @@ xiaotiancai:
   package: "com.xtc.watch"
   main_activity: ".MainActivity"
   check_interval: 2
-  # 漏消息补发：弹窗挡住 / 界面读不到期间到达的消息，恢复后按时间顺序补发
-  # （轮询每轮只读"最新一条"，不补的话那几条会永久漏掉）
+  # 漏消息补发：从最新一条往回走，撞到"库里已有"的那条就停（启动前积压的也一起补）
   catchup_missed: true                           # 总开关
-  catchup_max: 5                                 # 单次最多补发几条（防止一次刷屏）
-  catchup_slack: 90                              # 容差秒数：消息时间早于启动时刻但在此范围内仍补发
+  catchup_max: 0                                 # 单次最多补几条；0 = 不限制（默认）
   auto_install_adbkeyboard: true                 # 先查设备上有没有；没有才用项目目录里的本地 APK（不联网）
   login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
     phone: ""                                    # 手机号

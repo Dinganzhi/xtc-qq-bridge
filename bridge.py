@@ -121,8 +121,14 @@ class MessageBridge:
         self.echo = EchoFilter(store_path=store_path)
         # 长期已处理消息表（7 天持久化）：跨重启/多实例去重，杜绝死循环重复转发
         self.history = HistoryFilter(store_path=str(runtime_paths.data_path("history_cache.json")))
-        # 本地消息库（/小天才 历史消息 数据源）：记录真实对话，文件持久化
-        self.msgs = MessageLog(path=str(runtime_paths.data_path("msg_log.json")))
+        # 本地消息库（/小天才 历史消息 数据源 + "库里有没有这条消息"的判定库）：
+        # 条数上限 / 分库 / 只读最新几个分库，都可由 config.yaml -> msg_log 配置
+        _ml = cfg.get("msg_log") or {}
+        self.msgs = MessageLog(
+            path=str(runtime_paths.data_path("msg_log.json")),
+            cap=int(_ml.get("cap", 5000) or 0),                # 0 = 不限制
+            shard_size=int(_ml.get("shard_size", 2000) or 0),  # 0 = 不分库（单文件）
+            read_shards=int(_ml.get("read_shards", 1) or 1))   # 默认只加载最新分库
         self._poll_interval = float((cfg.get("xiaotiancai") or {}).get("check_interval", 2))
         self._heartbeat_interval = float((cfg.get("adb") or {}).get("heartbeat_interval", 10))
         self._login_check_interval = float(
@@ -149,14 +155,11 @@ class MessageBridge:
         self._log_seen: dict[str, float] = {}      # 日志去重：key -> 上次打印时刻
         self._poll_fail_streak = 0        # 连续"读不到消息"的轮数（触发界面自愈）
         self._last_state = ""             # 上一次判定的 App 状态（用于"状态变化才记日志"）
-        # 补发被漏掉的消息（弹窗挡住 / 界面读不到期间到达的）：
-        # 轮询每轮只看最新一条，挡住期间到达的消息等恢复后早已不是"最新一条"，
-        # 于是永久漏掉（用户实测：更新弹窗挡住时漏了 2~3 条，手动关掉后也没补发）。
-        self._started_at = time.time()    # 本次运行开始时刻，作为补发的时间下界
+        # 漏消息补发（从最新往回走、撞库即停）：弹窗挡住/界面读不到期间到达的、
+        # 以及启动前积压在聊天里的消息，都会按时间顺序补齐
         _xc = cfg.get("xiaotiancai") or {}
         self._catchup_enabled = bool(_xc.get("catchup_missed", True))
-        self._catchup_max = int(_xc.get("catchup_max", 5) or 5)
-        self._catchup_slack = float(_xc.get("catchup_slack", 90) or 90)
+        self._catchup_max = int(_xc.get("catchup_max", 0) or 0)   # 0 = 不限制（默认）
         self._wsa_guard_hinted = False    # WSA 断网提示只打一次
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
@@ -302,6 +305,13 @@ class MessageBridge:
                                                    f"进入聊天失败：{reason}", interval=300)
                 finally:
                     self._op_lock.release()
+                # 补发：从最新一条往回走、撞库即停（弹窗挡住期间漏掉的、启动前积压的都补齐）。
+                # 放在命令流程之前：它会跳过命令文本与系统提示，只处理真实消息。
+                if state == self.xtc.STATE_CHAT and contact is not None:
+                    try:
+                        self._forward_backlog(root, contact)
+                    except Exception as e:  # noqa: BLE001
+                        self._log("warning", f"补发流程异常: {e}")
                 # 连续读不到任何东西（且不在聊天页/被弹窗挡住）-> 自愈
                 if not text and not own_recent:
                     self._poll_fail_streak += 1
@@ -360,23 +370,34 @@ class MessageBridge:
                             # 只有转发成功才记入长期历史（7 天），避免失败后永不重试
                             self.history.mark("xtc", contact or "", text)
                         self.dedup.mark(key)  # 无论成败都短期去重（120s），失败会自动重试
-                # 补发被挡住期间漏掉的消息（弹窗/界面读不到时到达的那几条）
-                if state == self.xtc.STATE_CHAT:
-                    self._forward_missed(root, contact or "", text or "")
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             time.sleep(self._poll_interval)
 
-    def _forward_missed(self, root, contact: str, newest_text: str) -> int:
-        """补发"本次运行期间到达、但确实没转发出去"的消息，返回补发条数。
+    def _in_store(self, contact: str, text: str) -> bool:
+        """这条消息"库里有没有"（撞库判定，只认**持久**记录）。
 
-        为什么需要：轮询每轮只取**最新一条**对方消息。弹窗挡住界面、或界面一时读不到时
-        到达的消息，等恢复后已经不是"最新一条"，就永远不会被转发（用户实测：
-        更新弹窗弹出期间漏了 2~3 条，手动关掉弹窗后桥接也没补发）。
+        依次看：本地消息库（最新分库）-> 7 天历史表 -> 回声过滤。
+        注意这里**不看**短期去重表（120 秒那个）：它只是防重发的节流，
+        转发失败的消息不该因为它而被当成"已处理"（否则永远不会重试）。
+        """
+        if self.msgs.seen(text, "xtc"):
+            return True
+        if self.history.seen("xtc", contact or "", text):
+            return True
+        return bool(self.echo.is_echo(text))
 
-        做法：扫当前聊天窗口里可见的气泡（旧 -> 新），挑出
-        "没转发过（history/dedup/回声都没有）+ 不是系统提示 + 属于本次运行期间"的，
-        按时间顺序逐条补发。启动之前的历史消息不补（否则每次启动都会把旧消息刷一遍）。
+    def _forward_backlog(self, root, contact: str) -> int:
+        """从最新一条往回走，把库里没有的消息补齐；**撞到库里已有的就停**。
+
+        用户要的逻辑：
+          发完最新一条后看**上一条**：和库里一样 -> 停（不转发）；
+          不一样 -> 转发，再往上看一条，直到撞上库里已有的一条为止。
+
+        好处：弹窗挡住期间漏掉的、以及启动前积压在聊天里的消息，都会按时间顺序补齐；
+        而已处理过的消息一旦撞上就停，不会无限往上翻（也不需要记"启动时刻"来卡范围）。
+
+        返回补发条数。命令文本与系统提示只跳过、不作为停止边界。
         """
         if not self._catchup_enabled:
             return 0
@@ -387,39 +408,38 @@ class MessageBridge:
             return 0
 
         pending: list[tuple[str, str]] = []
-        for it in bubbles:                      # _chat_bubbles 已按 旧->新 排序
+        for it in reversed(bubbles):                # 从最新往回走
             text = (it.get("text") or "").strip()
-            label = it.get("time_label") or ""
-            if not text or text == newest_text:
-                continue                        # 最新那条由正常流程处理
-            key = ("xtc", contact or "", text)
-            if self.history.seen("xtc", contact or "", text) or self.dedup.seen(key):
-                continue                        # 已经转发过
-            if self.echo.is_echo(text):
-                continue                        # 是桥接自己发出去的内容
+            if not text:
+                continue
             try:
                 if self.xtc._is_system_msg(text):
-                    continue                    # 送达确认这类系统提示不转发
+                    continue                        # 送达确认这类系统提示：不转发也不当边界
             except Exception:  # noqa: BLE001
                 pass
-            epoch = self._label_epoch(label)
-            if epoch is not None and epoch < self._started_at - self._catchup_slack:
-                continue                        # 启动之前的旧消息，不补发
-            pending.append((text, label))
+            if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
+                continue                            # 命令文本由命令流程处理
+            if self._in_store(contact, text):
+                break                               # 撞库 -> 停，不再往上翻
+            if self.dedup.seen(("xtc", contact or "", text)):
+                # 刚试过（120 秒内，多为上次转发失败）：本轮先跳过它，
+                # 但不当作边界，继续往上找更老的那几条
+                self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
+                continue
+            pending.append((text, it.get("time_label") or ""))
 
         if not pending:
             return 0
-        if len(pending) > self._catchup_max:
-            self._log("warning", f"补发候选 {len(pending)} 条，超过上限 "
-                                 f"{self._catchup_max}，只补最早的 {self._catchup_max} 条")
+        pending.reverse()                           # 变成 旧 -> 新 的顺序转发
+        if self._catchup_max and len(pending) > self._catchup_max:
+            self._log("warning", f"[补发] 待补 {len(pending)} 条，超过上限 {self._catchup_max}，"
+                                 f"先补最早的 {self._catchup_max} 条（下一轮继续）")
             pending = pending[:self._catchup_max]
+        self._log("info", f"[补发] 有 {len(pending)} 条消息库里没有，按时间顺序补发")
 
-        self._log("warning", f"[补发] 发现 {len(pending)} 条漏掉的消息，按时间顺序补发")
         sent = 0
         for text, label in pending:
             key = ("xtc", contact or "", text)
-            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
-                             source=self._xtc_source(contact), source_id=contact or "")
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                               f"时间={label or '(无)'} 内容={text!r}（补发）")
             try:
@@ -429,7 +449,12 @@ class MessageBridge:
                 ok = False
             if ok:
                 self.history.mark("xtc", contact or "", text)
+                # 只有真的转发成功才入消息库：失败的下轮还会被当成"库里没有"而重试
+                self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
+                                 source=self._xtc_source(contact), source_id=contact or "")
                 sent += 1
+            else:
+                self._log("warning", f"[补发] 这条没发出去，稍后重试: {text!r}")
             self.dedup.mark(key)
         return sent
 
