@@ -1661,6 +1661,9 @@ def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
     br.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo.json"))
     br._cmd_done_file = str(root / f"{prefix}cmd_done.json")
     br._catchup_max = catchup_max
+    # 线上是"入队 + 工作线程异步转发"；测试里没有工作线程，
+    # 这里把入队替换成同步执行，逻辑（撞库判定/入库/顺序）保持一致。
+    br._queue_forward = lambda c, t, l: br._do_forward_job(c, t, l)
     for t in (known or []):
         br.msgs.append("xtc", "屑猹不喝茶", t)
     return br
@@ -1726,7 +1729,9 @@ def test_backlog_walk_until_known() -> None:
         # 转发失败：不入库（所以之后还会被当成"库里没有"重试），但受 120 秒节流保护
         fwd4 = _Fwd(ok=False)
         br4 = _backlog_bridge(root, fwd4, bubbles("会失败的"))
-        check("转发失败时不入库", br4._forward_backlog(None, "屑猹不喝茶") == 0)
+        check("转发失败时不入库",
+              br4._forward_backlog(None, "屑猹不喝茶") == 1
+              and br4.msgs.seen("会失败的", "xtc") is False)
         check("失败的消息没进消息库（之后还会重试）",
               br4.msgs.seen("会失败的", "xtc") is False)
         br4.dedup = bridge_mod.Deduplicator()      # 模拟 120 秒节流窗口过去
@@ -1748,6 +1753,22 @@ def test_backlog_walk_until_known() -> None:
         fwd5.sent.clear()
         check("开关关闭时不补发",
               br5._forward_backlog(None, "屑猹不喝茶") == 0 and not fwd5.sent)
+
+        # 线上路径：转发是异步入队（QQ 慢时不再卡住读屏）
+        fwd6 = _Fwd()
+        br6 = _backlog_bridge(root, fwd6, bubbles("异步消息"))
+        br6._queue_forward = bridge_mod.MessageBridge._queue_forward.__get__(br6)
+        n8 = br6._forward_backlog(None, "屑猹不喝茶")
+        jobs = []
+        while not br6._job_queue.empty():
+            jobs.append(br6._job_queue.get_nowait())
+        check("补发走的是异步队列（不会阻塞轮询）",
+              n8 == 1 and jobs and jobs[0][0] == "forward", f"n={n8} jobs={jobs}")
+        check("入队时就短期去重，避免下一轮重复入队",
+              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息")) is True)
+        br6._do_forward_job(*jobs[0][1:4])          # 工作线程真正执行
+        check("工作线程执行后才入长期历史/消息库",
+              fwd6.sent and br6.msgs.seen("异步消息", "xtc") is True, str(fwd6.sent))
     finally:
         cleanup(root)
 

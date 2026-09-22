@@ -430,13 +430,13 @@ class Xiaotiancai:
                 return True
         return False
 
-    def require_login(self) -> bool:
+    def require_login(self, root: ET.Element | None = None) -> bool:
         """能否读消息：只有**明确未登录**才算不能读。
 
         注意：'unknown'（App 不在前台 / 界面读不到，例如息屏）不再当成"未登录"刷日志，
         也不会（在桥接层）触发自动登录 —— 这正是"已经登录了还提示未登录"的修复点之一。
         """
-        state = self.login_state()
+        state = self.login_state(root=root)
         if state == self.NOT_LOGGED_IN:
             if not self._warned_not_login:
                 self.log("warning", "小天才 App 未登录家长账号：请在目标 Android 环境"
@@ -1836,7 +1836,7 @@ class Xiaotiancai:
         只在聊天窗口内读取——列表预览无法可靠判断发送方（家长侧手动发送的消息
         也会出现在预览里），会被误当成对方消息转发。轮询层负责确保聊天窗口已打开。"""
         try:
-            if not self.require_login():
+            if not self.require_login(root):
                 return (None, None, "", "", [])
             # 一次 dump 同时用于登录态判断与消息解析（登录态有缓存，避免重复 dump）；
             # 读不到界面（界面一直不空闲等）→ 返回空，交给轮询层稍后重试/自愈，

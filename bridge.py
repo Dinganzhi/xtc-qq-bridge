@@ -227,6 +227,11 @@ class MessageBridge:
                 if kind == "send":
                     _, text, user_id, group_id, request_id = job
                     self._do_send_job(text, user_id, group_id, request_id)
+                elif kind == "forward":
+                    # 小天才 -> QQ 的转发放在工作线程做：插件要等 QQ 侧真实结果才回包
+                    # （最长 30 秒），放在轮询线程里会把"读屏"一起拖住。
+                    _, f_contact, f_text, f_label = job[:4]
+                    self._do_forward_job(f_contact, f_text, f_label)
                 elif kind == "login":
                     _, request_id = job
                     self._do_login_job(request_id)
@@ -256,6 +261,7 @@ class MessageBridge:
     def _poll_loop(self) -> None:
         last_heartbeat = float("-inf")   # 首轮就做一次 ADB 心跳检查（monotonic 零点任意）
         while self.running:
+            loop_started = time.monotonic()
             try:
                 now = time.monotonic()
                 if now - last_heartbeat >= self._heartbeat_interval:
@@ -353,26 +359,15 @@ class MessageBridge:
                     key = ("xtc", contact or "", text)
                     if not self.history.seen("xtc", contact or "", text) \
                             and not self.dedup.seen(key) and not self.echo.is_echo(text):
-                        # 本地消息库归档（发送成功等系统提示已被读取层过滤，
-                        # 时间优先取 App 时间标签解析出的真实时刻）
-                        ts = self._label_epoch(time_label)
-                        self.msgs.append("xtc", contact or "", text, t=ts,
-                                         source=self._xtc_source(contact),
-                                         source_id=contact or "")
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
-                        try:
-                            ok = self._forward(contact, text, time_label)
-                        except Exception as e:  # noqa: BLE001
-                            self._log("warning", f"转发异常: {e}")
-                            ok = False
-                        if ok:
-                            # 只有转发成功才记入长期历史（7 天），避免失败后永不重试
-                            self.history.mark("xtc", contact or "", text)
-                        self.dedup.mark(key)  # 无论成败都短期去重（120s），失败会自动重试
+                        # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
+                        self._queue_forward(contact, text, time_label)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
-            time.sleep(self._poll_interval)
+            # 只补"剩下的"时间：一轮里 dump+转发可能已花 3~4 秒，再无条件 sleep
+            # 一个完整间隔就变成 6 秒一轮（检测延迟白白翻倍）。
+            time.sleep(max(0.0, self._poll_interval - (time.monotonic() - loop_started)))
 
     def _in_store(self, contact: str, text: str) -> bool:
         """这条消息"库里有没有"（撞库判定，只认**持久**记录）。
@@ -439,24 +434,37 @@ class MessageBridge:
 
         sent = 0
         for text, label in pending:
-            key = ("xtc", contact or "", text)
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                               f"时间={label or '(无)'} 内容={text!r}（补发）")
-            try:
-                ok = self._forward(contact, text, label)
-            except Exception as e:  # noqa: BLE001
-                self._log("warning", f"补发转发异常: {e}")
-                ok = False
-            if ok:
-                self.history.mark("xtc", contact or "", text)
-                # 只有真的转发成功才入消息库：失败的下轮还会被当成"库里没有"而重试
-                self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
-                                 source=self._xtc_source(contact), source_id=contact or "")
-                sent += 1
-            else:
-                self._log("warning", f"[补发] 这条没发出去，稍后重试: {text!r}")
-            self.dedup.mark(key)
+            # 异步转发：不阻塞读屏（见 _queue_forward）
+            self._queue_forward(contact, text, label)
+            sent += 1
         return sent
+
+    def _queue_forward(self, contact: str, text: str, label: str) -> None:
+        """把"小天才 -> QQ"的转发丢给工作线程，立刻返回。
+
+        为什么异步：插件要等 QQ 侧真实发送结果才回包（最长 30 秒），同步做的话
+        轮询线程会被卡住，读屏/检测跟着变慢（转发越快，漏消息窗口也越小）。
+        这里立刻 short-term 去重，避免下一轮把同一条再入队。
+        """
+        self.dedup.mark(("xtc", contact or "", text))
+        self._job_queue.put(("forward", contact, text, label or ""))
+
+    def _do_forward_job(self, contact: str, text: str, label: str) -> None:
+        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。"""
+        try:
+            ok = self._forward(contact, text, label)
+        except Exception as e:  # noqa: BLE001
+            self._log("warning", f"转发异常: {e}")
+            ok = False
+        if not ok:
+            self._log("warning", f"[转发] 这条没发出去，稍后重试: {text[:24]!r}")
+            return
+        self.history.mark("xtc", contact or "", text)
+        if not self.msgs.seen(text, "xtc"):
+            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
+                             source=self._xtc_source(contact), source_id=contact or "")
 
     def _hint_wsa_guard(self) -> None:
         """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。
