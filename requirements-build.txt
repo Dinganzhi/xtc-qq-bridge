@@ -2,6 +2,7 @@
 #   Windows: 需要 Visual Studio 2022+ 的"使用 C++ 的桌面开发"（Python 3.13+ 不能用 MinGW64）
 #   Linux  : 需要 gcc/g++ 与 python3-dev
 #   macOS  : 需要 xcode-select --install
-nuitka>=4.1
-# 编译产物要读 YAML 配置，pyyaml 必须一起打进去（--include-package=yaml）
+nuitka[onefile]>=4.1
+# 为什么要带 [onefile]：它会把 zstandard 一起装上。缺 zstandard 时 onefile **不会压缩**，
+# 而且只打一行 WARNING 不报错——实测 Linux 产物因此从 8MB 变成 62MB（Windows/macOS 恰好有）。
 pyyaml>=6.0

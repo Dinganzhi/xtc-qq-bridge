@@ -55,6 +55,18 @@ TARGETS = {
     # 守护只适用于 Windows（WSA 是 Windows 独有组件）；其它平台会自动跳过
     "guard": ("tools/wsa_net_guard.py", True, "WSA / WSABuilds 网络守护（仅 Windows）"),
 }
+# 瘦身：anti-bloat。这些库我们运行时一个都不用，但很容易被"顺带"打包进去
+# （例如某个依赖在 try/except 里 import 了它们），Nuitka 的 anti-bloat 插件能阻止跟随。
+# nofollow = 遇到就当作不存在，不再往下递归编译。
+ANTI_BLOAT_OPTIONS = (
+    "--noinclude-pytest-mode=nofollow",
+    "--noinclude-unittest-mode=nofollow",
+    "--noinclude-setuptools-mode=nofollow",
+    "--noinclude-pydoc-mode=nofollow",
+    "--noinclude-IPython-mode=nofollow",
+    "--noinclude-dask-mode=nofollow",
+    "--noinclude-numba-mode=nofollow",
+)
 # 只读资源：源 -> 包内目标（--include-data-files 的 "源=目标" 形式）
 #   注意：目标不能写 "."（Nuitka 会报 illegal suffix），必须是文件名/子目录名。
 DATA_FILES = {
@@ -297,6 +309,13 @@ def preflight(info: NuitkaInfo, *, strict: bool = False) -> tuple[bool, list[str
         lines.append("nuitka --version 原始输出（前 6 行，排障用）：")
         for line in info.raw_version.splitlines()[:6]:
             lines.append(f"    {line}")
+    # onefile 压缩要 zstandard：缺了不会报错，只是**载荷完全不压缩**，体积能差 8 倍
+    # （实测：Windows/macOS 7~8MB vs Linux 62MB，就是因为 Linux 缺这个包）
+    if not _has_module("zstandard"):
+        lines.append("[警告] 缺 zstandard：onefile 载荷不会被压缩（Linux 上实测会从 8MB 涨到 62MB）。"
+                     "安装：pip install -U 'nuitka[onefile]' 或 pip install zstandard")
+    else:
+        lines.append("zstandard   : 已安装（onefile 载荷会压缩）")
     return ok, lines
 
 
@@ -360,6 +379,16 @@ def build_command(info: NuitkaInfo, target: str, mode: str, out_dir: Path,
         cmd += [f"--jobs={jobs}"]
     if args.lto != "default" and info.supports("--lto"):
         cmd += [f"--lto={args.lto}"]
+    # ---- 瘦身：anti-bloat（阻止测试框架/打包工具/文档工具被顺带打包）----
+    for opt in ANTI_BLOAT_OPTIONS:
+        if info.supports(opt.split("=", 1)[0]):
+            cmd.append(opt)
+    # ---- 瘦身：去掉断言与文档字符串（-OO）----
+    if info.supports("--python-flag"):
+        cmd.append("--python-flag=-OO")
+    # ---- 瘦身：UPX 压缩外层可执行文件（需系统装了 upx；仅显式开启时用）----
+    if args.upx and info.supports("--use-upx") and shutil.which("upx"):
+        cmd.append("--use-upx")
     if args.quiet:
         cmd += ["--quiet"]
     if args.extra:
@@ -517,6 +546,23 @@ def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     return ok
 
 
+def trim_junk(art: Path) -> None:
+    """编译产物里的无用文件清掉（目录模式才有：.pdb 调试符号、__pycache__ 等）。
+
+    onefile 只有一个文件，这里什么都不做；standalone 目录模式下能省下可观体积。
+    """
+    if art.is_file():
+        return
+    for pattern in ("*.pdb", "*.ilk", "*.exp", "*.lib"):
+        for p in art.rglob(pattern):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    for d in list(art.rglob("__pycache__")):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def collect_artifacts(out_dir: Path, target: str, mode: str) -> list[Path]:
     """找出本次产物并统一命名。
 
@@ -559,8 +605,11 @@ def main(argv=None) -> int:
     ap.add_argument("--target", choices=["all", "bridge", "guard"], default="all")
     ap.add_argument("--out", default="dist", help="输出目录（默认 dist）")
     ap.add_argument("--jobs", type=int, default=0, help="并行编译进程数（默认 CPU 核数）")
-    ap.add_argument("--lto", choices=["default", "yes", "no"], default="default",
-                    help="链接时优化（默认跟随 Nuitka）")
+    ap.add_argument("--lto", choices=["default", "yes", "no"], default="yes",
+                    help="链接时优化（默认 yes：产物更小更快，编译更慢；用 --lto no 关闭）")
+    ap.add_argument("--upx", action="store_true",
+                    help="用 UPX 压缩外层可执行文件（需系统已装 upx；Windows 可能被杀软误报，"
+                         "macOS 会破坏签名，一般只建议 Linux 用）")
     ap.add_argument("--quiet", action="store_true", help="只输出关键信息")
     ap.add_argument("--check-env", action="store_true", help="只做前置检查后退出")
     ap.add_argument("--strict", action="store_true",
@@ -622,6 +671,7 @@ def main(argv=None) -> int:
             continue
         for art in collect_artifacts(out_dir, t, args.mode):
             if art.is_file():
+                trim_junk(art)                       # 顺手清掉 .pdb / __pycache__ 之类
                 digest = sha256_file(art)
                 (art.parent / (art.name + ".sha256")).write_text(
                     f"{digest}  {art.name}\n", encoding="utf-8")

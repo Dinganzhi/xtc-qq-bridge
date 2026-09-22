@@ -106,6 +106,15 @@ jobs:
       - name: Install build deps
         run: python -m pip install -U -r requirements-build.txt
 
+      - name: Install UPX (Linux only)
+        # UPX 只对 Linux 产物用：Windows 上容易被杀软误报，macOS 上会破坏代码签名。
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq upx-ucl || sudo apt-get install -y -qq upx
+          upx --version | head -1
+
       - name: Show build environment
         # 诊断步骤：即使自检报错也不要卡住后面的编译（真正缺编译器时，Nuitka 自己的
         # 报错更准确）。这里顺带把 `nuitka --version` 原样打出来，便于排障。
@@ -118,10 +127,14 @@ jobs:
         # 驱动脚本编译完会自己在干净目录里跑 --version / --verify（bridge）或 --test（guard），
         # 顺带验证"数据写在 exe 旁边、捆绑资源确实打进包了"，失败即整个 job 失败。
         # WSA 网络守护只适用于 Windows，非 Windows 平台由驱动脚本自动跳过（只编主程序）。
+        # 瘦身参数（anti-bloat / -OO / LTO）由驱动脚本自动加上；UPX 只在 Linux 上开。
         # 显式用 bash：Nuitka 会把大量进度写到 stderr，而 GitHub 的 pwsh 步骤带
         # $ErrorActionPreference='stop'，在 Windows runner 上可能把正常日志当错误中止步骤。
         shell: bash
-        run: python tools/build_nuitka.py --mode ${{ matrix.mode }} --target all --out dist
+        run: |
+          extra=""
+          case "${{ matrix.artifact }}" in linux-*) extra="--upx" ;; esac
+          python tools/build_nuitka.py --mode ${{ matrix.mode }} --target all --out dist $extra
 
       - name: Show artifacts
         shell: bash
@@ -143,7 +156,11 @@ jobs:
             esac
             cp -r "$f" "upload/$base"
           done
-          ls -la upload
+          # 编译后清理：调试符号与字节码缓存都不要（目录模式能省下可观体积）
+          find upload -name '*.pdb' -delete 2>/dev/null || true
+          find upload -name '*.ilk' -delete 2>/dev/null || true
+          find upload -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+          du -sh upload/* 2>/dev/null || ls -la upload
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
