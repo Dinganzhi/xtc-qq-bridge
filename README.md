@@ -271,6 +271,9 @@ project/
 | `xiaotiancai.login_retry_after_fail` | 明确账号/密码错误后的重试间隔（秒，默认 1800） |
 | `xiaotiancai.login_retry_after_risk` | 触发安全验证后的重试间隔（秒，默认 900） |
 | `xiaotiancai.login_state_ttl` | 登录态缓存秒数（默认 5，减少界面 dump） |
+| `xiaotiancai.catchup_missed` | 是否补发"弹窗挡住/界面读不到期间到达"的消息（默认 `true`） |
+| `xiaotiancai.catchup_max` | 单次最多补发几条（默认 5，防止一次刷屏） |
+| `xiaotiancai.catchup_slack` | 补发的时间容差秒数（默认 90；启动前的历史消息不补发） |
 | `xiaotiancai.ui.message_tab_texts` | 找不到联系人时依次尝试切换的 Tab 文案（默认 微聊/消息/聊天） |
 | `xiaotiancai.ui.contact_name_ids` | 消息列表里"联系人名"控件 id（末段）；按它匹配最可靠 |
 | `xiaotiancai.ui.contact_preview_ids` | 消息列表行"预览"控件 id；用来判断当前页到底是不是列表 |

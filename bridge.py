@@ -149,6 +149,14 @@ class MessageBridge:
         self._log_seen: dict[str, float] = {}      # 日志去重：key -> 上次打印时刻
         self._poll_fail_streak = 0        # 连续"读不到消息"的轮数（触发界面自愈）
         self._last_state = ""             # 上一次判定的 App 状态（用于"状态变化才记日志"）
+        # 补发被漏掉的消息（弹窗挡住 / 界面读不到期间到达的）：
+        # 轮询每轮只看最新一条，挡住期间到达的消息等恢复后早已不是"最新一条"，
+        # 于是永久漏掉（用户实测：更新弹窗挡住时漏了 2~3 条，手动关掉后也没补发）。
+        self._started_at = time.time()    # 本次运行开始时刻，作为补发的时间下界
+        _xc = cfg.get("xiaotiancai") or {}
+        self._catchup_enabled = bool(_xc.get("catchup_missed", True))
+        self._catchup_max = int(_xc.get("catchup_max", 5) or 5)
+        self._catchup_slack = float(_xc.get("catchup_slack", 90) or 90)
         self._wsa_guard_hinted = False    # WSA 断网提示只打一次
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
@@ -352,9 +360,78 @@ class MessageBridge:
                             # 只有转发成功才记入长期历史（7 天），避免失败后永不重试
                             self.history.mark("xtc", contact or "", text)
                         self.dedup.mark(key)  # 无论成败都短期去重（120s），失败会自动重试
+                # 补发被挡住期间漏掉的消息（弹窗/界面读不到时到达的那几条）
+                if state == self.xtc.STATE_CHAT:
+                    self._forward_missed(root, contact or "", text or "")
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             time.sleep(self._poll_interval)
+
+    def _forward_missed(self, root, contact: str, newest_text: str) -> int:
+        """补发"本次运行期间到达、但确实没转发出去"的消息，返回补发条数。
+
+        为什么需要：轮询每轮只取**最新一条**对方消息。弹窗挡住界面、或界面一时读不到时
+        到达的消息，等恢复后已经不是"最新一条"，就永远不会被转发（用户实测：
+        更新弹窗弹出期间漏了 2~3 条，手动关掉弹窗后桥接也没补发）。
+
+        做法：扫当前聊天窗口里可见的气泡（旧 -> 新），挑出
+        "没转发过（history/dedup/回声都没有）+ 不是系统提示 + 属于本次运行期间"的，
+        按时间顺序逐条补发。启动之前的历史消息不补（否则每次启动都会把旧消息刷一遍）。
+        """
+        if not self._catchup_enabled:
+            return 0
+        try:
+            bubbles = self.xtc._chat_bubbles(root, include_own=False)
+        except Exception as e:  # noqa: BLE001 补发失败不影响正常轮询
+            self._log("debug", f"补发扫描失败: {e}")
+            return 0
+
+        pending: list[tuple[str, str]] = []
+        for it in bubbles:                      # _chat_bubbles 已按 旧->新 排序
+            text = (it.get("text") or "").strip()
+            label = it.get("time_label") or ""
+            if not text or text == newest_text:
+                continue                        # 最新那条由正常流程处理
+            key = ("xtc", contact or "", text)
+            if self.history.seen("xtc", contact or "", text) or self.dedup.seen(key):
+                continue                        # 已经转发过
+            if self.echo.is_echo(text):
+                continue                        # 是桥接自己发出去的内容
+            try:
+                if self.xtc._is_system_msg(text):
+                    continue                    # 送达确认这类系统提示不转发
+            except Exception:  # noqa: BLE001
+                pass
+            epoch = self._label_epoch(label)
+            if epoch is not None and epoch < self._started_at - self._catchup_slack:
+                continue                        # 启动之前的旧消息，不补发
+            pending.append((text, label))
+
+        if not pending:
+            return 0
+        if len(pending) > self._catchup_max:
+            self._log("warning", f"补发候选 {len(pending)} 条，超过上限 "
+                                 f"{self._catchup_max}，只补最早的 {self._catchup_max} 条")
+            pending = pending[:self._catchup_max]
+
+        self._log("warning", f"[补发] 发现 {len(pending)} 条漏掉的消息，按时间顺序补发")
+        sent = 0
+        for text, label in pending:
+            key = ("xtc", contact or "", text)
+            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
+                             source=self._xtc_source(contact), source_id=contact or "")
+            self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
+                              f"时间={label or '(无)'} 内容={text!r}（补发）")
+            try:
+                ok = self._forward(contact, text, label)
+            except Exception as e:  # noqa: BLE001
+                self._log("warning", f"补发转发异常: {e}")
+                ok = False
+            if ok:
+                self.history.mark("xtc", contact or "", text)
+                sent += 1
+            self.dedup.mark(key)
+        return sent
 
     def _hint_wsa_guard(self) -> None:
         """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。

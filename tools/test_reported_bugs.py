@@ -1632,6 +1632,95 @@ def test_guard_is_windows_only() -> None:
     check("Windows 上显式要 guard 正常", t_guard_win == ["guard"])
 
 
+def test_catchup_missed_messages() -> None:
+    """弹窗挡住期间漏掉的消息，恢复后要补发。
+
+    用户实测：更新弹窗弹出期间有 2~3 条消息没读到，手动关掉弹窗后桥接也没有补发。
+    根因是轮询每轮只取"最新一条"，恢复后那些消息早已不是最新，于是永久漏掉。
+    """
+    from datetime import datetime
+
+    root = tmp_root()
+    label = datetime.now().strftime("%H:%M")
+
+    class _Fwd:
+        def __init__(self):
+            self.sent: list = []
+
+        def send(self, t, i, m):
+            self.sent.append(m)
+            return True
+
+        def send_detail(self, t, i, m):
+            self.sent.append(m)
+            return True, ""
+
+    class _Xtc:
+        STATE_CHAT = "chat"
+
+        def __init__(self, bubbles):
+            self.bubbles = list(bubbles)
+
+        def _chat_bubbles(self, root, include_own=False):
+            return list(self.bubbles)
+
+        def _is_system_msg(self, text):
+            return text.startswith("发送成功")
+
+        def is_in_chat(self):
+            return False
+
+    cfg = {"target": {"xtc_contact": "张三", "qq_private": "2218631043"},
+           "xiaotiancai": {}, "webhook": {}}
+    fwd = _Fwd()
+    br = bridge_mod.MessageBridge(cfg, adb=None, xtc=_Xtc([]), forwarder=fwd, logger=None)
+    br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+    br._cmd_done_file = str(_paths(root)["done"])
+    br._started_at = time.time() - 3600        # 一小时前启动：这些消息属于本次运行期间
+    try:
+        br.xtc = _Xtc([{"text": "第一条", "time_label": label},
+                       {"text": "第二条", "time_label": label},
+                       {"text": "第三条", "time_label": label}])
+        n = br._forward_missed(None, "屑猹不喝茶", "第三条")   # 第三条是最新，由正常流程转发
+        check("漏掉的 2 条被补发", n == 2 and len(fwd.sent) == 2, f"n={n} sent={fwd.sent}")
+        check("补发顺序是旧 -> 新",
+              "第一条" in fwd.sent[0] and "第二条" in fwd.sent[1], str(fwd.sent))
+        check("最新那条不会被重复补发",
+              all("第三条" not in m for m in fwd.sent), str(fwd.sent))
+
+        fwd.sent.clear()
+        n2 = br._forward_missed(None, "屑猹不喝茶", "第三条")
+        check("已转发过的不再补发", n2 == 0 and not fwd.sent, f"n={n2} sent={fwd.sent}")
+
+        br._started_at = time.time() + 7200    # 启动时刻在未来 -> 今天的时间标签都算"启动前"
+        fwd.sent.clear()
+        n3 = br._forward_missed(None, "屑猹不喝茶", "第三条")
+        check("启动之前的历史消息不补发", n3 == 0 and not fwd.sent, f"n={n3} sent={fwd.sent}")
+
+        br._started_at = time.time() - 3600
+        br.xtc = _Xtc([{"text": "发送成功：x", "time_label": label},
+                       {"text": "真消息", "time_label": label}])
+        fwd.sent.clear()
+        n4 = br._forward_missed(None, "屑猹不喝茶", "")
+        check("系统提示（送达确认）不补发",
+              n4 == 1 and all("发送成功" not in m for m in fwd.sent), f"n={n4} sent={fwd.sent}")
+
+        br._catchup_max = 1                    # 上限：只补最早的一条
+        br.xtc = _Xtc([{"text": "a1", "time_label": label},
+                       {"text": "a2", "time_label": label},
+                       {"text": "a3", "time_label": label}])
+        fwd.sent.clear()
+        n5 = br._forward_missed(None, "屑猹不喝茶", "a3")
+        check("超过上限时只补最早的几条", n5 == 1 and "a1" in fwd.sent[0], f"n={n5} sent={fwd.sent}")
+
+        br._catchup_enabled = False
+        fwd.sent.clear()
+        check("开关关闭时不补发",
+              br._forward_missed(None, "屑猹不喝茶", "a3") == 0 and not fwd.sent)
+    finally:
+        cleanup(root)
+
+
 def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
@@ -1660,6 +1749,7 @@ def main() -> int:
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
                test_monotonic_sentinels_survive_fresh_boot,
                test_nuitka_version_args_are_numeric, test_guard_is_windows_only,
+               test_catchup_missed_messages,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
         try:
