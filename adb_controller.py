@@ -1191,14 +1191,21 @@ class ADBController:
     def _dump_strategies(self) -> list:
         """按"上次成功的先试"的顺序返回 dump 策略。
 
-        不同镜像差别很大（实机 WSA：普通 dump 会被系统 Killed，`--compressed` 才稳定），
-        记住成功的那个就能避免每次都先去撞失败、白等几秒。
+        为什么**优先完整 dump**（实机 WSA 实测）：`--compressed` 会把消息时间标签
+        节点（tv_chat_msg_item_date）整片裁掉——同一屏压缩版 19 个节点 / 0 个时间标签，
+        完整版 46 个节点 / 3 个时间标签；时间标签一丢，每条消息的时间就退化成
+        "当前时间"（用户报的"消息时间还是不对"就是这么来的）。
+        实测完整版成功率 5/5、平均只慢 ~0.4s（3.5s vs 3.1s），所以默认先用它。
+
+        某些镜像上完整 dump 可能被系统 Killed：那就自动落到下一策略，并**记住**
+        能用的那个（见 _dump_strategy），下次直接用它先试，不会每次都白等。
         """
         strategies = [
+            ("file-full", lambda: self._dump_via_file_combined(False)),
+            ("tty-full", lambda: self._dump_via_tty(False)),
             ("file-compressed", lambda: self._dump_via_file_combined(True)),
-            ("tty", lambda: self._dump_via_tty(False)),
-            ("file", lambda: self._dump_via_file(False)),
             ("tty-compressed", lambda: self._dump_via_tty(True)),
+            ("file", lambda: self._dump_via_file(False)),
         ]
         if self._dump_strategy:
             strategies.sort(key=lambda s: 0 if s[0] == self._dump_strategy else 1)

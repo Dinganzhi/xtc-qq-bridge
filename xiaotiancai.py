@@ -65,7 +65,7 @@ _CLOSE_DESCS = ("关闭", "取消", "close", "Cancel", "×")
 # 更新/评价/公告类弹窗：优先点"稍后/以后再说"，避免误触下载
 _UPDATE_WORDS = ("发现新版本", "版本更新", "立即更新", "马上更新", "升级", "去评分",
                  "给个好评", "评价一下", "公告", "活动", "福利", "签到有礼")
-_SKIP_TEXTS = ("以后再说", "稍后再说", "暂不更新", "稍后更新", "下次再说", "暂不升级",
+_SKIP_TEXTS = ("以后再说", "稍后再说", "暂不更新", "不更新", "稍后更新", "下次再说", "暂不升级",
                "忽略此版本", "先逛逛", "放弃", "不同意", "取消", "关闭")
 # 系统无响应/崩溃弹窗
 _ANR_WORDS = ("无响应", "没有响应", "已停止运行", "屡次停止运行", "反复停止")
@@ -77,6 +77,30 @@ _NET_RETRY = ("重试", "再试一次", "重新加载", "刷新")
 _NET_DISMISS = ("知道了", "确定", "好的", "取消", "关闭")
 # 权限弹窗的文本按钮兜底
 _PERMISSION_TEXTS = ("允许", "始终允许", "仅在使用中允许", "使用应用时允许", "同意", "确定")
+
+# ---- 通用弹窗（自定义 Activity 弹窗 / Dialog / PopupWindow）----
+# 弹窗类 Activity 的名字里常带这些词：小天才的"升级提醒"就是
+# com.xtc.watch/com.xtc.widget.phone.popup.activity.CustomActivity14
+# （它既不是 PopupWindow 也不是 Dialog，以前认不出来，所以永远不会被自动关掉）
+_POPUP_ACTIVITY_HINTS = ("popup", "dialog", "alert")
+# 弹窗标题/说明控件（聊天页、消息列表页不会有）
+_POPUP_TITLE_TAILS = ("title", "tv_title", "dialog_title", "tv_dialog_title", "alert_title")
+# 弹窗容器（自定义弹窗常用 ll_center / iv_banner 这类 id）
+_POPUP_CONTAINER_TAILS = ("ll_center", "fl_center", "iv_banner", "dialog_root",
+                          "dialog_container", "alert_root", "popup_root")
+# 负向（安全）按钮：点它只是"不做这件事"，不会触发下载/安装/重启
+_POPUP_NEG_TAILS = ("btn_left", "btn_cancel", "tv_cancel", "btn_no", "tv_no",
+                    "btn_negative", "tv_negative", "btn_disagree", "btn_later", "tv_left")
+# 正向/危险按钮：**绝不点**（立即安装/立即更新/确定安装 这类会真的动系统）
+_POPUP_POS_TAILS = ("btn_right", "btn_sure", "btn_ok", "btn_confirm", "tv_right",
+                    "btn_positive", "btn_install", "btn_update", "btn_restart")
+# 危险按钮文案（命中且不含"不/稍后/取消"这类否定词时才禁点）
+_POPUP_BLOCK_TEXTS = ("立即安装", "马上安装", "现在安装", "去安装", "确认安装", "下载安装",
+                      "立即更新", "马上更新", "立即升级", "马上升级", "现在升级", "去升级",
+                      "立即重启", "去评分", "给个好评", "同意并安装")
+# 否定词：带这些词的按钮一律视为"安全的负向按钮"
+_POPUP_SAFE_WORDS = ("不", "稍后", "以后", "下次", "暂", "取消", "关闭", "忽略",
+                     "拒绝", "返回", "放弃")
 
 # 登录页"正在进行"的文案：出现这些一律**不判失败**，继续等待
 _DEFAULT_LOGIN_PROGRESS = ("登录中", "正在登录", "正在验证", "验证中", "正在提交", "提交中",
@@ -130,6 +154,10 @@ class Xiaotiancai:
         self._last_dump_warn = float("-inf")   # "读不到界面"告警的节流时间戳
         self._last_label_retry = float("-inf")  # "快照里没有时间标签"的补救重读节流
         self._throttle: dict[str, float] = {}   # 同类失败告警节流：key -> 上次打印时刻
+        self._last_verify_root = None   # 注入校验时的界面快照（复用给"找发送按钮"，省一次 dump）
+        # 弹窗自动关闭的"同一弹窗最多试几轮"状态（空 key 表示当前没有弹窗）
+        self._popup_key = ""            # 当前弹窗的指纹（Activity + 标题 + 说明前若干字）
+        self._popup_tries = 0           # 这个弹窗已经尝试关闭的轮数
         self.last_open_reason = ""   # 最近一次 open_chat 失败的原因（桥接据此去重打印）
 
     def log(self, level: str, msg: str):
@@ -195,6 +223,10 @@ class Xiaotiancai:
         if root is None or self._tree_is_empty(root):
             return self.STATE_BLIND
         try:
+            # 弹窗优先：弹窗盖在上面时，dump 出来的往往只有弹窗本身（下面的聊天页
+            # 读不到），若先判聊天页会得出错误结论，所以先认弹窗、把它关掉再说。
+            if self._looks_like_popup(root, self.current_activity()):
+                return self.STATE_POPUP
             if self.looks_like_chat_page(root):
                 return self.STATE_CHAT
             if self._looks_like_login_page(root):
@@ -318,6 +350,7 @@ class Xiaotiancai:
     STATE_LIST = "list"              # 消息列表（这里才该找联系人）
     STATE_LOGIN = "login"            # 登录页/安全验证页（等登录，别找联系人）
     STATE_OTHER = "other"            # 其它页面（首页/设置/详情等）
+    STATE_POPUP = "popup"            # 弹窗遮挡界面（升级提醒等，读不到下面的内容）
     STATE_BACKGROUND = "background"  # App 不在前台
     STATE_BLIND = "blind"            # 读不到界面（息屏/界面不空闲/dump 失败）
 
@@ -326,6 +359,7 @@ class Xiaotiancai:
         STATE_LIST: "消息列表",
         STATE_LOGIN: "登录/验证页",
         STATE_OTHER: "小天才其它页面",
+        STATE_POPUP: "弹窗遮挡界面",
         STATE_BACKGROUND: "App 不在前台",
         STATE_BLIND: "读不到界面",
     }
@@ -896,7 +930,8 @@ class Xiaotiancai:
 
         覆盖（按优先级）：系统权限 -> 应用无响应/崩溃 -> 通话面板 -> 隐私协议 ->
         更新/评价/公告类（点"以后再说"）-> 网络类（点"重试"，带冷却）->
-        小天才警告弹窗 -> 关闭类按钮（id/desc）-> 通用对话框文本按钮 -> 弹窗窗口 BACK 兜底。
+        小天才警告弹窗 -> 关闭类按钮（id/desc）-> 通用对话框文本按钮 ->
+        **通用弹窗兜底（负向按钮/返回键，认结构不认文案）** -> 弹窗窗口 BACK 兜底。
 
         注意：普通页面的 NAF 节点（图片等）不算遮挡，绝不能按 BACK（会把 App 退到桌面）；
         关闭类按钮只在"弹窗特征"成立时才点，避免误关正常页面。
@@ -923,6 +958,10 @@ class Xiaotiancai:
             root = self._dump_fast()
             texts_all = "".join((n.get("text") or "") for n in root.iter("node"))
             descs_all = "".join((n.get("content-desc") or "") for n in root.iter("node"))
+            # 弹窗判定（认结构/Activity 名，不认文案）；不是弹窗就把"同一弹窗重试计数"清零
+            popup = self._looks_like_popup(root, focus)
+            if not popup:
+                self._popup_key, self._popup_tries = "", 0
             # 2) 应用无响应/崩溃弹窗：优先"等待"（不杀进程），否则关闭
             if any(w in texts_all for w in _ANR_WORDS):
                 for t in self.ui.get("anr_wait_texts", list(_ANR_WAIT)):
@@ -954,11 +993,16 @@ class Xiaotiancai:
                     self.adb.tap_element(sure)
                     self.log("info", "已同意隐私协议（首启弹窗）")
                     return True
-            # 5) 更新/评价/公告/活动类弹窗：只点"稍后/以后再说"这类跳过按钮
-            if any(w in texts_all for w in _UPDATE_WORDS) or any(w in descs_all for w in _UPDATE_WORDS):
+            # 5) 已知的"跳过/稍后"类弹窗：点配置里的跳过按钮。
+            #    命中条件放宽到"只要是弹窗就试"——小天才的"升级提醒"标题是"升级提醒"、
+            #    按钮是"不更新"，以前靠 _UPDATE_WORDS 匹配碰运气，现在结构认出来就够了；
+            #    按钮文案仍必须是白名单里的（绝不点"立即安装/立即更新"）。
+            if popup or any(w in texts_all for w in _UPDATE_WORDS) \
+                    or any(w in descs_all for w in _UPDATE_WORDS):
                 for t in self.ui.get("popup_skip_texts", list(_SKIP_TEXTS)):
                     btn = self.adb.find_element(root, text=t)
-                    if btn is not None and self._looks_like_dialog(root, focus):
+                    if btn is not None and not self._popup_blocked(btn) \
+                            and self._looks_like_dialog(root, focus):
                         self.adb.tap_element(btn)
                         self.log("info", f"已跳过更新/活动类弹窗（点「{t}」）")
                         return True
@@ -1004,6 +1048,39 @@ class Xiaotiancai:
             clicked = self._tap_any_dialog_button(root, focus)
             if clicked:
                 return True
+            # 10.5) 通用弹窗兜底（小天才"升级提醒"这类**自定义 Activity 弹窗**：
+            #       com.xtc.watch/...popup.activity.CustomActivity14，按钮是
+            #       btn_left="不更新" / btn_right="立即安装"）。
+            #       以前只认 PopupWindow/Dialog 和固定文案，认不出它，于是弹窗永远
+            #       关不掉、消息一直读不到。这里按"结构"处理，与具体文案无关：
+            #       先点负向按钮（不更新/稍后/取消），找不到就按返回键；绝不点正向按钮。
+            if popup:
+                key = self._popup_signature(root, focus)
+                if key != self._popup_key:
+                    self._popup_key, self._popup_tries = key, 0
+                self._popup_tries += 1
+                title = self._popup_title(root) or focus or "(无标题)"
+                if self._popup_tries == 1:
+                    neg = self._find_popup_negative(root)
+                    if neg is not None:
+                        label = (neg.get("text") or "").strip() or self._id_tail(neg)
+                        self.adb.tap_element(neg)
+                        self.log("info", f"已关闭弹窗「{title}」（点「{label}」，未点确认/安装类按钮）")
+                        return True
+                    self.adb.keyevent(4)
+                    self.log("info", f"弹窗「{title}」没有可点的负向按钮，按返回键关闭")
+                    return True
+                if self._popup_tries == 2:
+                    self.adb.keyevent(4)
+                    self.log("warning", f"弹窗「{title}」仍在，直接按返回键关闭")
+                    return True
+                # 点过负向按钮、也按过返回键都关不掉：不再反复点，交给人工（10 分钟提醒一次）
+                self._warn_throttled(
+                    f"popup_stuck:{key[:48]}",
+                    f"弹窗「{title}」无法自动关闭（已尝试负向按钮与返回键）；"
+                    "可在 config.yaml -> xiaotiancai.ui.popup_skip_texts 里加上它的跳过按钮文案"
+                    "（例如「不更新」「稍后」）", interval=600.0)
+                return False
             # 11) BACK 兜底：仅当前台是独立弹窗/对话框窗口时（如 PopupWindow），
             #     普通 Activity 页面即使有 NAF 节点也不按返回，防止 App 退到桌面。
             if "popupwindow" in low_focus or "dialog" in low_focus:
@@ -1014,10 +1091,97 @@ class Xiaotiancai:
             pass
         return False
 
+    # ---- 通用弹窗：识别 / 找负向按钮 / 指纹 ----
+    def _looks_like_popup(self, root: ET.Element, focus: str = "") -> bool:
+        """是不是"弹窗盖在界面上"（自定义 Activity 弹窗 / Dialog / PopupWindow）。
+
+        判定必须**保守**：误判会把正常页面当弹窗去点按钮/按返回键，把 App 退到桌面。
+        强证据（任一成立才算）：
+        * 前台 Activity 名里带 popup/dialog/alert（小天才是 ...popup.activity.CustomActivity14）；
+        * 同时存在左/右两个对话按钮（btn_left + btn_right，聊天页/列表页不会有）；
+        * 存在弹窗容器（ll_center 等）且容器里有对话按钮或"标题+说明"。
+        """
+        low = (focus or "").lower()
+        if any(k in low for k in _POPUP_ACTIVITY_HINTS):
+            return True
+        tails = {self._id_tail(nd).lower() for nd in root.iter("node")}
+        if "btn_left" in tails and "btn_right" in tails:
+            return True
+        if tails & set(_POPUP_CONTAINER_TAILS):
+            buttons = tails & (set(_POPUP_NEG_TAILS) | set(_POPUP_POS_TAILS))
+            has_desc = bool(tails & {"desc", "tv_desc", "dialog_desc", "alert_desc"})
+            has_title = bool(tails & set(_POPUP_TITLE_TAILS))
+            if buttons or (has_title and has_desc):
+                return True
+        return False
+
+    def _popup_title(self, root: ET.Element) -> str:
+        """弹窗标题（用于日志，让用户一眼看出是哪个弹窗）。"""
+        for rid in _POPUP_TITLE_TAILS:
+            nd = self.adb.find_element(root, resource_id=f"{self.package}:id/{rid}")
+            if nd is not None and (nd.get("text") or "").strip():
+                return (nd.get("text") or "").strip()[:24]
+        return ""
+
+    def _popup_signature(self, root: ET.Element, focus: str = "") -> str:
+        """弹窗指纹：Activity + 标题 + 说明前 24 字。用来判断"是不是同一个弹窗"，
+        从而限制同一弹窗的重试次数（否则会一直点/一直按返回）。"""
+        desc = ""
+        for rid in ("desc", "tv_desc", "dialog_desc", "alert_desc", "message"):
+            nd = self.adb.find_element(root, resource_id=f"{self.package}:id/{rid}")
+            if nd is not None and (nd.get("text") or "").strip():
+                desc = (nd.get("text") or "").strip()[:24]
+                break
+        return f"{focus}|{self._popup_title(root)}|{desc}"
+
+    def _popup_block_texts(self) -> tuple:
+        """禁点按钮文案（config -> xiaotiancai.ui.popup_block_texts 可覆盖）。"""
+        val = self.ui.get("popup_block_texts")
+        if isinstance(val, (list, tuple)) and val:
+            return tuple(str(v) for v in val)
+        return _POPUP_BLOCK_TEXTS
+
+    def _popup_blocked(self, node) -> bool:
+        """这个控件是不是"危险按钮"（点了会真的下载/安装/更新/重启）。
+
+        判定顺序：id 末段是正向按钮 -> 禁点；文案带否定词（不/稍后/取消…）-> 安全；
+        文案命中禁点词 -> 禁点。
+        """
+        if node is None:
+            return True
+        if self._id_tail(node).lower() in _POPUP_POS_TAILS:
+            return True
+        text = (node.get("text") or "").strip()
+        if not text:
+            return False
+        if any(w in text for w in _POPUP_SAFE_WORDS):
+            return False
+        return any(w in text for w in self._popup_block_texts())
+
+    def _find_popup_negative(self, root: ET.Element):
+        """找弹窗里"安全的负向按钮"（不更新/稍后/取消），找不到返回 None。
+
+        优先按 id（btn_left/btn_cancel…，小天才会话框的约定是左负右正），
+        再按配置/默认的跳过文案。**永远不会返回"立即安装"这类正向按钮。**
+        """
+        for rid in _POPUP_NEG_TAILS:
+            nd = self.adb.find_element(root, resource_id=f"{self.package}:id/{rid}")
+            # clickable 属性缺失时按"可点"处理（dump 里通常有，测试构造的树里可能没有）
+            if nd is not None and str(nd.get("clickable", "true")).lower() != "false" \
+                    and not self._popup_blocked(nd):
+                return nd
+        for t in self.ui.get("popup_skip_texts", list(_SKIP_TEXTS)):
+            nd = self.adb.find_element(root, text=t)
+            if nd is not None and not self._popup_blocked(nd):
+                return nd
+        return None
+
     def _looks_like_dialog(self, root: ET.Element, focus: str = "") -> bool:
         """是否像"弹窗/对话框"场景：独立弹窗窗口、对话框标题控件、
         或界面上同时出现多个对话框按钮文本。用于给"点关闭/跳过"类动作兜底证据，
         避免在正常聊天/列表页误点。"""
+        if self._looks_like_popup(root, focus):
+            return True
         low = (focus or "").lower()
         if "popupwindow" in low or "dialog" in low:
             return True
@@ -1046,13 +1210,13 @@ class Xiaotiancai:
         confirm_keys = ("同意", "确定", "知道了", "好的", "确认", "允许")
         for key in skip_keys:
             n = self.adb.find_element(root, text=key)
-            if n is not None:
+            if n is not None and not self._popup_blocked(n):
                 self.adb.tap_element(n)
                 self.log("info", f"已点击对话框按钮: {key}")
                 return True
         for key in confirm_keys:
             n = self.adb.find_element(root, text=key)
-            if n is not None:
+            if n is not None and not self._popup_blocked(n):
                 self.adb.tap_element(n)
                 self.log("info", f"已点击对话框按钮: {key}")
                 return True
@@ -1443,6 +1607,7 @@ class Xiaotiancai:
         def _verify() -> bool:
             try:
                 root = self._dump_fast()
+                self._last_verify_root = root        # 供 _send_once 复用，省一次 dump
             except AdbError:
                 return True  # dump 失败无法判定，不阻塞发送流程
             edit = self._find_input(root)
@@ -1608,10 +1773,14 @@ class Xiaotiancai:
                 if not self.adb.input_text(text, verify=self.input_verifier(text)):
                     return False, "文本注入失败（输入框未收到内容）"
             time.sleep(0.3)
-            try:
-                send_root = self._dump_fast()
-            except AdbError:
-                send_root = root
+            # 复用注入校验时那次界面快照来找发送按钮，省掉一次 dump（WSA 上约 3 秒）
+            send_root = self._last_verify_root
+            self._last_verify_root = None
+            if send_root is None:
+                try:
+                    send_root = self._dump_fast()
+                except AdbError:
+                    send_root = root
             send_node = self._find_send(send_root)
             if send_node is None:
                 self.log("warning", "未找到发送按钮，改用回车发送")
@@ -1884,17 +2053,13 @@ class Xiaotiancai:
         screen_w = self.adb.get_screen_size()[0]
         filter_own = bool(self.ui.get("filter_own_bubbles", True))
         junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
-        # 收集日期标签（按 y 排序，供气泡取最近上方标签）
-        dates = []
+        # 收集时间标签（按 y 排序，供气泡取最近上方标签）；压缩 dump 里退化成从
+        # 父容器 desc 还原（见 _time_labels），否则时间会全变成"当前时间"
+        dates = self._time_labels(root)
         # 发送失败提示条（网络异常等）：下方带该提示的气泡 = 未送达，跳过
         fail_hints = []
         for n in root.iter("node"):
-            tail = self._id_tail(n)
-            if tail == "tv_chat_msg_item_date":
-                b = self._bounds(n)
-                if b and n.get("text", "").strip():
-                    dates.append((b[1], b[3], n.get("text", "").strip()))
-            elif tail in ("tv_weichat_uninstall_hint", "iv_tips_content"):
+            if self._id_tail(n) in _TIP_IDS:
                 b = self._bounds(n)
                 if b:
                     fail_hints.append((b[1], b[3]))
@@ -1974,8 +2139,80 @@ class Xiaotiancai:
         return chosen[2]
 
     def _date_count(self, root: ET.Element) -> int:
-        return sum(1 for n in root.iter("node")
-                   if self._id_tail(n) == "tv_chat_msg_item_date")
+        return len(self._time_labels(root))
+
+    @staticmethod
+    def _cn_numeral(token: str) -> str:
+        """还原 app 无障碍文案里的"中文式"数字：十1->11、十9->19、2十->20、4十6->46。
+
+        实机 ll_chat_top_layout 的 content-desc 就是这种写法（'十1点十9分' 对应 11:19）。
+        认不出来返回 ""（宁可不给，也不给错的时间）。
+        """
+        token = (token or "").strip()
+        if not token:
+            return ""
+        if "十" not in token:
+            return token if token.isdigit() else ""
+        if token == "十":
+            return "10"
+        head, _, tail = token.partition("十")
+        if head and not head.isdigit():
+            return ""
+        tens = int(head) if head else 1
+        if not tail:
+            return str(tens * 10)
+        if not tail.isdigit():
+            return ""
+        return str(tens * 10 + int(tail))
+
+    @classmethod
+    def _label_from_desc(cls, desc: str) -> str:
+        """把时间标签的 content-desc 还原成 "HH:MM"（认不出来返回 ""）。
+
+        为什么需要：WSA 上默认的 `--compressed` dump **不含** tv_chat_msg_item_date
+        节点（实测同一屏：压缩版 0 个时间标签，完整版 3 个），只剩父容器
+        ll_chat_top_layout 的 content-desc；不还原的话每条消息的时间都会退化成
+        "当前时间"（用户报的"消息时间不对"）。
+        """
+        s = (desc or "").strip()
+        if not s:
+            return ""
+        m = re.match(r"^([0-9十]{1,3})点(?:([0-9十]{1,3})分?)?$", s)
+        if not m:
+            return ""
+        hh = cls._cn_numeral(m.group(1))
+        mm = cls._cn_numeral(m.group(2)) if m.group(2) else "0"
+        if not hh or not mm:
+            return ""
+        hi, mi = int(hh), int(mm)
+        if not (0 <= hi <= 23 and 0 <= mi <= 59):
+            return ""
+        return f"{hi:02d}:{mi:02d}"
+
+    def _time_labels(self, root: ET.Element) -> list[tuple[int, int, str]]:
+        """聊天页里的时间标签 [(top, bottom, text)]，按从上到下排序。
+
+        首选 tv_chat_msg_item_date 的文本（完整 dump 里有，形如 "11:19"/"昨天 23:42"）；
+        没有这些节点时（压缩 dump）退化成从 ll_chat_top_layout 的 content-desc 还原。
+        """
+        labels = []
+        for n in root.iter("node"):
+            if self._id_tail(n) != "tv_chat_msg_item_date":
+                continue
+            b = self._bounds(n)
+            t = (n.get("text") or "").strip()
+            if b and t:
+                labels.append((b[1], b[3], t))
+        if labels:
+            return sorted(labels)
+        for n in root.iter("node"):
+            if self._id_tail(n) != "ll_chat_top_layout":
+                continue
+            b = self._bounds(n)
+            t = self._label_from_desc(n.get("content-desc") or "")
+            if b and t:
+                labels.append((b[1], b[3], t))
+        return sorted(labels)
 
     # ------------------------------------------------------------------ 历史消息 / 命令轮询
     def _chat_bubbles(self, root: ET.Element, include_own: bool = False) -> list[dict]:
@@ -1992,15 +2229,10 @@ class Xiaotiancai:
         screen_w = self.adb.get_screen_size()[0]
         filter_own = bool(self.ui.get("filter_own_bubbles", True))
         junk = set(self.ui.get("chat_junk_texts", _DEFAULT_JUNK))
-        dates: list[tuple[int, int, str]] = []
+        dates: list[tuple[int, int, str]] = self._time_labels(root)
         fail_hints: list[tuple[int, int]] = []
         for n in root.iter("node"):
-            tail = self._id_tail(n)
-            if tail == "tv_chat_msg_item_date":
-                b = self._bounds(n)
-                if b and n.get("text", "").strip():
-                    dates.append((b[1], b[3], n.get("text", "").strip()))
-            elif tail in _TIP_IDS:
+            if self._id_tail(n) in _TIP_IDS:
                 b = self._bounds(n)
                 if b:
                     fail_hints.append((b[1], b[3]))

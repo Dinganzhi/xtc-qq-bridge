@@ -612,6 +612,120 @@ def test_popup_handling() -> None:
     check("正常聊天页不按返回键", not any("keyevent 4" in t for t in taps6))
 
 
+# ---- 自定义 Activity 弹窗（实机抓下来的"升级提醒"） ----
+POPUP_FOCUS = "com.xtc.watch/com.xtc.widget.phone.popup.activity.CustomActivity14"
+
+
+def upgrade_popup_xml(left_text: str = "不更新", right_text: str = "立即安装",
+                      title: str = "升级提醒",
+                      desc: str = "小天才APP版本已下载完成，现在可以安装并开始体验了。") -> str:
+    """实机 dump 到的结构：title/desc + btn_left(负向) + btn_right(正向)。"""
+    return node_xml(
+        n(cls="android.widget.TextView", text=title, bounds="[979,339][1279,364]",
+          rid="com.xtc.watch:id/title") +
+        n(cls="android.widget.TextView", text=desc, bounds="[979,374][1275,421]",
+          rid="com.xtc.watch:id/desc") +
+        n(cls="android.widget.TextView", text=left_text, bounds="[995,503][1125,543]",
+          rid="com.xtc.watch:id/btn_left") +
+        n(cls="android.widget.TextView", text=right_text, bounds="[1133,503][1263,543]",
+          rid="com.xtc.watch:id/btn_right"))
+
+
+def test_custom_popup_auto_close() -> None:
+    """用户报告：小天才"升级提醒"弹窗盖住界面后，消息一直读不到（还老提示找不到联系人）。
+
+    实机抓包（CustomActivity14）：btn_left="不更新" 是负向按钮，btn_right="立即安装"
+    是正向按钮。它既不是 PopupWindow 也不是 Dialog，Activity 名里只有 `popup`，
+    以前完全认不出来，所以永远不会被自动关掉。要求：能自动关 + 绝不点"立即安装"。
+    """
+    # (a) 实机结构：点"不更新"，绝不点"立即安装"
+    handled, taps = _dismiss(upgrade_popup_xml(), focus=POPUP_FOCUS)
+    check("升级提醒弹窗被自动关掉", handled is True)
+    check("点的是负向按钮「不更新」", taps == ["tap [995,503][1125,543]"], str(taps))
+    check("绝不点「立即安装」", "tap [1133,503][1263,543]" not in taps, str(taps))
+
+    # (b) 文案换成没见过的（按钮="算了"/"马上安装"）：结构认得出来，仍点负向按钮
+    unknown = upgrade_popup_xml(left_text="算了", right_text="马上安装",
+                                title="需要你的确认", desc="请选择是否继续。")
+    handled2, taps2 = _dismiss(unknown, focus=POPUP_FOCUS)
+    check("没见过的弹窗文案也能按结构关掉",
+          handled2 and taps2 == ["tap [995,503][1125,543]"], str(taps2))
+
+    # (c) 只有正向按钮（没有安全的负向按钮）-> 按返回键关闭，而不是点"立即安装"
+    only_pos = node_xml(
+        n(cls="android.widget.TextView", text="有新版本", bounds="[0,100][400,160]",
+          rid="com.xtc.watch:id/title") +
+        n(cls="android.widget.TextView", text="立即安装", bounds="[0,300][400,360]",
+          rid="com.xtc.watch:id/btn_right"))
+    adb_c = FakeAdb(only_pos, focus=POPUP_FOCUS)
+    handled3 = Xiaotiancai(adb_c, {"ui": {"interaction_delay": 0.1}}, logger=None)._dismiss_blockers()
+    check("没有负向按钮时按返回键关闭",
+          handled3 is True and adb_c.calls == ["keyevent 4"], str(adb_c.calls))
+
+    # (d) 关不掉的弹窗：最多点一次负向按钮 + 按一次返回，之后不再反复点（也不刷屏）
+    adb_d = FakeAdb(upgrade_popup_xml(left_text="算了", right_text="马上安装",
+                                      title="需要你的确认", desc="请选择是否继续。"),
+                    focus=POPUP_FOCUS)
+    rec = Recorder()
+    xtc_d = Xiaotiancai(adb_d, {"ui": {"interaction_delay": 0.1}}, logger=rec)
+    r1 = xtc_d._dismiss_blockers()          # 第 1 轮：点负向按钮
+    r2 = xtc_d._dismiss_blockers()          # 第 2 轮：按返回键
+    calls_before = list(adb_d.calls)
+    r3 = xtc_d._dismiss_blockers()          # 第 3 轮：放弃，不再动作
+    r4 = xtc_d._dismiss_blockers()
+    check("关不掉时前两轮分别点按钮/按返回",
+          r1 and r2 and adb_d.calls[:2] == ["tap [995,503][1125,543]", "keyevent 4"],
+          str(adb_d.calls))
+    check("第 3 轮起不再反复点", (r3 is False) and (r4 is False))
+    check("放弃后没有再发出任何点击/按键", adb_d.calls == calls_before, str(adb_d.calls))
+    stuck = [l for l in rec.lines if "无法自动关闭" in l]
+    stuck_warn = [l for l in stuck if l.startswith("[warning]")]
+    check("关不掉时给出可排查的提示（warning 只报一次，其余降级 debug）",
+          len(stuck_warn) == 1 and all(l.startswith("[debug]") for l in stuck[1:]),
+          str(stuck))
+
+    # (e) 状态判定：弹窗 -> popup（不是 chat/other），弹窗关掉后 -> chat
+    adb_e = FakeAdb(upgrade_popup_xml(), focus=POPUP_FOCUS)
+    xtc_e = Xiaotiancai(adb_e, {"ui": {"interaction_delay": 0.1}}, logger=None)
+    check("弹窗遮挡 -> STATE_POPUP", xtc_e.app_state() == Xiaotiancai.STATE_POPUP,
+          xtc_e.app_state())
+    check("弹窗状态有中文说明", Xiaotiancai.STATE_TEXT.get(Xiaotiancai.STATE_POPUP) == "弹窗遮挡界面")
+    adb_e.xml = chat_page_xml()
+    adb_e.focus = "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatActivity"
+    check("弹窗关掉后 -> STATE_CHAT", xtc_e.app_state() == Xiaotiancai.STATE_CHAT,
+          xtc_e.app_state())
+
+    # (f) 危险按钮判定：正向禁点，负向安全
+    xtc_f = Xiaotiancai(FakeAdb(), {}, logger=None)
+
+    def blocked(text: str, rid: str = "") -> bool:
+        root = ET.fromstring(node_xml(n(cls="android.widget.TextView", text=text, rid=rid)))
+        return xtc_f._popup_blocked(next(iter(root.iter("node"))))
+
+    check("「立即安装」禁点", blocked("立即安装") is True)
+    check("「马上更新」禁点", blocked("马上更新") is True)
+    check("btn_right 一律禁点", blocked("继续", "com.xtc.watch:id/btn_right") is True)
+    check("「不更新」可点（负向）", blocked("不更新") is False)
+    check("「暂不安装」可点（负向）", blocked("暂不安装") is False)
+
+    # (g) 自定义跳过文案（config）生效；没有 id 的按钮也能按文案点到
+    custom = node_xml(
+        n(cls="android.widget.TextView", text="温馨提示", bounds="[0,100][400,160]",
+          rid="com.xtc.watch:id/title") +
+        n(cls="android.widget.TextView", text="不了", bounds="[0,300][400,360]") +
+        n(cls="android.widget.TextView", text="立即安装", bounds="[0,400][400,460]"))
+    handled_g, taps_g = _dismiss(custom, focus=POPUP_FOCUS,
+                                 ui_cfg={"interaction_delay": 0.1,
+                                         "popup_skip_texts": ["不了"]})
+    check("config 自定义跳过文案生效",
+          handled_g and taps_g == ["tap [0,300][400,360]"], str(taps_g))
+    # 没有配置时「不了」认不出来，但结构 + 无负向按钮 -> 返回键（不会点"立即安装"）
+    adb_h = FakeAdb(custom, focus=POPUP_FOCUS)
+    handled_h = Xiaotiancai(adb_h, {"ui": {"interaction_delay": 0.1}}, logger=None)._dismiss_blockers()
+    check("认不出的按钮不会误点「立即安装」",
+          handled_h is True and adb_h.calls == ["keyevent 4"], str(adb_h.calls))
+
+
 # ------------------------------------------------------------------ 10. 聊天页判定 / 联系人查找
 class Recorder:
     """收集日志文本的假 logger（断言"日志里有没有给出可排查的信息"）。"""
@@ -1296,6 +1410,100 @@ def test_time_label_is_per_message() -> None:
                 rid="com.xtc.watch:id/tv_chat_msg_item_date")))) == 1)
 
 
+def compressed_chat_xml() -> str:
+    """实机抓下来的**压缩 dump**聊天页：没有 tv_chat_msg_item_date 节点，
+    时间只剩父容器 ll_chat_top_layout 的 content-desc（数字是"中文式"写法）。"""
+    return node_xml(
+        n(cls="android.widget.ImageView", text="",
+          desc="屑猹不喝茶发的消息,表情喝娃哈哈.png",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,105][965,139]") +
+        n(cls="android.widget.LinearLayout", text="", desc="十1点十9分",
+          rid="com.xtc.watch:id/ll_chat_top_layout", bounds="[1004,153][1049,208]") +
+        n(cls="android.widget.ImageView", text="",
+          desc="屑猹不喝茶发的消息,表情流汗",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,208][965,328]") +
+        n(cls="android.widget.LinearLayout", text="", desc="十9点十8分",
+          rid="com.xtc.watch:id/ll_chat_top_layout", bounds="[1004,342][1049,397]") +
+        n(cls="android.widget.ImageView", text="",
+          desc="屑猹不喝茶发的消息,表情悄悄看",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,397][965,517]") +
+        n(cls="android.widget.LinearLayout", text="", desc="2十点4十6分",
+          rid="com.xtc.watch:id/ll_chat_top_layout", bounds="[1004,531][1049,586]") +
+        n(cls="android.widget.TextView", text="晚安",
+          desc="你发的消息,晚安",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[967,586][1207,658]") +
+        n(cls="android.widget.EditText", text="\xa0发送文字",
+          rid="com.xtc.watch:id/et_chat_text_content", bounds="[833,678][1179,721]") +
+        n(cls="android.widget.TextView", text="发送",
+          rid="com.xtc.watch:id/tv_send_view", bounds="[1179,677][1221,721]"))
+
+
+def test_time_labels_survive_compressed_dump() -> None:
+    """用户报告"消息时间还是不对"：根因是 WSA 上默认用的 `--compressed` dump
+    **把时间标签节点整片裁掉**（实机同一屏：压缩版 19 节点/0 个时间标签，
+    完整版 46 节点/3 个时间标签），于是每条消息都退化成"当前时间"。
+
+    两处修复：① 默认改用完整 dump（见 adb_controller._dump_strategies）；
+    ② 万一只拿到压缩版，就从 ll_chat_top_layout 的 content-desc 还原时间。
+    """
+    xtc, _ = make_xtc("", ui_cfg={})
+
+    # ① desc 里的"中文式"数字还原
+    check("desc「十1点十9分」-> 11:19", xtc._label_from_desc("十1点十9分") == "11:19",
+          xtc._label_from_desc("十1点十9分"))
+    check("desc「十9点十8分」-> 19:18", xtc._label_from_desc("十9点十8分") == "19:18",
+          xtc._label_from_desc("十9点十8分"))
+    check("desc「2十点4十6分」-> 20:46", xtc._label_from_desc("2十点4十6分") == "20:46",
+          xtc._label_from_desc("2十点4十6分"))
+    check("普通写法「19点18分」也能认", xtc._label_from_desc("19点18分") == "19:18",
+          xtc._label_from_desc("19点18分"))
+    check("认不出的 desc 一律返回空（不给错时间）",
+          xtc._label_from_desc("刚刚") == "" and xtc._label_from_desc("25点99分") == ""
+          and xtc._label_from_desc("和屑猹不喝茶的聊天") == "")
+
+    # ② 压缩 dump：时间标签数量不能是 0（否则会触发"快照不完整"的反复重读）
+    root = ET.fromstring(compressed_chat_xml())
+    check("压缩 dump 里也能数出时间标签", xtc._date_count(root) == 3, str(xtc._date_count(root)))
+
+    # ③ 每条消息各拿各的时间（标签在它上面 → 归下面第一条气泡）
+    bubbles = xtc._chat_bubbles(root, include_own=True)
+    got = [(b["text"], b["time_label"]) for b in bubbles]
+    check("压缩 dump 下每条消息的时间都对",
+          got == [("表情喝娃哈哈.png", ""), ("表情流汗", "11:19"),
+                  ("表情悄悄看", "19:18"), ("晚安", "20:46")],
+          str(got))
+
+    # ④ 最新一条（别人发的）也要带上自己的时间，而不是"当前时间"
+    contact, text, label = xtc._latest_in_chat(root)
+    check("最新消息的时间来自压缩 dump 的 desc", label == "19:18", f"label={label!r}")
+
+    # ⑤ 完整 dump 里两种节点都有时，优先用 tv_chat_msg_item_date 的文本
+    both = node_xml(
+        n(cls="android.widget.LinearLayout", text="", desc="2十点4十6分",
+          rid="com.xtc.watch:id/ll_chat_top_layout", bounds="[1004,531][1049,586]") +
+        n(cls="android.widget.TextView", text="昨天 20:46",
+          rid="com.xtc.watch:id/tv_chat_msg_item_date", bounds="[1004,551][1049,576]"))
+    labels = xtc._time_labels(ET.fromstring(both))
+    check("完整 dump 优先用 date 节点文本",
+          [t for _, _, t in labels] == ["昨天 20:46"], str(labels))
+
+
+def test_dump_prefers_full_hierarchy() -> None:
+    """默认要先用**完整 dump**：压缩版会把时间标签裁掉（用户报的"时间不对"）。
+
+    某些镜像上完整 dump 会被 Killed，所以仍保留压缩版兜底 + "记住成功策略"。
+    """
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    names = [n for n, _ in ctl._dump_strategies()]
+    check("默认先试完整 dump", names[0] == "file-full", str(names))
+    check("压缩版仍保留为兜底（镜像不支持完整 dump 时用）",
+          "file-compressed" in names and "tty-compressed" in names, str(names))
+    ctl._dump_strategy = "file-compressed"
+    check("记住的策略仍会被提到最前",
+          [n for n, _ in ctl._dump_strategies()][0] == "file-compressed")
+
+
 class SeqAdb(FakeAdb):
     """按调用次数返回不同界面快照（模拟"偶发不完整 dump"）。"""
 
@@ -1535,6 +1743,57 @@ def test_state_logged_once_and_warnings_throttled() -> None:
         check("同类失败 5 分钟内只 warning 一次", len(warns) == 1, str(rec.lines))
         check("其余降为 debug", len([x for x in rec.lines if x.startswith("[debug]")]) == 4,
               str(rec.lines))
+    finally:
+        cleanup(root)
+
+
+def test_poll_loop_dismisses_popup_without_cooldown() -> None:
+    """轮询层遇到"弹窗遮挡"要**立刻**清弹窗，而且不设冷却。
+
+    用户报告：弹窗盖住界面后消息一直读不到、还老提示"找不到联系人"。
+    以前轮询只认"在不在聊天页"，弹窗状态被当成"其它页面"去 open_chat（还有 30 秒
+    冷却），弹窗不关就永远进不去聊天页。现在状态机判出 popup，轮询每一轮都清它。
+    """
+    import threading
+
+    class PollAdb(FakeAdb):
+        def is_connected(self) -> bool:
+            return True
+
+        def ensure_connected(self) -> bool:
+            return True
+
+    calls = {"settle": 0, "states": []}
+
+    class PopupXtc(Xiaotiancai):
+        def app_state_with_root(self, attempts: int = 2):
+            calls["states"].append(self.STATE_POPUP)
+            return (self.STATE_POPUP, None)
+
+        def settle(self, max_passes: int = 6) -> bool:
+            calls["settle"] += 1
+            return True
+
+    root = tmp_root()
+    rec = Recorder()
+    try:
+        xtc = PopupXtc(PollAdb(), {"ui": {}}, logger=rec)
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=PollAdb(), xtc=xtc, forwarder=None, logger=rec)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._poll_interval = 0.05
+        br.running = True
+        t = threading.Thread(target=br._poll_loop, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        br.running = False
+        t.join(3)
+        check("弹窗状态下轮询会去清弹窗", calls["settle"] >= 1, str(calls))
+        check("状态日志里看得到「弹窗遮挡界面」",
+              any("弹窗遮挡界面" in x for x in rec.lines),
+              str([x for x in rec.lines if "状态" in x][:3]))
+        check("轮询没有抛异常", not any("轮询异常" in x for x in rec.lines), str(rec.lines[-3:]))
     finally:
         cleanup(root)
 
@@ -1825,7 +2084,7 @@ def main() -> int:
                test_password_field_masked, test_login_progress_not_failure,
                test_send_result_is_honest, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
-               test_popup_handling,
+               test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,
                test_contact_name_matching, test_contact_matching_when_ids_differ,
                test_contact_not_found_reports_visible_names,
@@ -1841,10 +2100,12 @@ def main() -> int:
                test_foreground_logic_two_layers,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
                test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
-               test_time_label_is_per_message, test_latest_message_retries_when_labels_missing,
+               test_time_label_is_per_message, test_time_labels_survive_compressed_dump,
+               test_dump_prefers_full_hierarchy, test_latest_message_retries_when_labels_missing,
                test_start_enqueues_auto_init, test_plugin_send_reports_real_reason,
                test_no_delivery_confirm_on_forward_failure,
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
+               test_poll_loop_dismisses_popup_without_cooldown,
                test_monotonic_sentinels_survive_fresh_boot,
                test_nuitka_version_args_are_numeric, test_guard_is_windows_only,
                test_backlog_walk_until_known,

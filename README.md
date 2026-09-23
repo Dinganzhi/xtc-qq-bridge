@@ -361,7 +361,8 @@ xiaotiancai:
     interaction_delay: 0.6                   # 点击/输入之间的等待（秒）
     send_retries: 2                          # 发送确认失败时的重试轮数
     send_fail_markers: ["发送失败", "网络异常", ...]
-    popup_skip_texts: ["以后再说", "稍后更新", ...]   # 更新/活动弹窗点这些跳过
+    popup_skip_texts: ["以后再说", "不更新", ...]      # 弹窗点这些跳过（含更新/活动/自研弹窗）
+    popup_block_texts: ["立即安装", "立即更新", ...]   # 危险按钮，自动关弹窗时绝不点
     anr_wait_texts: ["等待", "等待响应"]               # 无响应弹窗点这些（不杀 App）
     system_msg_prefixes: ["发送成功", "发送失败"]      # 送达确认前缀，读取时跳过
     badge_resource_ids: []
@@ -638,7 +639,8 @@ python tools/wsa_net_guard.py --test
 | **WSA 守护一直提示"无法判断子系统网络"** | 根因是 **WSA 的 NAT 不转发 ICMP**：ping 在 WSA 上永远 100% 丢包（镜像里其实有 ping），旧版把"ping 失败/输出被退出码吞掉"当成了无法判断。现在守护优先用 **`nc` TCP 连接**判断（`wsa_guard.tcp_targets`），再退回 ping / IP / `dumpsys connectivity`；**只有"没有 IP"或"系统明确说没有默认网络"才判定断网**，其余判为无法判断（只保活 adb，不误重启）。`--status` 会打印"探测证据"一行说明这次的判断依据 |
 | **有时"已经登录了却提示未登录"** | 已修复三处：① 登录态**以界面为准**（聊天页/消息列表/微聊·我的 等主界面特征 → 已登录；密码框/验证码/登录页文案 → 未登录），Activity 名只作兜底，不再因为名字里带 `login`（如 `AccountVerifyLoginActivity`）就误判；② "App 是否在前台"改看 **Activity** 而不是窗口焦点 —— 输入法一弹出就抢走 `mCurrentFocus`，旧实现会因此误判"App 不在前台/未登录"；③ 新增**三态**登录判定：读不到界面 / App 不在前台 = `unknown`，此时既不打印"未登录"、也**不会触发自动登录**（旧实现会误触发，甚至去点登录页控件） |
 | **日志反复出现 `null root node returned by UiTestAutomationBridge` 或 `mCurrentFocus=null`** | 说明 **WSA 窗口被最小化/关闭、或虚拟显示未点亮** —— 此时 Android 侧没有任何窗口获得焦点，`uiautomator` 必然失败（**与小天才 App 无关**，手动 `uiautomator dump` 同样会失败）。办法：让 WSA 窗口保持打开（可以挪到屏幕边上，但别最小化）。桥接检测到"没有焦点窗口"会**自动唤醒屏幕 + 重新拉起 App**，窗口恢复后自动继续；单条 dump 报错已压缩成一行可读信息，完整原因见 `--debug adb-info` 的 `last_dump_error` |
-| **弹窗挡住界面导致读不到消息** | 已修复：常见弹窗（权限/无响应/更新/评价/活动/网络/警告）会自动处理；连续读不到消息会触发界面自愈。特殊弹窗可加 `xiaotiancai.ui.popup_skip_texts` / `anr_wait_texts` |
+| **弹窗挡住界面导致读不到消息** | 已修复：常见弹窗（权限/无响应/更新/评价/活动/网络/警告）会自动处理；**自研自定义弹窗**（如"升级提醒" `com.xtc.widget.phone.popup.activity.CustomActivity14`）也按结构识别并自动关闭（点负向按钮/返回键，绝不点"立即安装"）；状态机会报 `弹窗遮挡界面`，轮询每轮都会清它。实在认不出的弹窗，把它的跳过按钮文案加进 `xiaotiancai.ui.popup_skip_texts` 即可 |
+| **消息时间不对（时间总是"当前时间"）** | 已修复：WSA 上旧版默认用的 `--compressed` dump 会把时间标签节点（`tv_chat_msg_item_date`）整片裁掉（实机同一屏：压缩版 0 个标签，完整版 3 个 `11:19`/`19:18`/`20:46`），于是每条消息的时间都退化成"当前时间"。现在默认用**完整 dump**，并且万一只拿到压缩版也会从 `ll_chat_top_layout` 的 content-desc 还原时间（`十1点十9分` -> `11:19`） |
 | Linux 真机看不到设备 | udev 规则/权限问题：配 `/etc/udev/rules.d/51-android.rules` 并把用户加入 `plugdev`（见「Linux」小节），再 `sudo udevadm control --reload-rules && sudo udevadm trigger` |
 | Waydroid 连不上 | `waydroid session start`（X11 加 `-X`）后再 `adb connect 127.0.0.1:5555`；容器/无桌面环境需 `/dev/kvm` 与显示输出 |
 | 连错设备（多个模拟器/真机） | 在 `adb.serial` 里写死要用的序列号（`python main.py --check` 会打印当前选中的是哪个） |
@@ -685,12 +687,30 @@ python tools/wsa_net_guard.py --test
 
 **弹窗处理**（`Xiaotiancai._dismiss_blockers()`，按优先级）：
 系统权限 -> 应用无响应/崩溃（点"等待"，**不杀 App**）-> 通话面板 -> 隐私协议 ->
-更新/评价/公告/活动（点"以后再说"这类跳过，**绝不点"立即更新"**）-> 网络异常（带 30s 冷却地点"重试"，否则关掉）
--> 小天才警告弹窗 -> 关闭类控件（`iv_close` 等 id）-> 通用对话框文本按钮 -> 弹窗窗口 BACK 兜底。
+更新/评价/公告/活动（点"以后再说"/"不更新"这类跳过，**绝不点"立即安装/立即更新"**）-> 网络异常（带 30s 冷却地点"重试"，否则关掉）
+-> 小天才警告弹窗 -> 关闭类控件（`iv_close` 等 id）-> 通用对话框文本按钮 ->
+**通用弹窗兜底**（认结构不认文案，见下）-> 弹窗窗口 BACK 兜底。
 
-安全护栏：只有在"像弹窗"时才动手（独立 Dialog/PopupWindow 窗口、对话框标题控件、
-或同屏出现多个对话框按钮文本），正常聊天/列表页**不会**被误点或误按返回键——
-`tools/test_reported_bugs.py::test_popup_handling` 覆盖了这些场景。
+**通用弹窗兜底**（"升级提醒"这类自定义 Activity 弹窗，实机：
+`com.xtc.watch/com.xtc.widget.phone.popup.activity.CustomActivity14`，
+按钮 `btn_left="不更新"` / `btn_right="立即安装"`）：
+
+- 它既不是 PopupWindow 也不是 Dialog，光看文案认不出来，以前**永远不会被自动关掉**，
+  弹窗盖住界面后消息一直读不到（用户报的"读不到消息 / 老提示找不到联系人"）。
+- 现在按**结构**判定是否弹窗：Activity 名含 `popup/dialog/alert`、或同时存在
+  `btn_left`+`btn_right`、或"弹窗容器 + 对话按钮/标题+说明"。判定刻意保守，
+  正常聊天页不会被误判。
+- 关闭顺序：**先点负向按钮**（`btn_left`/`btn_cancel`… 或 `popup_skip_texts` 里的文案），
+  找不到就**按返回键**；`popup_block_texts` 里的危险按钮（立即安装/立即更新…）**绝不点**。
+- 同一个弹窗最多试 2 轮（点一次 + 返回一次），仍关不掉就停止动作并每 10 分钟提醒一次，
+  提示你去 `popup_skip_texts` 补上它的按钮文案——不会反复点、也不会刷屏。
+- 状态机会把它判成 `popup`（日志："小天才状态: 弹窗遮挡界面"），轮询层**不设冷却**地清它。
+
+安全护栏：只有在"像弹窗"时才动手（独立 Dialog/PopupWindow 窗口、弹窗 Activity 名、
+双按钮结构、对话框标题控件），正常聊天/列表页**不会**被误点或误按返回键——
+`tools/test_reported_bugs.py::test_popup_handling` / `test_custom_popup_auto_close` 覆盖了这些场景。
+其他弹窗（系统权限、无响应等）同样通用；若是没见过的自研弹窗，加
+`xiaotiancai.ui.popup_skip_texts` 一个文案即可，不需要改代码。
 
 **界面自愈**（`bridge._poll_loop()` + `Xiaotiancai.recover()`）：
 连续若干轮读不到任何消息时，按需执行"清弹窗 -> 不在前台才启动 -> 未登录就等登录 ->
@@ -709,6 +729,11 @@ python tools/wsa_net_guard.py --test
 - 只在聊天窗口内读取：列表预览无法可靠判断发送方（家长侧手动发送的消息也会出现在预览里），
   会被误当成对方消息转发。
 - 界面更新后优先调整 `config.yaml -> xiaotiancai.ui`，不要改代码。
+- **每条消息的时间**（`_time_labels()` + `_label_for_bubble()`）：小天才只在一个"时间组"的
+  第一条消息上方画一个时间标签，所以标签**只归它下面紧挨着的那条消息**，组内其它消息
+  用自己的标签；没有标签时用"当前时间"（对刚收到的消息就是它的到达时间，各条不同）。
+  标签节点首选 `tv_chat_msg_item_date`（形如 `11:19` / `昨天 23:42`）；
+  压缩 dump 里没有它，就从 `ll_chat_top_layout` 的 content-desc 还原（`十1点十9分` -> `11:19`）。
 - **漏消息补发（撞库即停）**：每轮读完最新一条后，会从最新往回逐条检查——
   和消息库里已有的那条一样就**停**；不一样就转发，然后继续往上看，直到撞上库里已有的一条。
   这样弹窗挡住界面、界面一时读不到、以及桥接启动前积压在聊天里的消息都会按时间顺序补齐，
@@ -758,13 +783,22 @@ python tools/wsa_net_guard.py --test
 "写文件 -> 读取 -> 删文件"，且读取走 `exec-out cat`）；交互路径用 `retries=2, delay=0.3`
 的快速 dump；前台组件与登录态都带短缓存；等待时间由 `ui.interaction_delay` 控制。
 
-**UI dump 的三层策略与可读报错**（`adb_controller._dump_ui_locked`）：
+**UI dump 的三种方案与可读报错**（`adb_controller._dump_strategies` / `_dump_ui_locked`）：
 
-| 层 | 动作 | 作用 |
+| 方案 | 动作 | 作用 |
 |---|---|---|
-| 1 | `uiautomator dump /dev/tty` | 不落盘，一次 shell 调用拿到 XML（最快，也绕开 `/sdcard` 写不进去的问题） |
-| 2 | 落盘 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` | `/sdcard` 未挂载/无权限时自动换目录；读文件用 `exec-out cat`（二进制直出，不做换行转换） |
-| 3 | 重试逐轮递增等待 + 重设动画缩放 + 最后再试 `--compressed` | 等转场/动画结束；动画设置被系统恢复时补救 |
+| `file-full`（默认首选） | 一次 shell 完成"完整 dump 落盘 -> `cat` 读回 -> 删文件" | 节点最全：**消息时间标签 `tv_chat_msg_item_date` 只有完整 dump 里才有** |
+| `tty-full` | `uiautomator dump /dev/tty` | 不落盘，一次 shell 拿到 XML（绕开 `/sdcard` 写不进去） |
+| `file-compressed` / `tty-compressed` | 加 `--compressed` 的兜底 | 某些镜像上完整 dump 会被系统 Killed；失败后自动落到这里并**记住**能用的那个 |
+| `file` | 落盘 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` | `/sdcard` 未挂载/无权限时自动换目录；读文件用 `exec-out cat` |
+
+**为什么默认不再用 `--compressed`**（实机 WSA 实测的坑）：`--compressed` 会把时间标签节点
+整片裁掉——同一屏压缩版 **19 个节点 / 0 个时间标签**，完整版 **46 个节点 / 3 个时间标签**
+（`11:19` / `19:18` / `20:46`）。时间标签一丢，转发出去的消息时间就退化成"当前时间"
+（用户报的"消息时间还是不对"）。完整版实测成功率 5/5、平均只慢约 0.4s（3.5s vs 3.1s）。
+万一某个镜像只给压缩版，`Xiaotiancai._time_labels()` 会退化成从时间标签父容器
+`ll_chat_top_layout` 的 content-desc 还原时间（`十1点十9分` -> `11:19`），
+所以再怎么退化也不会把时间丢成"当前时间"。
 
 失败时抛出的错误形如：
 `UI dump 失败: /dev/tty: ERROR: could not get idle state.；/sdcard: 读取 ... 失败: 文件不存在 | ...（界面一直不空闲：...可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面）｜当前前台=com.xtc.watch/.ChatActivity`

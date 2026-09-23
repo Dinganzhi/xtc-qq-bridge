@@ -300,6 +300,18 @@ class MessageBridge:
                             self._log_once("state_login",
                                            "当前在小天才登录/安全验证页，等待登录完成"
                                            "（此时不会去找联系人）", interval=600)
+                        elif state == self.xtc.STATE_POPUP:
+                            # 弹窗遮挡（如"升级提醒"）：弹窗不关就完全读不到消息，
+                            # 所以这里**不设冷却**，每次轮询都尝试关掉；
+                            # 关不掉时由 xiaotiancai 侧 10 分钟提醒一次，避免刷屏。
+                            if self.xtc.settle():
+                                self._log("info", "检测到弹窗遮挡界面，已自动关闭")
+                            else:
+                                self._log_once(
+                                    "state_popup_stuck",
+                                    "弹窗遮挡界面且无法自动关闭（可在 config.yaml -> "
+                                    "xiaotiancai.ui.popup_skip_texts 里补上它的按钮文案）",
+                                    interval=600)
                         elif state in (self.xtc.STATE_LIST, self.xtc.STATE_OTHER):
                             cooldown = 30.0 if self._poll_fail_streak < 5 else 5.0
                             if xtc_contact and time.monotonic() - self._last_chat_open >= cooldown:
