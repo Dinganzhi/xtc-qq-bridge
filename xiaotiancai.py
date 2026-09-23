@@ -158,6 +158,21 @@ class Xiaotiancai:
         # 弹窗自动关闭的"同一弹窗最多试几轮"状态（空 key 表示当前没有弹窗）
         self._popup_key = ""            # 当前弹窗的指纹（Activity + 标题 + 说明前若干字）
         self._popup_tries = 0           # 这个弹窗已经尝试关闭的轮数
+        # 最近一次界面快照（轮询每 2 秒就会更新）：发送等交互复用它，省一次 ~3 秒的 dump
+        self._snapshot = None
+        self._snapshot_ts = float("-inf")
+        # 发送按钮坐标缓存 + 快路径开关（省掉"注入后 dump 一次找发送按钮"的 ~3 秒）
+        self._send_cache: dict | None = None
+        self._fast_send = bool(self.ui.get("fast_send", True))
+        try:
+            self._snapshot_reuse = max(0.0, float(self.ui.get("snapshot_reuse", 3.0)))
+        except (TypeError, ValueError):
+            self._snapshot_reuse = 3.0
+        # 点发送后等多久再 dump 确认：太短会白 dump 一次（约 3 秒），太长就只是慢一点
+        try:
+            self._confirm_delay = max(0.0, float(self.ui.get("confirm_delay", 0.45)))
+        except (TypeError, ValueError):
+            self._confirm_delay = 0.45
         self.last_open_reason = ""   # 最近一次 open_chat 失败的原因（桥接据此去重打印）
 
     def log(self, level: str, msg: str):
@@ -242,8 +257,29 @@ class Xiaotiancai:
 
         比默认 dump（2 次 / 0.8s）快，又比"只试 1 次"稳——单次 uiautomator 偶发失败
         时不至于把整轮发送/登录直接判成失败。
+
+        每次成功都记进"最近快照"（见 recent_snapshot）：轮询每 2 秒就会 dump 一次，
+        发送等交互可以直接复用那份，省掉一次 ~3 秒的 dump。
         """
-        return self.adb.dump_ui(retries=2, delay=0.3)
+        root = self.adb.dump_ui(retries=2, delay=0.3)
+        self._snapshot = root
+        self._snapshot_ts = time.monotonic()
+        return root
+
+    def recent_snapshot(self, max_age: float | None = None) -> ET.Element | None:
+        """最近一次界面快照（默认 max_age = ui.snapshot_reuse，秒），过期返回 None。
+
+        只用于"基线/控件位置"这类容错信息（例如发送前记下已有气泡数、输入框位置），
+        调用方拿到后仍会做自己的判断；过期就拿不到，自己 dump 即可。
+        """
+        if self._snapshot is None:
+            return None
+        age = self._snapshot_reuse if max_age is None else max_age
+        if age <= 0:
+            return None
+        if time.monotonic() - self._snapshot_ts > age:
+            return None
+        return self._snapshot
 
     def _dump_with_retry(self, attempts: int = 2) -> ET.Element | None:
         """读界面并容错：失败时（收键盘 / 找回窗口）再试，仍失败返回 None。
@@ -1228,15 +1264,20 @@ class Xiaotiancai:
 
         旧实现只认 `endswith("chatactivity")`，机型/版本一换（ChattingActivity、
         带子类后缀等）就漏判，于是"人已经在聊天页却以为在主页"。
-        现在改成：含 `chat` 且不含列表/首页类字样（list/main/watchmsg/...）。
+        后来改成"含 chat 且不含列表/首页类字样"，但那段判断用的是**整个组件名**——
+        实机上报的是 `com.xtc.wechat.view.chatlist.ChatActivity`：**包名里的
+        `chatlist` 含 "list"**，于是聊天页永远被排除，`is_in_chat()` 每次都要再
+        dump 一次界面（WSA 上一次 ~3 秒，发送链路白等 3 秒）。现在只拿**类名**
+        （最后一段）做判断，`ui.activity_chat_exclude` 也是按类名匹配。
         """
         a = (act or "").lower()
         if not a or not a.startswith(self.package.lower()):
             return False
-        if any(w in a for w in self.ui.get("activity_chat_exclude",
-                                           list(_ACTIVITY_CHAT_EXCLUDE))):
+        cls = a.split("/")[-1].rsplit(".", 1)[-1]      # ...chatlist.ChatActivity -> chatactivity
+        if any(w in cls for w in self.ui.get("activity_chat_exclude",
+                                             list(_ACTIVITY_CHAT_EXCLUDE))):
             return False
-        return "chat" in a
+        return "chat" in cls
 
     def _find_chat_bar(self, root: ET.Element):
         """聊天输入栏 / 聊天页特征控件。
@@ -1731,15 +1772,22 @@ class Xiaotiancai:
     def _send_once(self, text: str) -> tuple[bool, str]:
         """执行一轮"读界面 -> 清残留 -> 注入 -> 点发送 -> 确认"。返回 (是否确认成功, 说明)。
 
-        速度：全部用 `_dump_fast()`（单次 uiautomator dump，走 /dev/tty 快路径）+
-        较短的固定等待，一次发送通常 3~5 秒（旧实现 10 秒以上）。
+        速度（WSA 上一次 uiautomator dump 约 3 秒，所以**数 dump 次数**才是关键）：
+        - 发送前的基线优先复用轮询刚 dump 的那份快照（少 1 次）；
+        - 布局没变时走**快路径**：直接广播注入 + 点缓存的发送按钮坐标，
+          再用一次 dump 同时确认"注入成功 + 发送成功"（少 1 次）；
+        - 快路径不成立/没确认成功时退回"注入并校验"的稳妥流程（首次发送、布局变了、
+          或注入没生效时走这条），结果照样如实判定。
         """
         try:
-            root = self._dump_with_retry(2)   # 读不到界面（界面不空闲）时自动收键盘重试
+            # 1) 发送前基线：优先复用很新的界面快照（轮询每 2 秒 dump 一次）
+            root = self.recent_snapshot()
             if root is None or self._find_input(root) is None:
-                # 找不到输入框：可能有弹窗盖住了聊天页，先清理再重读界面
-                if self._dismiss_blockers():
-                    root = self._dump_with_retry(1)
+                root = self._dump_with_retry(2)   # 读不到界面（界面不空闲）时自动收键盘重试
+                if root is None or self._find_input(root) is None:
+                    # 找不到输入框：可能有弹窗盖住了聊天页，先清理再重读界面
+                    if self._dismiss_blockers():
+                        root = self._dump_with_retry(1)
             if root is None:
                 return False, "界面读取失败，无法确认聊天页状态"
             input_node = self._find_input(root)
@@ -1756,9 +1804,40 @@ class Xiaotiancai:
             if input_node is None:
                 return False, "未找到输入框（请确认当前在聊天页）"
             # 发送前基线：旧的失败提示 / 已有己方气泡（用于识别"新出现"的失败与新气泡）
+            input_bounds = self._bounds(input_node)
             base_fail = self._fail_signature(root)
             base_own = self._own_bubble_counter(root)
             self._clear_chat_input(root)
+            self._focus_input(input_node)
+            # 2) 快路径：布局与上次一致 -> 直接用缓存的发送按钮坐标
+            point = self._cached_send_point(input_bounds) if self._fast_send else None
+            if point is not None and self.adb.input_text_plain(text):
+                time.sleep(0.25)
+                self.adb.tap(point[0], point[1])
+                ok, why = self._confirm_sent(text, base_fail, base_own)
+                if ok:
+                    return True, why
+                # 只有"输入框仍留有内容"才能安全重来（说明没发出去）；
+                # 其它情况（气泡/界面不明）不重试，免得把消息发两遍。
+                if "输入框仍留有内容" not in why:
+                    return False, why
+                self.log("debug", f"快路径发送未确认（{why}），改用带校验的流程重试")
+                self._send_cache = None
+                # 盲点可能点到了别的控件（例如打开了表情面板）：先清一遍弹层，
+                # 再重读界面按残留处理，避免拼在新消息前面。
+                self._dismiss_blockers()
+                try:
+                    root = self._dump_fast()
+                    fresh_input = self._find_input(root)
+                    if fresh_input is not None:
+                        self._clear_chat_input(root)
+                        input_node = fresh_input
+                        input_bounds = self._bounds(fresh_input)
+                except AdbError:
+                    pass
+            elif point is not None:
+                self.log("debug", "纯注入广播未发出，改用带校验的注入流程")
+            # 3) 稳妥路径：注入并校验（这次 dump 同时用来找发送按钮），点完再确认
             self._focus_input(input_node)
             if not self.adb.input_text(text, verify=self.input_verifier(text)):
                 # 注入失败最常见的原因是"输入框没拿到输入连接"（点一下没生效、
@@ -1787,9 +1866,62 @@ class Xiaotiancai:
                 self.adb.keyevent(66)  # KEYCODE_ENTER
             else:
                 self._tap_send(send_node, send_root)
+                self._remember_send_point(input_bounds, send_node, send_root)
             return self._confirm_sent(text, base_fail, base_own)
         except AdbError as e:
             return False, f"ADB 异常: {e}"
+
+    # ---- 发送按钮坐标缓存（快路径用；布局变了就失效） ----
+    @staticmethod
+    def _same_bounds(a, b, tol: int = 12) -> bool:
+        """两处控件位置是否基本一致（允许 tol 像素误差）。"""
+        if not a or not b or len(a) != 4 or len(b) != 4:
+            return False
+        try:
+            return all(abs(int(x) - int(y)) <= tol for x, y in zip(a, b))
+        except (TypeError, ValueError):
+            return False
+
+    def _cached_send_point(self, input_bounds):
+        """缓存的发送按钮可点坐标；**仅当输入框位置与缓存时一致**才返回
+
+        为什么要这个判断：WSA 窗口能被缩放/最大化，布局一变，缓存下来的绝对坐标
+        可能落到别的控件上（例如"更多"）。位置对不上就返回 None，退回
+        "注入后 dump 找按钮"的稳妥流程，宁可慢一点也不乱点。
+
+        已知残余风险（可接受）：位置比对用的是**最近快照**，所以"刚缩放完窗口、还没
+        轮到下一次轮询 dump 就发消息"这一种情况仍可能按旧坐标点一次；点完的确认 dump
+        会发现没发出去，随后清掉缓存并退回稳妥流程（多余点开的弹层也会被清掉），
+        所以最坏是多花一次 dump，不会静默发错。
+        """
+        cache = self._send_cache
+        if not cache or not input_bounds:
+            return None
+        if not self._same_bounds(cache.get("input"), input_bounds):
+            return None
+        point = cache.get("point")
+        if not point:
+            return None
+        try:
+            w, h = self.adb.get_screen_size()
+            if not (0 <= int(point[0]) <= int(w) and 0 <= int(point[1]) <= int(h)):
+                return None
+        except Exception:  # noqa: BLE001 拿不到屏幕尺寸就不冒险
+            return None
+        return (int(point[0]), int(point[1]))
+
+    def _remember_send_point(self, input_bounds, send_node, root: ET.Element) -> None:
+        """记下这次点成功的发送按钮坐标（连同输入框位置），供下次快路径使用。"""
+        try:
+            target = send_node
+            if str(send_node.get("clickable", "")).lower() != "true":
+                target = self._clickable_ancestor(send_node, root) or send_node
+            center = self.adb.node_center(target) or self.adb.node_center(send_node)
+            if center and input_bounds:
+                self._send_cache = {"input": tuple(int(v) for v in input_bounds),
+                                    "point": (int(center[0]), int(center[1]))}
+        except Exception as e:  # noqa: BLE001 缓存失败不影响发送
+            self.log("debug", f"发送按钮坐标缓存失败: {e}")
 
     def _focus_input(self, edit) -> None:
         """点击输入框让它获得焦点，并等软键盘/输入连接就绪。
@@ -1803,12 +1935,16 @@ class Xiaotiancai:
         time.sleep(self._delay)
 
     def _confirm_sent(self, text: str, base_fail: list, base_own: dict) -> tuple[bool, str]:
-        """发送后确认（最多 3 次快速 dump，约 2s）。返回 (是否确认发出, 说明)。"""
+        """发送后确认（通常只 dump 一次，约 3 秒）。返回 (是否确认发出, 说明)。
+
+        第一次 dump 前先等 `_confirm_delay`：点发送后 App 要一点时间才把气泡画出来，
+        等太短会白 dump 一次（WSA 上一次 ~3 秒，白等就变成"发一条要十几秒"）。
+        后面几次只在前一次证据不足时才继续。
+        """
         last = "界面读取失败"
         base_fail_cnt = self._counter(base_fail)
         for i in range(3):
-            if i:
-                time.sleep(0.5)
+            time.sleep(self._confirm_delay if i == 0 else 0.5)
             try:
                 root = self._dump_fast()
             except AdbError as e:

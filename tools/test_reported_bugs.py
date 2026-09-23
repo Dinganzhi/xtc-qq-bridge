@@ -191,14 +191,16 @@ class ChatAdb(FakeAdb):
         self.tap_send_clears = tap_send_clears
         self.tap_send_fails = tap_send_fails
         self.fail_dump = False
+        self.input_bounds = "[40,1700][900,1800]"      # 可改：模拟窗口缩放/键盘弹出
+        self.send_bounds = "[920,1700][1060,1800]"
         self.set_ui(input_text=input_text, tip=tip)
 
     def set_ui(self, input_text: str = "", tip: str = "", bubble: str = "") -> None:
         nodes = n(cls="android.widget.EditText", text=input_text,
                   rid="com.xtc.watch:id/et_chat_text_content",
-                  bounds="[40,1700][900,1800]", focusable="true")
+                  bounds=self.input_bounds, focusable="true")
         nodes += n(cls="android.widget.TextView", text="发送",
-                   rid="com.xtc.watch:id/tv_send_view", bounds="[920,1700][1060,1800]")
+                   rid="com.xtc.watch:id/tv_send_view", bounds=self.send_bounds)
         if tip:
             nodes += n(cls="android.widget.TextView", text=tip,
                        rid="com.xtc.watch:id/tv_weichat_uninstall_hint",
@@ -240,6 +242,60 @@ class ChatAdb(FakeAdb):
 
     def _bubble(self) -> str:
         return self._node_text("chat_msg_item_content")
+
+
+class FastChatAdb(ChatAdb):
+    """带"dump 计数 + 纯注入"的聊天页假设备，用来验证发送快路径真的省下了 dump。"""
+
+    def __init__(self, **kw):
+        kw.setdefault("input_text", "")
+        super().__init__(**kw)
+        # 实机聊天页的组件名（包里带 chatlist，曾把 activity 快路径判否）
+        self.focus = "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatActivity"
+        self.dumps = 0
+        self.plain_injects = 0
+        self.sends = 0
+        self.blind_tap_sends = True     # False = 模拟"盲点没点中发送按钮"
+        self.set_ui(input_text=self._input(), tip=self._tip(), bubble=self._bubble())
+
+    def dump_ui(self, retries: int = 3, delay: float = 2.0):
+        self.dumps += 1
+        return super().dump_ui(retries, delay)
+
+    def input_text_plain(self, text, ensure_ime=True) -> bool:
+        self.plain_injects += 1
+        self.calls.append(f"input_text_plain {text}")
+        self.set_ui(input_text=text, tip=self._tip(), bubble=self._bubble())
+        return True
+
+    def input_text(self, text, verify=None, retries=0, ensure_ime=True) -> bool:
+        self.calls.append(f"input_text {text}")
+        self.set_ui(input_text=text, tip=self._tip(), bubble=self._bubble())
+        return True if verify is None else bool(verify())
+
+    def tap(self, x, y) -> None:
+        self.calls.append(f"tap {x},{y}")
+        if not self.blind_tap_sends:
+            return                      # 盲点没点中：输入框仍留有内容
+        self.sends += 1
+        self._apply_send()
+
+    def tap_element(self, node) -> None:
+        rid = node.get("resource-id", "")
+        self.calls.append(f"tap {rid}")
+        if not rid.endswith("tv_send_view"):
+            return
+        self.sends += 1
+        self._apply_send()
+
+    def _apply_send(self) -> None:
+        if self.tap_send_fails:
+            self.set_ui(input_text="", tip="网络异常，发送失败")
+        elif self.tap_send_clears:
+            self.set_ui(input_text="", bubble="刚发出的一条")
+
+    def _input(self) -> str:
+        return self._node_text("et_chat_text_content")
 
 
 def make_xtc(xml: str = "", focus: str = "com.xtc.watch/.MainActivity",
@@ -493,6 +549,121 @@ def test_send_result_is_honest() -> None:
     adb5.fail_dump = True
     xtc5 = Xiaotiancai(adb5, {"ui": {"interaction_delay": 0.1, "send_retries": 1}})
     check("界面读不到 -> 报发送失败（不谎报）", xtc5.send_message(text) is False)
+
+
+def test_send_speed_fast_path() -> None:
+    """用户报告：发一条要十几秒。根因是发送链路里 **dump 次数太多**（WSA 上一次约 3 秒）。
+
+    旧链路每发一条要 dump 5 次左右：聊天页 Activity 名被判否（包名 chatlist 含 list）
+    → `is_in_chat()` 先 dump 一次；发送前再 dump 一次；注入后 dump 一次做校验；
+    找发送按钮（这次已经复用）；点完再 dump 1~2 次确认。
+    现在：Activity 名按类名判断（0 次）+ 复用轮询刚 dump 的快照（0 次）+
+    布局没变时直接广播注入并点缓存的发送按钮坐标（0 次）+ 确认 1 次 = **1 次**。
+    """
+    text = "晚上回家吃饭"
+
+    # ① Activity 名按**类名**判断：实机包名 chatlist 里的 "list" 不能再把聊天页判否
+    adb = FakeAdb(chat_page_xml(),
+                  "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatActivity")
+    xtc = Xiaotiancai(adb, {"ui": {}}, logger=None)
+    check("包名含 chatlist 的 ChatActivity 算聊天页", xtc._activity_is_chat(adb.focus) is True)
+    check("is_in_chat 走 Activity 快路径（不用 dump）",
+          xtc.is_in_chat() is True and not adb.calls, str(adb.calls))
+    xtc2 = Xiaotiancai(FakeAdb("", "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatListActivity"),
+                       {"ui": {}}, logger=None)
+    check("真正的消息列表 Activity（类名含 List）仍排除",
+          xtc2._activity_is_chat("com.xtc.watch/com.xtc.wechat.view.chatlist.ChatListActivity")
+          is False)
+
+    # ② 首次发送（还没有按钮坐标）走稳妥流程，之后记住坐标
+    adb2 = FastChatAdb()
+    xtc3 = Xiaotiancai(adb2, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
+                       logger=None)
+    check("首次发送成功", xtc3.send_message(text) is True)
+    first_dumps = adb2.dumps
+    check("首次发送记住发送按钮坐标", xtc3._send_cache is not None, str(xtc3._send_cache))
+
+    # ③ 第二次发送：复用快照 + 快路径 -> 只要 1 次 dump
+    adb2.dumps = 0
+    adb2.plain_injects = 0
+    adb2.sends = 0
+    ok = xtc3.send_message("第二条消息")
+    check("第二次发送成功", ok is True)
+    check("第二次发送只 dump 1 次（旧实现 4~5 次）", adb2.dumps == 1, f"dumps={adb2.dumps}")
+    check("快路径用纯广播注入（不做注入校验）", adb2.plain_injects == 1,
+          f"plain_injects={adb2.plain_injects}")
+    check("确实点到了发送按钮（不是盲点空转）", adb2.sends == 1, f"sends={adb2.sends}")
+    check("首次发送的 dump 次数也没有变多", first_dumps <= 3, f"first_dumps={first_dumps}")
+
+    # ④ 布局变了（WSA 窗口缩放/键盘顶起输入框）-> 不许按旧坐标盲点，退回稳妥流程。
+    #    轮询会持续 dump，所以布局变化会体现在下一份快照里；这里手动模拟那次 dump。
+    adb3 = FastChatAdb()
+    xtc4 = Xiaotiancai(adb3, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
+                       logger=None)
+    xtc4.send_message(text)
+    adb3.input_bounds = "[40,1500][900,1600]"     # 输入框整体上移 200px
+    adb3.send_bounds = "[920,1500][1060,1600]"
+    adb3.set_ui(input_text="", tip="", bubble="")
+    xtc4._dump_fast()                             # 轮询读到新布局
+    adb3.dumps = 0
+    adb3.plain_injects = 0
+    ok4 = xtc4.send_message("第三条消息")
+    check("布局变了仍能发出", ok4 is True)
+    check("布局变了不按旧坐标盲点（走带校验的稳妥流程）", adb3.plain_injects == 0,
+          f"plain_injects={adb3.plain_injects}")
+    check("布局变了会重新 dump 找按钮", adb3.dumps >= 2, f"dumps={adb3.dumps}")
+
+    # ⑤ 快路径点偏了（输入框仍留有内容）-> 退回稳妥流程重发，且**只发一条**
+    adb5 = FastChatAdb()
+    xtc5 = Xiaotiancai(adb5, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
+                       logger=None)
+    xtc5.send_message(text)                        # 先缓存坐标
+    adb5.blind_tap_sends = False                   # 之后盲点不再生效
+    adb5.sends = 0
+    ok5 = xtc5.send_message("第四条消息")
+    check("快路径点偏后仍能发出", ok5 is True)
+    check("只发出一条（没有重复发送）", adb5.sends == 1, f"sends={adb5.sends}")
+
+
+def test_recent_snapshot_window() -> None:
+    """最近快照复用：有效期内可用、过期/关闭就返回 None（调用方自己 dump）。"""
+    adb = FakeAdb(chat_page_xml(), "com.xtc.watch/.ChatActivity")
+    xtc = Xiaotiancai(adb, {"ui": {"snapshot_reuse": 3.0}}, logger=None)
+    check("还没读过界面 -> 没有快照", xtc.recent_snapshot() is None)
+    xtc._dump_fast()
+    check("刚 dump 完可以复用", xtc.recent_snapshot() is not None)
+    xtc._snapshot_ts -= 5.0
+    check("超过 3 秒不再复用", xtc.recent_snapshot() is None)
+    xtc2 = Xiaotiancai(adb, {"ui": {"snapshot_reuse": 0}}, logger=None)
+    xtc2._dump_fast()
+    check("snapshot_reuse=0 表示不复用（改动可关）", xtc2.recent_snapshot() is None)
+
+
+def test_plain_injection_skips_dump() -> None:
+    """纯注入（input_text_plain）只发广播、不 dump：省下的就是发送链路里的 3 秒。"""
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    cmds: list = []
+    dumps = {"n": 0}
+    ctl._adbkeyboard_ready = lambda: True
+    ctl._adbkeyboard_active = lambda: True
+    ctl.shell = lambda cmd, timeout=None: (cmds.append(cmd), "")[1]
+    ctl.dump_ui = lambda *a, **k: dumps.__setitem__("n", dumps["n"] + 1)
+
+    check("纯注入返回成功", ctl.input_text_plain("你好") is True)
+    check("发的是 ADBKeyBoard 明文广播",
+          any("ADB_INPUT_TEXT" in c for c in cmds), str(cmds))
+    check("纯注入不做界面校验（0 次 dump）", dumps["n"] == 0, str(dumps))
+
+    ctl._adbkeyboard_b64_ok = True      # 上次明文广播被吞过 -> 记住走 base64
+    cmds.clear()
+    ctl.input_text_plain("你好")
+    check("记住 base64 通道后改走 B64",
+          any("ADB_INPUT_B64" in c for c in cmds), str(cmds))
+
+    ctl._adbkeyboard_ready = lambda: False
+    check("输入法没就绪时返回 False（调用方会退回带校验的流程）",
+          ctl.input_text_plain("你好") is False)
 
 
 def test_confirm_sent_rule() -> None:
@@ -2293,7 +2464,8 @@ def main() -> int:
     for fn in (test_history_source_tags, test_history_source_from_plugin_payload,
                test_command_not_repeated, test_login_detection,
                test_password_field_masked, test_login_progress_not_failure,
-               test_send_result_is_honest, test_confirm_sent_rule,
+               test_send_result_is_honest, test_send_speed_fast_path,
+               test_recent_snapshot_window, test_plain_injection_skips_dump, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

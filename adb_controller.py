@@ -1465,6 +1465,38 @@ class ADBController:
         return False
 
     # ---------------------------------------------------- 各注入通道
+    def input_text_plain(self, text: str, ensure_ime: bool = True) -> bool:
+        """只把文本广播给输入框（**不做** UI 校验），返回广播是否发出。
+
+        用途：发送快路径。校验要 dump 一次界面（WSA 上 ~3 秒），而"点发送之后"
+        那次确认 dump 本身是更强的证据（气泡里出现这段文本 = 注入成功 + 发送成功）。
+        所以快路径先不校验，直接点发送，再一次 dump 统一确认；没确认成功时调用方
+        会退回 `input_text()`（带校验的完整策略链，含重新聚焦）重试。
+
+        走上次成功的通道（`_adbkeyboard_b64_ok`）：明文广播在个别镜像上会被 am 的
+        UTF-8 参数问题吞掉，那时改用 base64 通道。
+        """
+        if not text:
+            return True
+        try:
+            if not self._adbkeyboard_ready():
+                return False
+            if ensure_ime and not self._adbkeyboard_active():
+                self.logger.info("ADBKeyBoard 不是当前输入法，正在切换...")
+                self.set_default_ime(ADBKEYBOARD_IME)
+                time.sleep(0.8)
+            if self._adbkeyboard_b64_ok:
+                b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                self.shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64}", timeout=20)
+            else:
+                self.shell(f"am broadcast -a ADB_INPUT_TEXT --es msg {self._sh_quote(text)}",
+                           timeout=20)
+            time.sleep(_TEXT_RETRY_SLEEP)
+            return True
+        except AdbError as e:
+            self.logger.debug(f"纯注入广播失败: {e}")
+            return False
+
     def _input_via_adbkeyboard(self, text: str, verify, ensure_ime: bool = True) -> bool:
         if not self._adbkeyboard_ready():
             return False

@@ -360,6 +360,9 @@ xiaotiancai:
     send_texts: ["发送"]
     interaction_delay: 0.6                   # 点击/输入之间的等待（秒）
     send_retries: 2                          # 发送确认失败时的重试轮数
+    fast_send: true                          # 布局没变时走快路径（省 1 次 dump，见"发送速度"）
+    snapshot_reuse: 3.0                      # 复用最近界面快照的秒数（0 = 不复用）
+    confirm_delay: 0.45                      # 点发送后等多久再 dump 确认
     send_fail_markers: ["发送失败", "网络异常", ...]
     popup_skip_texts: ["以后再说", "不更新", ...]      # 弹窗点这些跳过（含更新/活动/自研弹窗）
     popup_block_texts: ["立即安装", "立即更新", ...]   # 危险按钮，自动关弹窗时绝不点
@@ -631,7 +634,7 @@ python tools/wsa_net_guard.py --test
 | **自动登录不生效** | (1) 看日志有没有 `检测到小天才未登录，触发自动登录`；(2) 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；(3) 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；(4) 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
 | **明明在登录中却提示"登录失败"** | 已修复：出现"登录中/正在验证/请稍候"等进度文案时**一律不判失败**；只有明确的账号/密码错误才算失败，网络类临时问题按"超时->稍后重试"处理。若仍误报，把该文案加进 `xiaotiancai.ui.login_progress_markers` |
 | **发送提示失败但其实发不出去 / 提示成功却没发出** | 已修复：只有"输入框已清空且无新的失败提示"或"出现新的己方气泡"才回「发送成功」；读不到界面、出现"发送失败/网络异常"、输入框仍有残留 -> 如实回「发送失败」。若你的机型提示语不同，补充 `xiaotiancai.ui.send_fail_markers` |
-| **按按钮/发送很慢** | 已优化：UI dump 一次 shell 完成"落盘+读回+删文件"（交互路径 retries=2/delay=0.3）、发送时复用注入校验的快照、前台组件与登录态缓存、交互等待变短。设备本身慢可调大 `xiaotiancai.ui.interaction_delay`（0.6 -> 1.0）；网络差可减小 |
+| **按按钮/发送很慢（发一条十几秒）** | 已优化：发送链路的 dump 次数从 4~5 次降到 **1 次**（Activity 名按类名判断、复用轮询的界面快照、布局没变时走快路径直接点缓存的发送按钮坐标、确认只 dump 一次）——见「5. 发送结果确认与发送速度」。每次 dump 本身在 WSA 上就要 3~4 秒，所以要更快只能减少 dump 次数；`ui.fast_send: false` 可关掉快路径 |
 | **控制台看不到收到的命令** | INFO 级别下应当能看到 `[QQ回调] 收到 …`、`[收到QQ命令] …`、`[收到小天才命令] …`、`[收到小天才消息] …`、`[QQ->小天才] 发送成功/失败`。看不到时：(1) 确认 `logging.level: INFO`；(2) 确认命令真的到了（QQ 侧看插件日志，小天才侧看界面）；(3) 中文 Windows 控制台编码问题已兜底（不会再整条丢失） |
 | **已经启动了 App 还重复启动** | 已修复：`launch()` 先判断前台，已在前台直接返回，不执行任何启动命令；`/小天才 初始化` 也改成按需执行 |
 | **明明在聊天页，却提示"在消息列表找不到联系人"** | 已修复：聊天页判定不再只看 Activity 名（`endswith("chatactivity")`），改为"Activity 名含 chat 且不含 list/main/watchmsg"**或**界面出现消息气泡/输入栏；另外 `open_chat` 进来会先确认一次界面特征，已经在聊天页就直接返回，不再去列表里找联系人 |
@@ -764,13 +767,13 @@ python tools/wsa_net_guard.py --test
 - 手动安装：`adb install -r keyboardservice-debug.apk && adb shell ime enable com.android.adbkeyboard/.AdbIME && adb shell ime set com.android.adbkeyboard/.AdbIME`
 - 排查：`python main.py --debug adb-info` 会打印当前输入法、软键盘是否显示、剪贴板通道是否可用。
 
-## 5. 发送结果确认（为什么不再"假成功"）
+## 5. 发送结果确认（为什么不再"假成功"）+ 发送速度
 
 `Xiaotiancai.send_message()` 的判定顺序：
 
 1. 发送前记录基线：界面上原有的"发送失败"类提示（`send_fail_markers`）与已有己方气泡计数；
 2. 注入文本 -> 点发送按钮（找不到按钮就回车）；
-3. 最多 3 次快速 dump 复核：
+3. 最多 3 次快速 dump 复核（**通常只 dump 1 次**）：
    - 出现**新的**失败提示 -> 失败（旧提示不算，避免历史残留误报）；
    - 出现**新的**、包含该文本的己方消息气泡 -> 成功（最强证据）；
    - 输入框里**仍留有**这段文本 -> 失败；
@@ -780,9 +783,27 @@ python tools/wsa_net_guard.py --test
 重试策略：只有"输入框仍留有内容"（点击发送没生效）才安全重发，最多 `ui.send_retries` 轮；
 "读不到界面"绝不重发，避免重复消息。
 
-速度优化：UI dump 一次 shell 调用完成"落盘 -> `cat` 读回 -> 删文件"（失败再回退 `/dev/tty`
-或换目录）；交互路径用 `retries=2, delay=0.3` 的快速 dump；发送时"注入校验"的界面快照
-会复用给"找发送按钮"（省一次 dump）；前台组件与登录态都带短缓存；等待时间由
+**发送速度：关键在"数 dump 次数"**（WSA 上一次 uiautomator dump 实测 3~4 秒）。
+用户报过"发一条要十几秒"，实测每条的耗时构成就是 dump 次数 × 3~4 秒 + 固定等待：
+
+| 环节 | 旧实现 | 现在 |
+|---|---|---|
+| 判断"在不在聊天页"（`is_in_chat`） | 1 次 dump：实机组件是 `com.xtc.wechat.view.chatlist.ChatActivity`，**包名里的 `chatlist` 含 "list"** 被排除，只能再 dump 界面判断 | 0 次：Activity 名改成只看**类名**（`ChatActivity`），不再被包名误伤 |
+| 发送前读界面（基线/输入框位置） | 1 次 dump | 0 次：复用轮询每 2 秒 dump 的那份快照（`ui.snapshot_reuse`，默认 3 秒内有效） |
+| 注入后校验 + 找发送按钮 | 1 次 dump | 0 次（快路径）：布局没变时直接广播注入 + 点**缓存的发送按钮坐标**，把"注入成功"交给下一步的确认 dump 一起证明（气泡里出现这段文本 = 注入与发送都成立） |
+| 点发送后确认 | 1~2 次 dump（第一帧还没画出来就白 dump 一次） | 1 次：先等 `ui.confirm_delay`（0.45s）让气泡画出来再 dump |
+| **合计** | **4~5 次 ≈ 20 秒+**（还与轮询抢锁，实测 22~23 秒） | **1 次 ≈ 4~5 秒**（首次发送或布局变化后走稳妥流程，约 2 次） |
+
+安全边界（快路径不是"盲发"）：
+- 只有**输入框位置与缓存时一致**（±12px）才用缓存坐标；WSA 窗口被缩放/最大化后位置对不上，
+  自动退回"注入并校验"的稳妥流程（绝不按旧坐标乱点）；
+- 布局在"最近快照"之后才变的那一瞬仍可能点偏一次：点完的确认 dump 会发现没发出去，
+  于是清掉缓存、先清弹窗再退回稳妥流程重发，最多多花一次 dump，**不会重复发送**
+  （只有"输入框仍留有内容"才允许重发）；
+- `ui.fast_send: false` 可以彻底关掉快路径，回到每次注入都校验的流程。
+
+速度优化（其他）：UI dump 一次 shell 调用完成"落盘 -> `cat` 读回 -> 删文件"（失败再回退 `/dev/tty`
+或换目录）；交互路径用 `retries=2, delay=0.3` 的快速 dump；前台组件与登录态都带短缓存；等待时间由
 `ui.interaction_delay` 控制。
 
 **UI dump 的三种方案与可读报错**（`adb_controller._dump_strategies` / `_dump_ui_locked`）：
