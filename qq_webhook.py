@@ -95,9 +95,10 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
             group = str(data.get("group_id") or "")
             action = str(data.get("action") or "")
             request_id = str(data.get("request_id") or "")
+            raw_msg = str(data.get("message") or data.get("raw_message") or "").strip()
+            preview = raw_msg[:120]
             kind = (f"动作={_ACTION_NAMES.get(action, action)}" if action
                     else ("OneBot上报" if data.get("post_type") == "message" else "消息"))
-            preview = str(data.get("message") or data.get("raw_message") or "")[:120]
             _log(logger, "info",
                  f"[QQ回调] 收到 {kind} 来源={_where(user, group)}"
                  + (f" 内容={preview!r}" if preview else "")
@@ -105,7 +106,7 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
 
             message = extract_message(data, bridge, logger)
             if message:
-                # 白名单已在 extract_message 内校验（拒绝时会写日志）
+                # 白名单已在校验与 extract_message 里做过（拒绝时已写日志）
                 _log(logger, "info", f"[QQ回调] 放行 -> 转发到小天才（来源={_where(user, group)}）")
                 threading.Thread(
                     target=bridge.forward_to_xiaotiancai,
@@ -114,12 +115,12 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                 ).start()
                 self._send(200, b"OK")
                 return
-            if data.get("post_type") == "message" or data.get("source") == "astrbot":
-                _log(logger, "info",
-                     f"[QQ回调] 未转发（空消息或来源不在白名单）：来源={_where(user, group)}")
-                self._send(200, b"IGNORED")
-                return
 
+            # 动作类请求（历史消息/登录/初始化/自动登录）**必须在"空消息"分支之前分派**：
+            # 插件转发也带 action 且 message 为空，旧代码先撞上
+            # `post_type == "message" or source == "astrbot"` 那个分支直接 return，
+            # 于是 QQ 侧 /小天才 历史消息 永远不执行，日志还甩锅给白名单
+            # （实机：收到 动作=历史消息 -> 未转发（空消息或来源不在白名单））。
             if action:
                 if not bridge.qq_sender_allowed(user, group):
                     _log(logger, "warning",
@@ -157,6 +158,21 @@ def create_webhook_server(bridge, host: str = "127.0.0.1", port: int = 5000,
                 else:
                     _log(logger, "warning", f"[QQ回调] 未知动作: {action}（已忽略）")
                     self._send(200, b"IGNORED")
+                return
+
+            if data.get("post_type") == "message" or data.get("source") == "astrbot":
+                # 走到这里只有两种情况：消息是空的（图片/回环/纯命令），
+                # 或者"有内容但没通过白名单"（extract_message 已打过白名单那行日志）。
+                # 旧代码把两种情况都写成"空消息或来源不在白名单"，把用户误导成白名单没配好。
+                if raw_msg:
+                    _log(logger, "info",
+                         f"[QQ回调] 未转发：来源={_where(user, group)} 不在白名单"
+                         "（webhook.allow_from / allow_groups）")
+                else:
+                    _log(logger, "info",
+                         f"[QQ回调] 未转发：来源={_where(user, group)} 没有可转发的内容"
+                         "（动作/命令已单独处理，或消息为空）")
+                self._send(200, b"IGNORED")
                 return
 
             _log(logger, "info", "[QQ回调] 事件不含要转发的消息（已忽略）")
@@ -197,12 +213,25 @@ if __name__ == "__main__":
     class _Fake:
         cfg = {"target": {"qq_private": "123"}, "webhook": {}}
 
-        def qq_sender_allowed(self, qq, group):
+        def qq_sender_allowed(self, qq, group=""):
             return True
 
-        def forward_to_xiaotiancai(self, text):
+        def forward_to_xiaotiancai(self, text, user="", group="", request_id=""):
             print(f"[假转发] {text}")
             return True
+
+        # 动作类请求的桩：独立调试时不会因为缺方法把请求打成 500
+        def login_xiaotiancai(self, request_id=""):
+            print("[假登录]")
+
+        def toggle_auto_login(self, request_id=""):
+            print("[假自动登录开关]")
+
+        def init_xiaotiancai(self, request_id=""):
+            print("[假初始化]")
+
+        def fetch_xtc_history(self, count=20, request_id="", into_chat=False, source=""):
+            print(f"[假历史消息] {count} 条 {source}")
 
     srv = create_webhook_server(_Fake(), token="")
     print("测试服务运行中: http://127.0.0.1:5000/qq_callback （Ctrl+C 退出）")

@@ -279,13 +279,25 @@ class Main(star.Star):
                              action: str = "", timeout: float = 90,
                              extra: dict | None = None) -> str | None:
         """POST 到桥接并挂起等待 /api/result 回传（引用+@ 回复用）。
-        extra: 额外字段（如 history_count）合并进 payload。"""
+        extra: 额外字段（如 history_count）合并进 payload。
+
+        桥接的**立即响应**也会被检查：`OK` = 已受理（继续等结果），
+        其它（IGNORED / unauthorized / 连不上）= 明确没受理，直接告诉用户，
+        否则用户只会干等超时、还看不出是白名单还是桥接没起来。
+        """
         req_id = self._new_request_id()
         payload = self._base_payload(event, message=message, action=action)
         payload["request_id"] = req_id
         if extra:
             payload.update(extra)
-        await self._forward_to_python(payload)
+        resp = await self._forward_to_python(payload)
+        if resp.startswith("ERROR:"):
+            return (f"桥接未连接：{resp[6:].strip()[:100]}"
+                    "（确认 python main.py 正在运行，且插件 python_callback_url 端口一致）")
+        if resp and resp != "OK":
+            return (f"桥接未受理（{resp[:40]}）：多为 config.yaml -> webhook 的"
+                    "allow_from / allow_groups 不含当前会话，或 token 不一致；"
+                    "详见桥接控制台日志")
         fut = asyncio.get_running_loop().create_future()
         self._pending_replies[req_id] = fut
         try:
@@ -335,25 +347,31 @@ class Main(star.Star):
                 return False
         return True
 
-    async def _forward_to_python(self, payload: dict) -> None:
+    async def _forward_to_python(self, payload: dict) -> str:
+        """转发到 Python 桥接，返回它的**响应体**（'OK'/'IGNORED'/... 失败时 'ERROR: ...'）。
+
+        返回值给 _post_and_wait 用来判断"桥接到底受理了没有"：以前只看发送是否抛异常，
+        桥接回 IGNORED（比如动作类请求被吞掉、白名单不含当前会话）时用户要干等超时。
+        """
         url = self.config.get(
             "python_callback_url", "http://127.0.0.1:5000/qq_callback"
         )
         token = self.config.get("python_callback_token", "")
         try:
-            await asyncio.to_thread(self._http_post, url, payload, token)
+            return await asyncio.to_thread(self._http_post, url, payload, token)
         except Exception as e:  # noqa: BLE001
             self._lg().warning(f"[xtc_qq_bridge] 转发到 Python 桥失败: {e}")
+            return f"ERROR: {e}"
 
     @staticmethod
-    def _http_post(url: str, payload: dict, token: str) -> None:
+    def _http_post(url: str, payload: dict, token: str) -> str:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if token:
             headers["X-Bridge-Token"] = token
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=5) as r:
-            r.read()
+            return r.read().decode("utf-8", "replace").strip()
 
     # ------------------------------------------------------------------ Python -> QQ
     def _start_http(self) -> None:

@@ -1284,6 +1284,217 @@ def test_webhook_logs_and_forwards() -> None:
         srv.shutdown()
 
 
+def test_webhook_action_requests_reach_bridge() -> None:
+    """QQ 侧 /小天才 历史消息（动作类回调）必须真的被执行到桥接里。
+
+    用户报告："发历史消息提示群不在白名单，明明我添加了"。真因（实机日志）：
+    插件转发带 source=astrbot 且 message 为空，而 qq_webhook 的"空消息"分支写在
+    action 分派**之前**就 return 了 —— 于是历史消息/登录/初始化/自动登录在插件路径下
+    全部被吞掉，日志还把原因写成"未转发（空消息或来源不在白名单）"，误导成白名单问题。
+    """
+    import qq_webhook as wh_mod
+
+    logs: list = []
+
+    class _Log:
+        def info(self, m):
+            logs.append(("info", str(m)))
+
+        def warning(self, m):
+            logs.append(("warning", str(m)))
+
+        def error(self, m):
+            logs.append(("error", str(m)))
+
+        def debug(self, m):
+            logs.append(("debug", str(m)))
+
+    class _Bridge:
+        def __init__(self, allow: bool = True):
+            self.allow = allow
+            self.history: list = []
+            self.actions: list = []
+
+        def qq_sender_allowed(self, qq, group=""):
+            if not self.allow:
+                self.actions.append("拒绝")
+            return self.allow
+
+        def forward_to_xiaotiancai(self, text, user="", group="", request_id=""):
+            self.actions.append(("转发", text))
+            return True
+
+        def fetch_xtc_history(self, count=20, request_id="", into_chat=False, source=""):
+            self.history.append((count, request_id, into_chat, source))
+
+        def login_xiaotiancai(self, request_id=""):
+            self.actions.append(("登录", request_id))
+
+        def toggle_auto_login(self, request_id=""):
+            self.actions.append(("自动登录", request_id))
+
+        def init_xiaotiancai(self, request_id=""):
+            self.actions.append(("初始化", request_id))
+
+    def post(port: int, payload: dict) -> str:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/qq_callback", data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read().decode()
+
+    def wait_for(pred, timeout: float = 2.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return False
+
+    bridge = _Bridge()
+    srv = wh_mod.create_webhook_server(bridge, host="127.0.0.1", port=0,
+                                       token="", logger=_Log())
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        # ① 插件路径的"历史消息"动作：必须落到 fetch_xtc_history，并且返回 OK
+        body = post(port, {"source": "astrbot", "action": "history", "user_id": "",
+                           "group_id": "472805002", "history_count": 5,
+                           "history_source": "QQ群 472805002", "request_id": "req-1"})
+        ok = wait_for(lambda: bool(bridge.history))
+        check("插件路径的历史消息动作被执行",
+              ok and bridge.history[0] == (5, "req-1", False, "QQ群 472805002"),
+              f"body={body.strip()} history={bridge.history}")
+        check("历史消息动作返回 OK（不是 IGNORED）", body.strip() == "OK", body.strip())
+        check("不再把动作请求说成白名单问题",
+              not any("不在白名单" in m for _, m in logs), str([m for _, m in logs]))
+
+        # ② 其他动作同样可达
+        for act, name in (("login", "登录"), ("auto_login", "自动登录"), ("init", "初始化")):
+            before = len(bridge.actions)
+            b = post(port, {"source": "astrbot", "action": act, "user_id": "10001",
+                            "request_id": f"req-{act}"})
+            wait_for(lambda: len(bridge.actions) > before)
+            check(f"动作 {act} 被执行",
+                  any(a[0] == name for a in bridge.actions[before:]), str(bridge.actions[before:]))
+            check(f"动作 {act} 返回 OK", b.strip() == "OK", b.strip())
+
+        # ③ 真的不在白名单：返回 IGNORED，且日志说明是白名单
+        bridge2 = _Bridge(allow=False)
+        srv2 = wh_mod.create_webhook_server(bridge2, host="127.0.0.1", port=0,
+                                            token="", logger=_Log())
+        port2 = srv2.server_address[1]
+        threading.Thread(target=srv2.serve_forever, daemon=True).start()
+        try:
+            logs.clear()
+            b2 = post(port2, {"source": "astrbot", "action": "history", "user_id": "999",
+                              "group_id": "111", "request_id": "req-x"})
+            check("白名单外的动作返回 IGNORED", b2.strip() == "IGNORED", b2.strip())
+            check("白名单外的动作不会被执行", not bridge2.history, str(bridge2.history))
+            check("白名单外仍只提示白名单原因",
+                  any("不在白名单" in m for _, m in logs), str([m for _, m in logs]))
+
+            # ⑤ 有内容但白名单外：同样只能说白名单，不能说"没有可转发的内容"
+            logs.clear()
+            b2b = post(port2, {"source": "astrbot", "message": "你好", "user_id": "999",
+                               "group_id": "111"})
+            check("白名单外的普通消息返回 IGNORED", b2b.strip() == "IGNORED", b2b.strip())
+            check("白名单外的普通消息提示白名单原因",
+                  any("不在白名单" in m for _, m in logs)
+                  and not any("没有可转发的内容" in m for _, m in logs),
+                  str([m for _, m in logs]))
+        finally:
+            srv2.shutdown()
+
+        # ④ 白名单允许但内容为空：日志说明"没有可转发的内容"，不再甩锅白名单
+        logs.clear()
+        b3 = post(port, {"source": "astrbot", "message": "", "user_id": "10001"})
+        check("空消息返回 IGNORED", b3.strip() == "IGNORED", b3.strip())
+        check("允许的空消息提示「没有可转发的内容」",
+              any("没有可转发的内容" in m for _, m in logs), str([m for _, m in logs]))
+        check("允许的空消息不再提白名单",
+              not any("不在白名单" in m for _, m in logs), str([m for _, m in logs]))
+    finally:
+        srv.shutdown()
+
+
+def test_history_action_end_to_end() -> None:
+    """完整链路：QQ(插件) --action=history--> qq_webhook --> 工作线程 --> /api/result 回传。
+
+    用**真的** MessageBridge（不只假桥）跑一遍，确保用户那条
+    "/小天才 历史消息" 真能拿到内容并回到 QQ。
+    """
+    import qq_webhook as wh_mod
+
+    class _Silent:
+        def info(self, m):
+            pass
+
+        def warning(self, m):
+            pass
+
+        def error(self, m):
+            pass
+
+        def debug(self, m):
+            pass
+
+    class _Fwd:
+        def __init__(self):
+            self.replies: list = []
+
+        def reply_result(self, request_id, text):
+            self.replies.append((request_id, text))
+            return True
+
+    root = tmp_root()
+    srv = None
+    rec = Recorder()
+    try:
+        cfg = {"target": {"xtc_contact": "张三"},
+               "xiaotiancai": {"ui": {}},
+               "webhook": {"allow_groups": ["472805002"], "allow_from": ["10001"]}}
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=None, logger=rec)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        fwd = _Fwd()
+        br.forwarder = fwd
+        br.msgs.append("xtc", "屑猹不喝茶", "晚安", source="手表-屑猹不喝茶")
+        br.msgs.append("qq", "张三", "吃饭了", source="QQ群 472805002")
+        br.running = True     # _job_worker 是 while self.running 的（真实启动由 br.start() 置位）
+        threading.Thread(target=br._job_worker, daemon=True, name="test-jobs").start()
+
+        srv = wh_mod.create_webhook_server(br, host="127.0.0.1", port=0,
+                                           token="", logger=_Silent())
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        data = json.dumps({"source": "astrbot", "action": "history", "user_id": "10001",
+                           "group_id": "472805002", "history_count": 5,
+                           "request_id": "req-e2e"}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/qq_callback", data=data,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = r.read().decode()
+        check("动作回执 OK", body.strip() == "OK", body.strip())
+
+        end = time.time() + 3
+        while time.time() < end and not fwd.replies:
+            time.sleep(0.02)
+        check("历史消息结果回传到 /api/result", bool(fwd.replies),
+              f"replies={fwd.replies} logs={rec.lines[-4:]}")
+        if fwd.replies:
+            rid, text = fwd.replies[0]
+            check("回传带上了原 request_id", rid == "req-e2e", rid)
+            check("回传内容是小天才历史消息", "小天才历史消息" in text, text[:80])
+            check("内容里能看到真实记录", ("晚安" in text) and ("吃饭了" in text), text[:200])
+    finally:
+        if srv is not None:
+            srv.shutdown()
+        cleanup(root)
+
+
 def test_logger_tolerant_stream() -> None:
     """GBK 控制台遇到无法编码的字符（emoji / 特殊符号）时不能整条日志丢失。
 
@@ -2099,6 +2310,7 @@ def main() -> int:
                test_input_hint_text_is_not_residue,
                test_foreground_logic_two_layers,
                test_auto_login_retry_semantics, test_webhook_logs_and_forwards,
+               test_webhook_action_requests_reach_bridge, test_history_action_end_to_end,
                test_find_send_ignores_message_state_icon, test_content_desc_exact_match,
                test_time_label_is_per_message, test_time_labels_survive_compressed_dump,
                test_dump_prefers_full_hierarchy, test_latest_message_retries_when_labels_missing,

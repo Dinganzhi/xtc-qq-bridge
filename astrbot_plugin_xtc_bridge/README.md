@@ -57,6 +57,9 @@ Python 桥(小天才侧)  --POST /api/forward-->  插件(本目录)  --context.s
 
 - 命令白名单：插件配置 `allow_senders` / `allow_groups` 为可选前置过滤；
   最终闸门在 Python 侧 `config.yaml -> webhook.allow_from`（私聊）/ `allow_groups`（群聊）。
+- 桥接的**立即响应**会被检查：`OK` = 已受理（继续等 `/api/result` 结果）；
+  `IGNORED`（白名单不含当前会话、动作未知）或连不上桥接时会**马上回话**说明原因，
+  不会再让你干等几十秒到超时。
 - 主动发送依赖平台 ID：若插件日志报「无法确定平台 ID」，按上面第 3 步处理。
 - 插件更新：仓库根目录 `astrbot_plugin_xtc_bridge/` 是唯一源码，改完复制本目录 4 个文件
   （`main.py` / `metadata.yaml` / `_conf_schema.json` / `README.md`）到插件目录并重载插件。
