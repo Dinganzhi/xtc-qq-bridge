@@ -666,6 +666,123 @@ def test_plain_injection_skips_dump() -> None:
           ctl.input_text_plain("你好") is False)
 
 
+def test_ime_check_is_cached() -> None:
+    """注入每条消息都要问一次"ADBKeyBoard 是不是当前输入法"（一次 adb shell 0.18s）。
+
+    实测：这条链路上真正的 adb 开销只有 ~0.4s（settings 查询 0.18 + 广播 0.23），
+    所以能省就省；IME 不会自己变，缓存 60 秒，切输入法/注入失败时作废。
+    """
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    cmds: list = []
+    ctl.shell = lambda cmd, timeout=None: (cmds.append(cmd), "com.android.adbkeyboard/.AdbIME")[1]
+    check("第一次查询命中", ctl._adbkeyboard_active() is True)
+    n1 = len(cmds)
+    check("第二次走缓存（不再起 adb 进程）",
+          ctl._adbkeyboard_active() is True and len(cmds) == n1, str(cmds))
+    ctl.invalidate_ime_state()
+    ctl._adbkeyboard_active()
+    check("失效后重新查询", len(cmds) == n1 + 1, str(cmds))
+    # 换了输入法 -> 返回 False（调用方会去切回 ADBKeyBoard）
+    ctl.shell = lambda cmd, timeout=None: "com.android.inputmethod.pinyin/.InputService"
+    ctl.invalidate_ime_state()
+    check("当前不是 ADBKeyBoard 时返回 False", ctl._adbkeyboard_active() is False)
+
+
+def test_launch_app_skips_hard_failures_fast() -> None:
+    """启动策略"硬失败"（not exported / SecurityException）要立刻换下一套。
+
+    实机 WSA 实测：`am start -a MAIN/LAUNCHER` 根本起不来（12 秒都到不了前台），
+    而旧实现给每个策略 25 秒前台等待 —— 撞上它就白等 25 秒，这正是
+    "发一条要十几秒"里的一段。现在单策略最多等 6 秒，且命令自己报错就立刻换。
+    """
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    ctl.package_installed = lambda pkg: True
+    ctl.is_in_foreground = lambda pkg, use_cache=True: False
+    ctl.resolve_launcher_activity = lambda pkg: ".MainActivity"
+
+    tried: list = []
+
+    def shell(cmd, timeout=None):
+        tried.append(cmd.split()[0] + " " + (cmd.split()[1] if len(cmd.split()) > 1 else ""))
+        if cmd.startswith("am start -n"):
+            # 模拟"这个 activity 不导出"的硬失败
+            return ("Starting: Intent { cmp=com.xtc.watch/.MainActivity }\n"
+                    "java.lang.SecurityException: Permission Denial: starting Intent "
+                    "{ ... } not exported from uid 10087")
+        return "Events injected: 1"
+
+    ctl.shell = shell
+    waits: list = []
+    ctl.wait_for_activity = lambda pkg, timeout=20.0, interval=1.0: (
+        waits.append(timeout), True)[1]
+
+    got = ctl.launch_app("com.xtc.watch", ".MainActivity", attempts=1)
+    check("换到能成功的策略并返回", bool(got), got)
+    check("硬失败策略没有白等前台确认（只等了一次，且 ≤6 秒）",
+          len(waits) == 1 and waits[0] <= 6.0, str(waits))
+    check("确实试过 monkey", any("monkey" in c for c in tried), str(tried))
+
+
+def test_poll_loop_yields_to_pending_send() -> None:
+    """有发送在排队时轮询先让路：否则发送要等轮询那一次 3~4 秒的 dump 做完才开始输入。"""
+    import threading
+
+    class PollAdb(FakeAdb):
+        def is_connected(self) -> bool:
+            return True
+
+        def ensure_connected(self) -> bool:
+            return True
+
+    calls = {"n": 0}
+
+    class CountingXtc(Xiaotiancai):
+        def app_state_with_root(self, attempts: int = 2):
+            calls["n"] += 1
+            return (self.STATE_CHAT, ET.fromstring(chat_page_xml()))
+
+    def make_bridge() -> tuple:
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=PollAdb(), xtc=CountingXtc(PollAdb(), {"ui": {}},
+                                                                     logger=None),
+                                      forwarder=None, logger=Recorder())
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._poll_interval = 0.3
+        return br
+
+    def run(br, seconds: float) -> None:
+        br.running = True
+        t = threading.Thread(target=br._poll_loop, daemon=True)
+        t.start()
+        time.sleep(seconds)
+        br.running = False
+        t.join(3)
+
+    root = tmp_root()
+    try:
+        br = make_bridge()
+        br._send_pending = True
+        br._send_pending_ts = time.monotonic()
+        run(br, 0.5)
+        check("发送排队期间轮询不抢 dump（让路）", calls["n"] == 0, str(calls))
+
+        br._send_pending = False
+        run(br, 0.5)
+        check("发送结束后轮询恢复读消息", calls["n"] >= 1, str(calls))
+
+        # 让路有上限：长队列（或发送线程卡住）不能把读消息饿死
+        calls["n"] = 0
+        br._send_pending = True
+        br._send_pending_ts = time.monotonic() - 31
+        run(br, 0.5)
+        check("让路最多 30 秒（超时后轮询照常跑）", calls["n"] >= 1, str(calls))
+    finally:
+        cleanup(root)
+
+
 def test_confirm_sent_rule() -> None:
     """_confirm_sent 的判定规则单测（新气泡 / 失败提示 / 输入框残留 / 读不到界面）。"""
     adb = ChatAdb()
@@ -2465,7 +2582,9 @@ def main() -> int:
                test_command_not_repeated, test_login_detection,
                test_password_field_masked, test_login_progress_not_failure,
                test_send_result_is_honest, test_send_speed_fast_path,
-               test_recent_snapshot_window, test_plain_injection_skips_dump, test_confirm_sent_rule,
+               test_recent_snapshot_window, test_plain_injection_skips_dump,
+               test_ime_check_is_cached, test_launch_app_skips_hard_failures_fast,
+               test_poll_loop_yields_to_pending_send, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

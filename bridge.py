@@ -143,6 +143,9 @@ class MessageBridge:
             (cfg.get("xiaotiancai") or {}).get("login_retry_after_risk", 900))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
+        # 有发送任务在排队/执行时置位：轮询据此让路（见 _poll_loop），别和发送抢 dump
+        self._send_pending = False
+        self._send_pending_ts = float("-inf")
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
@@ -262,6 +265,12 @@ class MessageBridge:
         last_heartbeat = float("-inf")   # 首轮就做一次 ADB 心跳检查（monotonic 零点任意）
         while self.running:
             loop_started = time.monotonic()
+            # 有消息要发时先让路：发送要拿操作锁，轮询若正好开始一轮 dump（3~4 秒），
+            # 发送就得等它做完 —— 用户看到的"点了发送半天才出现文字"有一部分就是这个。
+            # 最多让路 30 秒（长队列不会把读消息饿死；漏掉的消息由撞库补发兜底）。
+            if self._send_pending and (loop_started - self._send_pending_ts) < 30:
+                time.sleep(0.05)
+                continue
             try:
                 now = time.monotonic()
                 if now - last_heartbeat >= self._heartbeat_interval:
@@ -614,6 +623,10 @@ class MessageBridge:
         self._log("info", f"[收到QQ命令] 来源={where} 内容={text!r}"
                           + (f" request_id={request_id}" if request_id else "")
                           + f"（队列中 {self._job_queue.qsize()} 条待处理）")
+        # 让轮询先停一轮 dump，把 adb/操作锁让给发送（见 _poll_loop 开头的让路逻辑）
+        if not self._send_pending:
+            self._send_pending_ts = time.monotonic()
+        self._send_pending = True
         self._job_queue.put(("send", text, user_id, group_id, request_id))
         return True
 
@@ -634,6 +647,9 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001 单条发送异常不能让工作线程退出
             self._log("warning", f"[QQ->小天才] 发送异常: {e}")
             ok = False
+        finally:
+            # 队列里还有待发的就继续让路（_send_pending_ts 不刷新，最长 30 秒兜底）
+            self._send_pending = not self._job_queue.empty()
         self._log("info" if ok else "error",
                   f"[QQ->小天才] {'发送成功' if ok else '发送失败'}: {text[:80]!r}")
         if ok:

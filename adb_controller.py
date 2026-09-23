@@ -140,6 +140,10 @@ ADBKEYBOARD_APK_NAMES = ("keyboardservice-debug.apk", "ADBKeyBoard.apk")
 # 文本注入相关常量
 _CODEPOINT_CHUNK = 200          # ADB_INPUT_CHARS 每批码点数（命令行长度限制）
 _TEXT_RETRY_SLEEP = 0.35        # 广播后等待 IME 提交文本
+# 启动 App 时的"硬失败"特征：命令自己就报错了，换下一套策略即可，别再等前台
+_LAUNCH_FAIL_RE = re.compile(
+    r"(?mi)^\s*(Error|Exception)\b|\bError type \d|does not exist"
+    r"|SecurityException|Permission Denial|not exported|Unable to (resolve|find)")
 CLIPBOARD_PKG = "com.android.clipper"   # Android 10 及以下可用（若已安装）
 WSA_APPS_URI = "shell:AppsFolder\\MicrosoftCorporationII.WindowsSubsystemForAndroid_8wekyb3d8bbwe!App"
 
@@ -470,6 +474,9 @@ class ADBController:
         self._clipboard_ok: bool | None = None
         self._adbkeyboard_ok: bool | None = None
         self._adbkeyboard_b64_ok: bool | None = None
+        # "ADBKeyBoard 是不是当前输入法"的缓存（注入每条消息都要问一次，实测 0.18s/次）
+        self._ime_active_ok: bool | None = None
+        self._ime_active_ts = float("-inf")
         self._input_verify_supported: bool | None = None
         self._is_wsa: bool | None = None
         # 显示旋转缓存（模拟器可能被旋转成竖屏，UI 逻辑坐标 != input 物理坐标）
@@ -1033,8 +1040,8 @@ class ADBController:
     def _resolve_launcher_activity(self, package: str) -> str:  # 兼容旧调用名
         return self.resolve_launcher_activity(package)
 
-    def launch_app(self, package: str, activity: str = "", wait: float = 25.0,
-                   attempts: int = 3) -> str:
+    def launch_app(self, package: str, activity: str = "", wait: float = 6.0,
+                   attempts: int = 2) -> str:
         """启动 App 并确认其到达前台，返回最终使用的 activity（空串表示启动失败）。
 
         多策略（WSA 上 `am start -n` 偶发失败/被系统吞掉，`monkey` 最稳）：
@@ -1043,6 +1050,13 @@ class ADBController:
           3) am start -a android.intent.action.MAIN -c ...LAUNCHER <pkg>
         每次启动后轮询前台确认；未到前台则退避重试整轮。
         返回值为 activity 名或命中的策略名（调用方只需判断非空）。
+
+        速度（实机 WSA 实测）：`am start -n` 0.46s 到前台、`monkey` 0.97s 到前台，
+        而 `am start -a MAIN/LAUNCHER` 在有的镜像上**根本起不来**——旧实现给每个策略
+        25 秒的前台等待，撞上这种策略就白等 25 秒（用户报"发一条要十几秒"里就有它）。
+        现在：① 单策略等待 6 秒、0.4 秒轮询一次；② 输出里一旦出现
+        SecurityException / not exported / does not exist 这类**硬失败**就立刻换策略，
+        不再傻等。
         """
         if not self.package_installed(package):
             raise AdbError(f"设备上没有安装 {package}（请先在模拟器/WSA 里安装并登录小天才 App）")
@@ -1066,13 +1080,12 @@ class ADBController:
                 except AdbError as e:
                     last_err = f"{name}: {e}"
                     continue
-                # 只认真正的启动失败行；成功时的一些警告里也会出现 "error" 字样
-                if re.search(r"(?mi)^\s*(Error|Exception)\b|\bError type \d|does not exist",
-                             out or ""):
+                # 硬失败（命令自己就报错了）：立刻换下一套策略，不做无谓的前台等待
+                if _LAUNCH_FAIL_RE.search(out or ""):
                     last_err = f"{name}: {(out or '').strip()[:200]}"
                     self.logger.debug(f"启动策略 {name} 返回: {(out or '').strip()[:200]}")
                     continue
-                if self.wait_for_activity(package, timeout=wait):
+                if self.wait_for_activity(package, timeout=wait, interval=0.4):
                     return resolved or name
                 last_err = f"{name}: 命令已执行但未检测到 {package} 前台"
             # 三套策略都没成功：等一下再来（WSA 冷启动/上一个进程未完全退出时常见）
@@ -1457,6 +1470,7 @@ class ADBController:
                     return True
             except AdbError:
                 pass
+        self.invalidate_ime_state()   # 注入通道全失败：输入法状态可能已变，下次重新探测
         self.logger.warning(
             "文本注入失败（输入框未收到内容）。请检查：ADBKeyBoard 是否为当前输入法"
             "（adb shell ime set com.android.adbkeyboard/.AdbIME）、输入框是否已获得焦点；"
@@ -1495,6 +1509,7 @@ class ADBController:
             return True
         except AdbError as e:
             self.logger.debug(f"纯注入广播失败: {e}")
+            self.invalidate_ime_state()
             return False
 
     def _input_via_adbkeyboard(self, text: str, verify, ensure_ime: bool = True) -> bool:
@@ -1573,16 +1588,29 @@ class ADBController:
     def adbkeyboard_ready(self) -> bool:
         return self._adbkeyboard_ready()
 
-    def _adbkeyboard_active(self) -> bool:
-        """ADBKeyBoard 是否为当前默认输入法（仅启用不够——广播需要它是活动 IME）。"""
+    def _adbkeyboard_active(self, ttl: float = 60.0) -> bool:
+        """ADBKeyBoard 是否为当前默认输入法（仅启用不够——广播需要它是活动 IME）。
+
+        结果按 ttl 秒缓存：注入每条消息都要问一次，而每次问都要起一个 adb shell
+        （实测 0.18s）。IME 不会自己变；真被换了（注入失败/切输入法）会 invalidate。
+        """
+        now = time.monotonic()
+        if self._ime_active_ok is not None and now - self._ime_active_ts < ttl:
+            return self._ime_active_ok
         try:
             out = self.shell("settings get secure default_input_method")
-            if ADBKEYBOARD_IME in out:
-                return True
-            # 某些实现会写成 com.android.adbkeyboard/com.android.adbkeyboard.AdbIME
-            return ADBKEYBOARD_PKG in out and "adbkeyboard" in out.lower()
+            ok = ADBKEYBOARD_IME in out or (ADBKEYBOARD_PKG in out
+                                            and "adbkeyboard" in out.lower())
         except AdbError:
-            return False
+            ok = False
+        self._ime_active_ok = ok
+        self._ime_active_ts = now
+        return ok
+
+    def invalidate_ime_state(self) -> None:
+        """丢弃"输入法状态"缓存（切换输入法/注入失败后调用，下次会重新探测）。"""
+        self._ime_active_ok = None
+        self._ime_active_ts = float("-inf")
 
     def current_ime(self) -> str:
         return self.try_shell("settings get secure default_input_method").strip()
@@ -1682,6 +1710,7 @@ class ADBController:
                 self.shell(f"settings put secure enabled_input_methods {joined}")
         except AdbError:
             pass
+        self.invalidate_ime_state()      # 换过输入法 -> "是不是当前 IME"的缓存作废
 
     def install_adbkeyboard(self, apk_path: str = "") -> bool:
         """确保 ADBKeyBoard 可用：**先检查设备上有没有**，没有才用项目目录里的本地 APK 安装。
