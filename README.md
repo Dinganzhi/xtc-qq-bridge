@@ -631,7 +631,7 @@ python tools/wsa_net_guard.py --test
 | **自动登录不生效** | (1) 看日志有没有 `检测到小天才未登录，触发自动登录`；(2) 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；(3) 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；(4) 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
 | **明明在登录中却提示"登录失败"** | 已修复：出现"登录中/正在验证/请稍候"等进度文案时**一律不判失败**；只有明确的账号/密码错误才算失败，网络类临时问题按"超时->稍后重试"处理。若仍误报，把该文案加进 `xiaotiancai.ui.login_progress_markers` |
 | **发送提示失败但其实发不出去 / 提示成功却没发出** | 已修复：只有"输入框已清空且无新的失败提示"或"出现新的己方气泡"才回「发送成功」；读不到界面、出现"发送失败/网络异常"、输入框仍有残留 -> 如实回「发送失败」。若你的机型提示语不同，补充 `xiaotiancai.ui.send_fail_markers` |
-| **按按钮/发送很慢** | 已优化：UI dump 走 `/dev/tty` 快路径、前台组件缓存、登录态缓存、交互等待变短。设备本身慢可调大 `xiaotiancai.ui.interaction_delay`（0.6 -> 1.0）；网络差可减小 |
+| **按按钮/发送很慢** | 已优化：UI dump 一次 shell 完成"落盘+读回+删文件"（交互路径 retries=2/delay=0.3）、发送时复用注入校验的快照、前台组件与登录态缓存、交互等待变短。设备本身慢可调大 `xiaotiancai.ui.interaction_delay`（0.6 -> 1.0）；网络差可减小 |
 | **控制台看不到收到的命令** | INFO 级别下应当能看到 `[QQ回调] 收到 …`、`[收到QQ命令] …`、`[收到小天才命令] …`、`[收到小天才消息] …`、`[QQ->小天才] 发送成功/失败`。看不到时：(1) 确认 `logging.level: INFO`；(2) 确认命令真的到了（QQ 侧看插件日志，小天才侧看界面）；(3) 中文 Windows 控制台编码问题已兜底（不会再整条丢失） |
 | **已经启动了 App 还重复启动** | 已修复：`launch()` 先判断前台，已在前台直接返回，不执行任何启动命令；`/小天才 初始化` 也改成按需执行 |
 | **明明在聊天页，却提示"在消息列表找不到联系人"** | 已修复：聊天页判定不再只看 Activity 名（`endswith("chatactivity")`），改为"Activity 名含 chat 且不含 list/main/watchmsg"**或**界面出现消息气泡/输入栏；另外 `open_chat` 进来会先确认一次界面特征，已经在聊天页就直接返回，不再去列表里找联系人 |
@@ -647,7 +647,7 @@ python tools/wsa_net_guard.py --test
 | 日志"启动小天才未确认" | 用 `python main.py --debug dump-ui` 看前台是不是 `com.xtc.watch`；`--debug adb-info` 看 `focus` 字段。App 未安装会直接报错 |
 | 中文发不出去 / 发出去是旧内容 | `--debug adb-info` 看 `adbkeyboard_ready` 与 `ime`：必须 `com.android.adbkeyboard/.AdbIME`；`clipboard_ok=false` 时不要依赖剪贴板 |
 | 输入框有残留导致内容拼接 | 已内置发送前清空；若仍出现，检查 `adb.input_retries` 与聊天页是否稳定 |
-| **uiautomator dump 失败 / 反复出现 `cat: /sdcard/xtc_dump_*.xml: No such file or directory`** | 根因是 `uiautomator` 没写出文件（最常见是 `ERROR: could not get idle state.`：界面一直不空闲，如转场/加载动画、弹窗、键盘光标闪烁；其次是 `/sdcard` 未挂载或无写权限）。现已：① 优先走 `uiautomator dump /dev/tty` 快路径（不落盘）；② 落盘自动换 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` 三个目录；③ 读取改用 `exec-out cat`；④ 重试逐轮递增等待，并自动重设动画缩放；⑤ **报错里带 uiautomator 的真实原因 + 当前前台组件**（不再只报 cat）。仍出现时：调大 `adb.dump_retries` / `adb.dump_delay`，确认 `adb.disable_animations: true`，用 `/小天才 初始化` 清理界面，或看 `python main.py --debug adb-info` 里的 `last_dump_error` |
+| **uiautomator dump 失败 / 反复出现 `cat: /sdcard/xtc_dump_*.xml: No such file or directory`** | 根因是 `uiautomator` 没写出文件（最常见是 `ERROR: could not get idle state.`：界面一直不空闲，如转场/加载动画、弹窗、键盘光标闪烁；其次是 `/sdcard` 未挂载或无写权限）。现已：① 优先"完整 dump 落盘并一次 shell 读回"（要完整版才拿得到消息时间标签），失败再回退 `/dev/tty` 与 `--compressed`；② 落盘自动换 `/sdcard` -> `/data/local/tmp` -> `/storage/emulated/0` 三个目录；③ 读取改用 `exec-out cat`；④ 重试逐轮递增等待，并自动重设动画缩放；⑤ **报错里带 uiautomator 的真实原因 + 当前前台组件**（不再只报 cat）。仍出现时：调大 `adb.dump_retries` / `adb.dump_delay`，确认 `adb.disable_animations: true`，用 `/小天才 初始化` 清理界面，或看 `python main.py --debug adb-info` 里的 `last_dump_error` |
 
 ---
 
@@ -779,9 +779,10 @@ python tools/wsa_net_guard.py --test
 重试策略：只有"输入框仍留有内容"（点击发送没生效）才安全重发，最多 `ui.send_retries` 轮；
 "读不到界面"绝不重发，避免重复消息。
 
-速度优化：UI dump 优先 `uiautomator dump /dev/tty`（一次 shell 调用拿到 XML，失败再回退
-"写文件 -> 读取 -> 删文件"，且读取走 `exec-out cat`）；交互路径用 `retries=2, delay=0.3`
-的快速 dump；前台组件与登录态都带短缓存；等待时间由 `ui.interaction_delay` 控制。
+速度优化：UI dump 一次 shell 调用完成"落盘 -> `cat` 读回 -> 删文件"（失败再回退 `/dev/tty`
+或换目录）；交互路径用 `retries=2, delay=0.3` 的快速 dump；发送时"注入校验"的界面快照
+会复用给"找发送按钮"（省一次 dump）；前台组件与登录态都带短缓存；等待时间由
+`ui.interaction_delay` 控制。
 
 **UI dump 的三种方案与可读报错**（`adb_controller._dump_strategies` / `_dump_ui_locked`）：
 
@@ -801,7 +802,7 @@ python tools/wsa_net_guard.py --test
 所以再怎么退化也不会把时间丢成"当前时间"。
 
 失败时抛出的错误形如：
-`UI dump 失败: /dev/tty: ERROR: could not get idle state.；/sdcard: 读取 ... 失败: 文件不存在 | ...（界面一直不空闲：...可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面）｜当前前台=com.xtc.watch/.ChatActivity`
+`UI dump 失败: file-full: ERROR: could not get idle state.；tty-full: 没有 XML 输出 | ...（界面一直不空闲：...可调大 adb.dump_retries / adb.dump_delay，或用 /小天才 初始化 清理界面）｜当前前台=com.xtc.watch/.ChatActivity`
 ——即**真实原因 + 当前前台 + 怎么处理**，而上层（打开聊天/读消息/发送）遇到读不到界面时
 只记一条节流后的 warning 并稍后重试，不再整轮报 ERROR、也不再影响后续轮询。
 
