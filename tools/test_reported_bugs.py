@@ -196,12 +196,21 @@ class ChatAdb(FakeAdb):
         self.fail_dump = False
         self.input_bounds = "[40,1700][900,1800]"      # 可改：模拟窗口缩放/键盘弹出
         self.send_bounds = "[920,1700][1060,1800]"
+        self.title_text = ""                           # 聊天页标题（"先手打字"的门闩要用）
         self.set_ui(input_text=input_text, tip=tip)
 
-    def set_ui(self, input_text: str = "", tip: str = "", bubble: str = "") -> None:
-        nodes = n(cls="android.widget.EditText", text=input_text,
-                  rid="com.xtc.watch:id/et_chat_text_content",
-                  bounds=self.input_bounds, focusable="true")
+    def set_ui(self, input_text: str = "", tip: str = "", bubble: str = "",
+               title: str | None = None) -> None:
+        if title is not None:
+            self.title_text = title
+        nodes = ""
+        if self.title_text:
+            nodes += n(cls="android.widget.TextView", text=self.title_text,
+                       desc=f"和{self.title_text}的聊天",
+                       rid="com.xtc.watch:id/tv_titleBar_title", bounds="[983,67][1068,92]")
+        nodes += n(cls="android.widget.EditText", text=input_text,
+                   rid="com.xtc.watch:id/et_chat_text_content",
+                   bounds=self.input_bounds, focusable="true")
         nodes += n(cls="android.widget.TextView", text="发送",
                    rid="com.xtc.watch:id/tv_send_view", bounds=self.send_bounds)
         if tip:
@@ -1100,6 +1109,93 @@ def test_sticker_forward_one_way() -> None:
               f"sent={sent} images={fwd4.images}")
     finally:
         cleanup(root)
+
+
+def test_blind_send_fast_typing() -> None:
+    """用户报告："从 QQ 发消息到文字出现在输入框要 10 秒"。
+
+    慢在**打字之前的等待**：稳妥流程要先等轮询那次 ~3.8 秒的 dump（操作锁）、再自己读一次
+    界面（~3.5 秒）才注入。现在加了"先手打字"：按**上次成功发送留下的坐标**直接点输入框、
+    广播注入、点发送，不占锁不读界面 —— 文字 ~1 秒内出现，然后才用一次 dump 复核。
+    门闩（防止盲点发错聊天）：近 15 秒内轮询确认过在聊天页 + 标题就是目标联系人 + 有坐标缓存。
+    """
+    chat_xml = node_xml(
+        n(cls="android.widget.TextView", text="屑猹不喝茶", desc="和屑猹不喝茶的聊天",
+          rid="com.xtc.watch:id/tv_titleBar_title", bounds="[983,67][1068,92]") +
+        n(cls="android.widget.EditText", text="", rid="com.xtc.watch:id/et_chat_text_content",
+          bounds="[833,678][1179,721]") +
+        n(cls="android.widget.TextView", text="发送", rid="com.xtc.watch:id/tv_send_view",
+          bounds="[1179,677][1221,721]"))
+
+    # ① 聊天页标题读取（用于"确实在目标聊天"的门闩）
+    adb = FastChatAdb()
+    adb.set_ui(title="屑猹不喝茶", input_text="")
+    xtc = Xiaotiancai(adb, {"ui": {}}, logger=None)
+    root_t = ET.fromstring(adb.xml)
+    check("能读到聊天页标题", xtc.chat_title(root_t) == "屑猹不喝茶", xtc.chat_title(root_t))
+
+    # ② 没有坐标缓存 -> 不许先手（走稳妥流程）
+    check("没有坐标缓存时不先手", xtc.blind_send_ready() is False)
+    staged, why = xtc.begin_blind_send("你好")
+    check("没缓存时 begin_blind_send 明确拒绝", staged is False and "缓存" in why, why)
+
+    # ③ 有缓存（模拟上一次发送留下的）-> 先手：点输入框 -> 广播 -> 点发送，顺序要对
+    adb.calls.clear()
+    xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
+                       "input_point": (1006, 699)}
+    xy: dict = {"taps": []}
+
+    def tap_xy(x, y):
+        xy["taps"].append((x, y))
+        adb.calls.append(f"tap {x},{y}")
+
+    adb.tap = tap_xy
+    adb.input_text_plain = lambda text, ensure_ime=True: (
+        adb.calls.append(f"input_text_plain {text}"), True)[1]
+    xtc._snapshot = ET.fromstring(adb.xml)           # 轮询刚 dump 的快照（只为拿基线）
+    xtc._snapshot_ts = time.monotonic()
+    check("有缓存+快照时可以先手", xtc.blind_send_ready() is True)
+    staged2, why2 = xtc.begin_blind_send("你好")
+    check("先手输入成功", staged2 is True, why2)
+    check("先点了输入框、再注入、再点发送",
+          xy.get("taps") == [(1006, 699), (1200, 699)], str(xy.get("taps")))
+    check("注入走的是不做校验的纯广播",
+          any(c.startswith("input_text_plain 你好") for c in adb.calls), str(adb.calls))
+
+    # ④ 复核：输入框已清空 + 无新失败提示 -> 确认成功
+    adb.set_ui(input_text="", bubble="刚发出的一条")
+    ok, why3, retryable = xtc.end_blind_send("你好")
+    check("复核通过", ok is True, why3)
+    check("成功时不需要重发", retryable is False)
+
+    # ⑤ 复核发现"输入框仍留有内容"（点偏了/没发出去）-> 允许安全重发 + 清掉缓存坐标
+    xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
+                       "input_point": (1006, 699)}
+    xtc.begin_blind_send("你好")
+    adb.set_ui(input_text="你好")                     # 文字还在输入框里
+    ok2, why4, retryable2 = xtc.end_blind_send("你好")
+    check("没发出去时如实报未确认", ok2 is False and "输入框仍留有内容" in why4, why4)
+    check("这种情况允许安全重发", retryable2 is True)
+    check("重发前清掉缓存坐标（改用稳妥流程）", xtc._send_cache is None)
+
+    # ⑥ 桥接门闩：太久没确认过聊天页 / 标题不对 -> 不先手
+    br = bridge_mod.MessageBridge(
+        {"target": {"xtc_contact": "屑猹不喝茶"}, "xiaotiancai": {"ui": {}}, "webhook": {}},
+        adb=None, xtc=xtc, forwarder=None, logger=None)
+    br.msgs = MessageLog(path=str(_paths(tmp_root())["msgs"]))
+    br._cmd_done_file = str(_paths(tmp_root())["done"])
+    xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
+                       "input_point": (1006, 699)}
+    check("没有最近确认过聊天页时不先手", br._blind_send_allowed("屑猹不喝茶") is False)
+    br._chat_ok_ts = time.monotonic()
+    br._chat_ok_title = "别的联系人"
+    check("标题不是目标联系人时不先手（防发错聊天）",
+          br._blind_send_allowed("屑猹不喝茶") is False)
+    br._chat_ok_title = "屑猹不喝茶"
+    check("确认过目标聊天页且标题一致 -> 允许先手",
+          br._blind_send_allowed("屑猹不喝茶") is True)
+    br._chat_ok_ts = time.monotonic() - 60
+    check("超过 15 秒没再确认过就不先手", br._blind_send_allowed("屑猹不喝茶") is False)
 
 
 def test_confirm_sent_rule() -> None:
@@ -2907,7 +3003,7 @@ def main() -> int:
                test_poll_loop_yields_to_pending_send,
                test_png_encoder_and_crop, test_screencap_header_parsing,
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
-               test_emoji_store_reads_original_file, test_confirm_sent_rule,
+               test_emoji_store_reads_original_file, test_blind_send_fast_typing, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

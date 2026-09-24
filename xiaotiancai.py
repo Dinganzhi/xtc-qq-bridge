@@ -163,6 +163,9 @@ class Xiaotiancai:
         self._snapshot_ts = float("-inf")
         # 发送按钮坐标缓存 + 快路径开关（省掉"注入后 dump 一次找发送按钮"的 ~3 秒）
         self._send_cache: dict | None = None
+        # "先手打字"的中间状态（begin_blind_send -> end_blind_send）
+        self._blind: dict | None = None
+        self._blind_enabled = bool(self.ui.get("blind_send", True))
         self._fast_send = bool(self.ui.get("fast_send", True))
         try:
             self._snapshot_reuse = max(0.0, float(self.ui.get("snapshot_reuse", 3.0)))
@@ -1911,17 +1914,111 @@ class Xiaotiancai:
         return (int(point[0]), int(point[1]))
 
     def _remember_send_point(self, input_bounds, send_node, root: ET.Element) -> None:
-        """记下这次点成功的发送按钮坐标（连同输入框位置），供下次快路径使用。"""
+        """记下这次点成功的发送按钮坐标 + 输入框坐标，供下次"先手打字"用。"""
         try:
             target = send_node
             if str(send_node.get("clickable", "")).lower() != "true":
                 target = self._clickable_ancestor(send_node, root) or send_node
             center = self.adb.node_center(target) or self.adb.node_center(send_node)
             if center and input_bounds:
-                self._send_cache = {"input": tuple(int(v) for v in input_bounds),
-                                    "point": (int(center[0]), int(center[1]))}
+                x1, y1, x2, y2 = (int(v) for v in input_bounds)
+                self._send_cache = {
+                    "input": (x1, y1, x2, y2),
+                    "point": (int(center[0]), int(center[1])),
+                    "input_point": ((x1 + x2) // 2, (y1 + y2) // 2),
+                }
         except Exception as e:  # noqa: BLE001 缓存失败不影响发送
             self.log("debug", f"发送按钮坐标缓存失败: {e}")
+
+    # ---- "先手打字"（免 dump 预输入）：QQ -> 小天才 的可见延迟从 ~10 秒降到 ~1 秒 ----
+    def chat_title(self, root: ET.Element | None = None) -> str:
+        """当前聊天页的标题（联系人名）。用于确认"现在打开的确实是目标联系人"。"""
+        try:
+            if root is None:
+                root = self._dump_fast()
+            for n in root.iter("node"):
+                if self._id_tail(n) in ("tv_titleBar_title", "tv_title", "chat_title"):
+                    t = (n.get("text") or "").strip()
+                    if t:
+                        return t
+                    d = (n.get("content-desc") or "").strip()
+                    if d.startswith("和") and d.endswith("的聊天"):
+                        return d[1:-3].strip()
+        except Exception:  # noqa: BLE001 标题读不到就算了（调用方据此不放行快发）
+            pass
+        return ""
+
+    def blind_send_ready(self) -> bool:
+        """能不能"先手打字"：需要上次成功发送留下的坐标缓存 + 一份可用的界面快照。
+
+        坐标缓存由**上一次真正发成功**的发送留下（重启后第一条走稳妥流程），
+        快照用轮询刚 dump 的那份（只为拿"发送前基线"，不做任何 UI 操作）。
+        `ui.blind_send: false` 可彻底关掉这条快路径。
+        """
+        if not self._blind_enabled:
+            return False
+        cache = self._send_cache or {}
+        if not cache.get("point") or not cache.get("input_point"):
+            return False
+        return self.recent_snapshot() is not None
+
+    def begin_blind_send(self, text: str) -> tuple[bool, str]:
+        """先手把文字打进去（**不占桥接的操作锁、不读界面**）：文字 ~1 秒内出现在输入框。
+
+        为什么快：稳妥流程要先等轮询那次 ~3.8 秒的 dump（操作锁）再自己读一次界面，
+        文字才被注入；这里直接用缓存坐标点输入框 -> 广播注入 -> 点缓存坐标的发送按钮。
+        正确性靠两点保证：
+          * 调用方（桥接）只在"最近一次轮询确认过就是目标聊天页"时才走这条（含标题校验）；
+          * 随后的 `end_blind_send()` 会用一次 dump 复核，失败就退回稳妥流程 + 清缓存。
+        """
+        cache = self._send_cache or {}
+        point_in = cache.get("input_point")
+        point_send = cache.get("point")
+        if not point_in or not point_send:
+            return False, "还没有发送坐标缓存（先走稳妥流程建立）"
+        base = self.recent_snapshot()
+        if base is None:
+            return False, "没有可用的界面快照（拿不到发送前基线）"
+        self._blind = {
+            "text": text,
+            "base_fail": self._fail_signature(base),
+            "base_own": self._own_bubble_counter(base),
+            "retryable": False,
+        }
+        try:
+            self.adb.tap(point_in[0], point_in[1])          # 点输入框拿焦点
+            time.sleep(min(self._delay, 0.4))
+            if not self.adb.input_text_plain(text):         # 广播注入（不校验）
+                self._blind = None
+                return False, "纯注入广播未发出"
+            time.sleep(0.15)
+            self.adb.tap(point_send[0], point_send[1])      # 点发送（缓存坐标）
+            self._blind["retryable"] = True
+            return True, ""
+        except AdbError as e:
+            self._blind = None
+            return False, f"ADB 异常: {e}"
+
+    def end_blind_send(self, text: str) -> tuple[bool, str, bool]:
+        """复核"先手打字"的结果：返回 (是否确认发出, 说明, 失败时能否安全重发)。
+
+        用一次 dump 同时判断：出现新己方气泡（最强证据）/ 出现新失败提示 /
+        输入框仍留有内容（没发出去，可安全重发）/ 输入框已清空且无新失败提示。
+        """
+        blind = self._blind or {}
+        self._blind = None
+        if not blind:
+            return False, "没有待复核的先手发送", False
+        try:
+            ok, why = self._confirm_sent(text, blind.get("base_fail") or [],
+                                         blind.get("base_own") or {})
+        except AdbError as e:
+            return False, f"复核失败: {e}", False
+        retryable = "输入框仍留有内容" in (why or "")
+        if not ok and retryable:
+            # 没发出去（文字还在输入框里）：清掉缓存坐标，让稳妥流程重来
+            self._send_cache = None
+        return ok, why, retryable
 
     def _focus_input(self, edit) -> None:
         """点击输入框让它获得焦点，并等软键盘/输入连接就绪。

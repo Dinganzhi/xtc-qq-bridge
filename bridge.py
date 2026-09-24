@@ -162,6 +162,9 @@ class MessageBridge:
         # 有发送任务在排队/执行时置位：轮询据此让路（见 _poll_loop），别和发送抢 dump
         self._send_pending = False
         self._send_pending_ts = float("-inf")
+        # 最近一次"轮询确认过就在聊天页"的时刻与标题（"先手打字"快发的放行条件）
+        self._chat_ok_ts = float("-inf")
+        self._chat_ok_title = ""
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
@@ -322,6 +325,9 @@ class MessageBridge:
                     self._log_state(state)
                     xtc_contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
                     if state == self.xtc.STATE_CHAT:
+                        # 记下"最近一次确认过就在聊天页"（含标题），"先手打字"快发据此放行
+                        self._chat_ok_ts = time.monotonic()
+                        self._chat_ok_title = self.xtc.chat_title(root)
                         contact, text, time_label, own_text, own_recent = \
                             self.xtc.get_latest_message(root)
                     else:
@@ -738,6 +744,30 @@ class MessageBridge:
         self._job_queue.put(("send", text, user_id, group_id, request_id))
         return True
 
+    def _blind_send_allowed(self, contact: str) -> bool:
+        """能不能走"先手打字"：最近一次轮询确认过**就是目标聊天页**（含标题校验）。
+
+        为什么要这个门闩：先手打字是按**缓存坐标**盲点输入框/发送按钮，
+        只有"确实在目标聊天页"时才安全。条件：
+          * 近 15 秒内轮询判过 STATE_CHAT；
+          * 那次读到的聊天标题就是目标联系人（防止盲点把消息发到别的聊天里）；
+          * 上次成功发送留下了坐标缓存（`blind_send_ready`）。
+        """
+        if time.monotonic() - self._chat_ok_ts > 15.0:
+            return False
+        title = (self._chat_ok_title or "").strip()
+        want = (self._display_name(contact) or contact or "").strip()
+        if not title or not want:
+            return False
+        if want != title and want not in title and title not in want:
+            return False
+        try:
+            if not self.xtc.blind_send_ready():
+                return False
+        except Exception:  # noqa: BLE001 判断失败就走稳妥流程
+            return False
+        return True
+
     def _do_send_job(self, text: str, user_id: str, group_id: str, request_id: str) -> None:
         """实际执行 QQ->小天才 发送 + 送达确认（工作线程内，按入队顺序）。"""
         self.echo.mark(text)
@@ -746,12 +776,37 @@ class MessageBridge:
             self._log("error", "反向转发需要 config.yaml -> target.xtc_contact")
             return
         self._log("info", f"[QQ->小天才] 开始发送: {text[:80]!r}")
+        ok = False
+        skip_safe = False
         try:
-            with self._op_lock:
-                in_chat = self.xtc.open_chat(contact)
-                ok = in_chat and self.xtc.send_message(text)
-            if not in_chat:
-                self._log("error", "[QQ->小天才] 未能进入小天才聊天窗口，未发送")
+            # ① "先手打字"：直接按缓存坐标点输入框 + 广播注入 + 点发送，
+            #    **不等轮询那次 dump、也不抢操作锁** —— 文字 ~1 秒内就出现在输入框里。
+            #    复核放在后面（要 dump），失败再退回稳妥流程。
+            if self._blind_send_allowed(contact):
+                t0 = time.monotonic()
+                staged, why = self.xtc.begin_blind_send(text)
+                if staged:
+                    self._log("info", f"[QQ->小天才] 已先手输入（{time.monotonic() - t0:.1f}s），"
+                                      "正在复核…")
+                    with self._op_lock:
+                        ok, why, retryable = self.xtc.end_blind_send(text)
+                    if ok:
+                        self._log("info", f"[QQ->小天才] 先手发送已复核通过"
+                                          f"（总 {time.monotonic() - t0:.1f}s）")
+                    else:
+                        skip_safe = not retryable
+                        self._log("warning" if skip_safe else "info",
+                                  f"[QQ->小天才] 先手发送未确认（{why}）"
+                                  + ("，且不宜重发，按失败上报" if skip_safe else "，改用稳妥流程"))
+                else:
+                    self._log("debug", f"[QQ->小天才] 先手输入未启用（{why}），走稳妥流程")
+            # ② 稳妥流程（未走先手 / 先手没发出去且可安全重发时）
+            if not ok and not skip_safe:
+                with self._op_lock:
+                    in_chat = self.xtc.open_chat(contact)
+                    ok = in_chat and self.xtc.send_message(text)
+                if not in_chat:
+                    self._log("error", "[QQ->小天才] 未能进入小天才聊天窗口，未发送")
         except Exception as e:  # noqa: BLE001 单条发送异常不能让工作线程退出
             self._log("warning", f"[QQ->小天才] 发送异常: {e}")
             ok = False
