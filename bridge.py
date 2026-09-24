@@ -7,6 +7,7 @@ webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -143,6 +144,11 @@ class MessageBridge:
             (cfg.get("xiaotiancai") or {}).get("login_retry_after_risk", 900))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
+        # 表情包（**仅 小天才 -> QQ 单向**）：把贴纸按气泡位置截图发给 QQ；
+        # 截图/发送失败自动退回发"表情X"文字，绝不因为表情而丢消息。
+        _emoji = cfg.get("emoji") or {}
+        self._emoji_image = bool(_emoji.get("forward_image", True))
+        self._emoji_caption = bool(_emoji.get("caption", True))
         # 有发送任务在排队/执行时置位：轮询据此让路（见 _poll_loop），别和发送抢 dump
         self._send_pending = False
         self._send_pending_ts = float("-inf")
@@ -234,7 +240,8 @@ class MessageBridge:
                     # 小天才 -> QQ 的转发放在工作线程做：插件要等 QQ 侧真实结果才回包
                     # （最长 30 秒），放在轮询线程里会把"读屏"一起拖住。
                     _, f_contact, f_text, f_label = job[:4]
-                    self._do_forward_job(f_contact, f_text, f_label)
+                    f_image = job[4] if len(job) > 4 else None
+                    self._do_forward_job(f_contact, f_text, f_label, image=f_image)
                 elif kind == "login":
                     _, request_id = job
                     self._do_login_job(request_id)
@@ -382,8 +389,10 @@ class MessageBridge:
                             and not self.dedup.seen(key) and not self.echo.is_echo(text):
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
+                        # 表情包：**必须在轮询线程里**截（此刻快照/气泡位置才是准的）
+                        image = self._capture_sticker(root, text)
                         # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
-                        self._queue_forward(contact, text, time_label)
+                        self._queue_forward(contact, text, time_label, image=image)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             # 只补"剩下的"时间：一轮里 dump+转发可能已花 3~4 秒，再无条件 sleep
@@ -423,7 +432,7 @@ class MessageBridge:
             self._log("debug", f"补发扫描失败: {e}")
             return 0
 
-        pending: list[tuple[str, str]] = []
+        pending: list[tuple[str, str, bytes | None]] = []
         for it in reversed(bubbles):                # 从最新往回走
             text = (it.get("text") or "").strip()
             if not text:
@@ -442,7 +451,10 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            pending.append((text, it.get("time_label") or ""))
+            # 补发的表情包也截图（此刻 root 里就有它的气泡位置，晚了就滚走了）
+            image = (self.xtc.capture_sticker(it.get("bounds"))
+                     if (self._emoji_image and it.get("sticker")) else None)
+            pending.append((text, it.get("time_label") or "", image))
 
         if not pending:
             return 0
@@ -454,28 +466,33 @@ class MessageBridge:
         self._log("info", f"[补发] 有 {len(pending)} 条消息库里没有，按时间顺序补发")
 
         sent = 0
-        for text, label in pending:
+        for text, label, image in pending:
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                               f"时间={label or '(无)'} 内容={text!r}（补发）")
             # 异步转发：不阻塞读屏（见 _queue_forward）
-            self._queue_forward(contact, text, label)
+            self._queue_forward(contact, text, label, image=image)
             sent += 1
         return sent
 
-    def _queue_forward(self, contact: str, text: str, label: str) -> None:
+    def _queue_forward(self, contact: str, text: str, label: str,
+                       image: bytes | None = None) -> None:
         """把"小天才 -> QQ"的转发丢给工作线程，立刻返回。
 
         为什么异步：插件要等 QQ 侧真实发送结果才回包（最长 30 秒），同步做的话
         轮询线程会被卡住，读屏/检测跟着变慢（转发越快，漏消息窗口也越小）。
         这里立刻 short-term 去重，避免下一轮把同一条再入队。
+
+        image：表情包截图（PNG 字节）。**必须在轮询线程里截**——那一刻界面快照/气泡位置
+        才是准的，等到工作线程再截图，聊天可能已经滚走了。没有它就按文字发（老行为）。
         """
         self.dedup.mark(("xtc", contact or "", text))
-        self._job_queue.put(("forward", contact, text, label or ""))
+        self._job_queue.put(("forward", contact, text, label or "", image))
 
-    def _do_forward_job(self, contact: str, text: str, label: str) -> None:
+    def _do_forward_job(self, contact: str, text: str, label: str,
+                        image: bytes | None = None) -> None:
         """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。"""
         try:
-            ok = self._forward(contact, text, label)
+            ok = self._forward(contact, text, label, image=image)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
             ok = False
@@ -486,6 +503,27 @@ class MessageBridge:
         if not self.msgs.seen(text, "xtc"):
             self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
                              source=self._xtc_source(contact), source_id=contact or "")
+
+    def _capture_sticker(self, root, text: str) -> bytes | None:
+        """表情包（仅小天才 -> QQ 单向）：按气泡位置把贴纸截图抠成 PNG。
+
+        拿不到就返回 None，调用方照样发"表情X"文字，功能不会因为截图失败而丢消息。
+        """
+        if not self._emoji_image:
+            return None
+        try:
+            item = self.xtc.sticker_of_latest(root, text)
+            if not item:
+                self._log("debug", f"没找到表情气泡位置，按文字转发: {text!r}")
+                return None
+            png = self.xtc.capture_sticker(item.get("bounds"))
+            if png:
+                self._log("info", f"[表情包] 已截取贴纸 {len(png)} 字节"
+                                  f"（{item.get('bounds')}），随转发发给 QQ")
+            return png
+        except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
+            self._log("debug", f"表情包截图失败（按文字转发）: {e}")
+            return None
 
     def _hint_wsa_guard(self) -> None:
         """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。
@@ -502,8 +540,13 @@ class MessageBridge:
                   "python tools/wsa_net_guard.py（自动重连/重置网络/必要时重启 WSA，"
                   "详见 README「WSA 网络守护」）")
 
-    def _forward(self, contact, text: str, time_label: str = "") -> bool:
-        """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。"""
+    def _forward(self, contact, text: str, time_label: str = "",
+                 image: bytes | None = None) -> bool:
+        """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。
+
+        image：表情包截图（PNG）。给了就发"图片（+说明文字）"，失败自动退回纯文字。
+        **单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字（见 forward_to_xiaotiancai）。
+        """
         targets = self._qq_targets()
         if not targets:
             self._log("info", f"[占位] 收到小天才消息（未配置 QQ 目标，仅打印）: {text}")
@@ -514,16 +557,29 @@ class MessageBridge:
         time_str = self._format_xtc_time(time_label)
         nickname = self._display_name(contact)
         message = f"[{time_str}] [{nickname}] {text}"
+        image_b64 = ""
+        if image:
+            try:
+                image_b64 = base64.b64encode(image).decode("ascii")
+            except Exception as e:  # noqa: BLE001 编码失败就退回文字
+                self._log("warning", f"表情包编码失败（按文字转发）: {e}")
+                image_b64 = ""
         ok_all = True
         queued = False
         for target_type, target_id in targets:
             why = ""
             try:
-                send_fn = getattr(self.forwarder, "send_detail", None)
-                if send_fn is not None:
-                    ok, why = send_fn(target_type, target_id, message)
+                if image_b64:
+                    send_image = getattr(self.forwarder, "send_image", None)
+                    if send_image is not None:
+                        caption = message if self._emoji_caption else ""
+                        ok, why = send_image(target_type, target_id, image_b64, caption)
+                    else:
+                        self._log("warning", "转发器不支持图片，改发文字"
+                                             "（插件需一并更新）")
+                        ok, why = self._send_text(target_type, target_id, message)
                 else:
-                    ok = self.forwarder.send(target_type, target_id, message)
+                    ok, why = self._send_text(target_type, target_id, message)
             except Exception as e:  # noqa: BLE001
                 self._log("error", f"转发异常({target_type}:{target_id}): {e}")
                 ok, why = False, f"{type(e).__name__}: {e}"
@@ -534,10 +590,11 @@ class MessageBridge:
                 self._log("warning", f"[转发未确认] {target_type}:{target_id} "
                                      "插件刚启动，消息只是排队（未确认已发出）")
                 continue
+            shown = message + (f"（+表情包图片 {len(image)} 字节）" if image_b64 else "")
             if ok:
-                self._log("info", f"[转发成功] {target_type}:{target_id} <- {message}")
+                self._log("info", f"[转发成功] {target_type}:{target_id} <- {shown}")
             else:
-                self._log("error", f"[转发失败] {target_type}:{target_id} <- {message}"
+                self._log("error", f"[转发失败] {target_type}:{target_id} <- {shown}"
                                    + (f"  原因: {why}" if why else ""))
                 ok_all = False
         if ok_all and not queued:
@@ -551,6 +608,13 @@ class MessageBridge:
             self.echo.mark(message)
             self._log("info", "小天才侧送达确认已跳过：本次转发未确认（插件排队中）")
         return ok_all
+
+    def _send_text(self, target_type, target_id, message: str) -> tuple:
+        """发纯文字（兼容只有 send() 的旧转发器）。返回 (ok, why)。"""
+        send_fn = getattr(self.forwarder, "send_detail", None)
+        if send_fn is not None:
+            return send_fn(target_type, target_id, message)
+        return bool(self.forwarder.send(target_type, target_id, message)), ""
 
     def _format_xtc_time(self, time_label: str) -> str:
         """把 App 内的时间标签转成 [日期时间] 格式：

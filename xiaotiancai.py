@@ -2386,18 +2386,25 @@ class Xiaotiancai:
             center_x = (b[0] + b[2]) / 2
             is_own = False
             contact = ""
+            desc_body = ""
             if "发的消息" in desc:
                 if desc.startswith("你发的"):
                     is_own = True
                 else:
                     contact = desc.split("发的消息", 1)[0].strip()
-                if not t and "," in desc:
-                    t = desc.split(",", 1)[1].strip()  # 表情/语音等从 desc 取类型
+                if "," in desc:
+                    desc_body = desc.split(",", 1)[1].strip()
+                if not t and desc_body:
+                    t = desc_body                      # 表情/语音等从 desc 取类型
             else:
                 # 无标注：右侧气泡 = 自己发的消息
                 is_own = filter_own and center_x > screen_w * 0.55
             if not t or t in junk:
                 continue
+            # 表情/贴纸：气泡本身没有文字（文字消息的 text 一定非空），
+            # content-desc 给的是"表情<名字>"，例如 '屑猹不喝茶发的消息,表情啊啊啊'。
+            # 只按这个判，避免把"表情包发我"这种真的文字消息当成表情。
+            is_sticker = bool(desc_body.startswith("表情")) and not (n.get("text", "") or "").strip()
             if self._is_system_msg(t):
                 continue
             if is_own and not include_own:
@@ -2408,9 +2415,59 @@ class Xiaotiancai:
                     time_label = d_text
                     break
             out.append({"text": t, "is_own": is_own, "contact": contact,
-                        "time_label": time_label, "y_bottom": b[3]})
+                        "time_label": time_label, "y_bottom": b[3],
+                        "sticker": is_sticker, "bounds": b})
         out.sort(key=lambda it: it["y_bottom"])
         return out
+
+    def sticker_of_latest(self, root: ET.Element, text: str = "") -> dict | None:
+        """最新一条**对方发来的表情**气泡信息 {text, bounds, time_label}；没有则 None。
+
+        给桥接用：轮询读到"表情X"时，据此拿到气泡位置，把贴纸原样截图发给 QQ
+        （见 capture_sticker）。text 传了就按文本匹配那一条（避免读到别的表情）。
+        """
+        try:
+            items = self._chat_bubbles(root, include_own=False)
+        except Exception as e:  # noqa: BLE001 判定失败不影响文字转发
+            self.log("debug", f"解析表情气泡失败: {e}")
+            return None
+        want = (text or "").strip()
+        hit = None
+        for it in items:                      # 已按 y 从小到大（旧->新）
+            if not it.get("sticker"):
+                continue
+            if want and it.get("text") != want:
+                continue
+            hit = it
+        return hit
+
+    def capture_sticker(self, bounds) -> bytes | None:
+        """把表情气泡那块**截图抠成 PNG**（失败返回 None，调用方退回发文字）。
+
+        为什么截图而不是拿原图：贴纸是 App 内部资源（可能在 so/apk 里、也可能是网络图），
+        ADB 拿不到；而贴纸在屏幕上就是它本身，按气泡区域裁剪即得原图。
+        只裁气泡本身的区域（不加内边距）：实机实测 ImageView 的 bounds 正好是贴纸范围。
+        """
+        if not bounds:
+            return None
+        try:
+            w, h = self.adb.get_screen_size()
+            x1, y1, x2, y2 = (int(v) for v in bounds)
+            if x2 - x1 < 12 or y2 - y1 < 12:
+                self.log("debug", f"表情气泡太小，放弃截图: {bounds}")
+                return None
+            if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
+                self.log("debug", f"表情气泡不在屏幕内，放弃截图: {bounds}")
+                return None
+            png = self.adb.screencap_crop_png((max(0, x1), max(0, y1),
+                                               min(w, x2), min(h, y2)))
+        except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
+            self.log("debug", f"表情截图失败: {e}")
+            return None
+        if not png or len(png) < 200:
+            self.log("debug", "表情截图内容异常（过小），放弃")
+            return None
+        return png
 
     def _latest_own_in_chat(self, root: ET.Element) -> str:
         """聊天页内最新一条"自己发的"消息文本（系统/垃圾已过滤）；无则 ""。"""

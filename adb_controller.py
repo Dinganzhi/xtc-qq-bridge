@@ -31,12 +31,15 @@ import base64
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from utils import pngtool
 
 try:  # 仅 Windows 有；用于读取 WSA 的 ADB 端口
     import winreg  # type: ignore
@@ -1113,6 +1116,40 @@ class ADBController:
         if path:
             Path(path).write_bytes(out)
         return out
+
+    def screencap_rgba(self) -> tuple[bytes, int, int]:
+        """原始截屏（RGBA_8888 像素），返回 (pixels, width, height)。
+
+        为什么不用 `-p`（PNG）：抠图要按像素裁，而解码 PNG 需要额外依赖（Pillow）。
+        `screencap` 不带 `-p` 直接给原始像素，裁剪 + 自己编码 PNG 只用标准库（见 utils/pngtool.py）。
+
+        头部长度：12 字节（w,h,format）或 16 字节（多一个 colorspace，Android 9+ 实测 WSA 就是
+        16：第 12~15 字节 = 1）。**按"总长度减去头部后正好等于 w*h*4"来判定**——
+        实机实测 len=4196368、w*h*4=4196352：12 字节读法会多出 4 字节（会把像素整体错位一个像素），
+        16 字节读法刚好吻合。
+        """
+        res = self._run(["exec-out", "screencap"], timeout=60, binary=True)
+        raw = res[0] if isinstance(res, tuple) else res
+        if not raw or len(raw) < 12:
+            raise AdbError("screencap 返回空数据")
+        w, h, _fmt = struct.unpack("<III", raw[:12])
+        if w <= 0 or h <= 0:
+            raise AdbError(f"screencap 头异常: {w}x{h}")
+        need = w * h * 4
+        pick = None
+        for header in (16, 12):
+            slack = len(raw) - header - need
+            if slack >= 0 and (pick is None or slack < pick[1]):
+                pick = (header, slack)
+        if pick is None:
+            raise AdbError(f"screencap 数据不完整: {len(raw)} < {12 + need}")
+        start = pick[0]
+        return raw[start:start + need], w, h
+
+    def screencap_crop_png(self, box) -> bytes:
+        """截屏并抠出 box=(x1,y1,x2,y2)，返回 PNG 字节（用于把表情包原样发出去）。"""
+        rgba, w, h = self.screencap_rgba()
+        return pngtool.crop_png_from_rgba(rgba, w, h, box)
 
     # ------------------------------------------------------------------ UI 解析
     def dump_ui(self, retries: int | None = None, delay: float | None = None) -> ET.Element:

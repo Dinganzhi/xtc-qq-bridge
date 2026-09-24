@@ -16,13 +16,16 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import struct
 import sys
 import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -779,6 +782,211 @@ def test_poll_loop_yields_to_pending_send() -> None:
         br._send_pending_ts = time.monotonic() - 31
         run(br, 0.5)
         check("让路最多 30 秒（超时后轮询照常跑）", calls["n"] >= 1, str(calls))
+    finally:
+        cleanup(root)
+
+
+def test_png_encoder_and_crop() -> None:
+    """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
+
+    校验方式：自己把 PNG 解回来（解析 chunk + zlib 解压 + 反 filter=0），
+    比只看"字节非空"可靠得多。
+    """
+    from utils import pngtool
+
+    def decode_png(png: bytes) -> tuple:
+        check("PNG 签名正确", png.startswith(pngtool.PNG_SIGNATURE))
+        pos, chunks, idat = 8, {}, b""
+        while pos < len(png):
+            length = int.from_bytes(png[pos:pos + 4], "big")
+            tag = png[pos + 4:pos + 8]
+            data = png[pos + 8:pos + 8 + length]
+            crc = int.from_bytes(png[pos + 8 + length:pos + 12 + length], "big")
+            check(f"chunk {tag.decode()} CRC 正确",
+                  crc == (zlib.crc32(tag + data) & 0xFFFFFFFF))
+            chunks[tag] = data
+            if tag == b"IDAT":
+                idat += data
+            pos += 12 + length
+        w, h, depth, ctype = struct.unpack(">IIBB", chunks[b"IHDR"][:10])
+        return w, h, depth, ctype, zlib.decompress(idat)
+
+    # ① 2x2 纯色图：编码 -> 解码应完全一致
+    row = bytes([10, 20, 30, 40, 50, 60])
+    png = pngtool.encode_png_rgb(2, 2, [row, row])
+    w, h, depth, ctype, raw = decode_png(png)
+    check("IHDR 尺寸/位深/颜色类型正确", (w, h, depth, ctype) == (2, 2, 8, 2), f"{w}x{h} {ctype}")
+    check("像素数据往返一致", raw == b"\x00" + row + b"\x00" + row, repr(raw))
+
+    # ② 从"整屏 RGBA"里抠一块：坐标/颜色要对得上
+    W, H = 4, 3
+    rgba = bytearray()
+    for y in range(H):
+        for x in range(W):
+            rgba += bytes([x * 10, y * 10, 200, 255])          # R=10x, G=10y, B=200
+    out = pngtool.crop_png_from_rgba(bytes(rgba), W, H, (1, 1, 3, 3))
+    w2, h2, _d, _c, raw2 = decode_png(out)
+    check("抠图尺寸正确", (w2, h2) == (2, 2), f"{w2}x{h2}")
+    rows = [raw2[i * (w2 * 3 + 1) + 1: i * (w2 * 3 + 1) + 1 + w2 * 3] for i in range(h2)]
+    check("抠图像素来自指定区域（且丢掉了 alpha）",
+          rows == [bytes([10, 10, 200, 20, 10, 200]), bytes([10, 20, 200, 20, 20, 200])],
+          str(rows))
+
+    # ③ 越界坐标会被夹回画面内（不能抛、也不能越界读）
+    out3 = pngtool.crop_png_from_rgba(bytes(rgba), W, H, (-5, -5, 99, 99))
+    w3, h3, _d, _c, _r = decode_png(out3)
+    check("越界坐标夹到屏幕内", (w3, h3) == (W, H), f"{w3}x{h3}")
+    check("数据不完整时返回空（调用方按失败处理）",
+          pngtool.rgba_to_rgb_rows(b"\x00" * 10, 4, 3, (0, 0, 2, 2)) == [])
+
+
+def test_screencap_header_parsing() -> None:
+    """screencap 原始像素的头部解析：12 字节（Android 9+）与 16 字节（多 colorspace）都要认。"""
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    w, h = 3, 2
+    pixels = bytes(range(1, w * h * 4 + 1))
+
+    ctl._run = lambda *a, **k: (struct.pack("<III", w, h, 1) + pixels, "")
+    got, gw, gh = ctl.screencap_rgba()
+    check("12 字节头解析正确", (gw, gh) == (w, h) and got == pixels, f"{gw}x{gh} {len(got)}")
+
+    ctl._run = lambda *a, **k: (struct.pack("<IIII", w, h, 1, 0) + pixels, "")
+    got2, gw2, gh2 = ctl.screencap_rgba()
+    check("16 字节头解析正确", (gw2, gh2) == (w, h) and got2 == pixels, f"{gw2}x{gh2} {len(got2)}")
+
+    ctl._run = lambda *a, **k: (struct.pack("<III", 9, 9, 1) + b"\x00" * 16, "")
+    try:
+        ctl.screencap_rgba()
+        check("数据不完整要报错", False, "没有抛异常")
+    except Exception as e:  # noqa: BLE001
+        check("数据不完整要报错", "不完整" in str(e), str(e)[:60])
+
+
+def test_sticker_detection_and_capture() -> None:
+    """表情/贴纸识别 + 按气泡截图（单向：小天才 -> QQ）。"""
+    sticker_xml = node_xml(
+        n(cls="android.widget.TextView", text="回家中", desc="屑猹不喝茶发的消息,回家中",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[1070,586][1310,658]") +
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]") +
+        n(cls="android.widget.TextView", text="表情包发我", desc="屑猹不喝茶发的消息,表情包发我",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,100][965,160]"))
+    xtc, adb = make_xtc(sticker_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+    items = xtc._chat_bubbles(ET.fromstring(sticker_xml))
+    stickers = [it["text"] for it in items if it.get("sticker")]
+    check("只把 ImageView 的「表情X」判成表情",
+          stickers == ["表情啊啊啊"], str([(it["text"], it.get("sticker")) for it in items]))
+    check("文字消息「表情包发我」不算表情（不能靠前缀猜）",
+          all(it.get("sticker") is False for it in items if it["text"] == "表情包发我"),
+          str(items))
+
+    hit = xtc.sticker_of_latest(ET.fromstring(sticker_xml), "表情啊啊啊")
+    check("能取到最新表情气泡的位置",
+          bool(hit) and hit["bounds"] == (948, 267, 1068, 387), str(hit))
+    check("文本不匹配时不会拿错气泡",
+          xtc.sticker_of_latest(ET.fromstring(sticker_xml), "表情没有的") is None)
+
+    # 截图：ADB 侧用假的原始像素，验证"按气泡区域抠出来"
+    captured = {}
+
+    def fake_crop(box):
+        captured["box"] = box
+        return b"\x89PNG" + b"x" * 400
+
+    adb.screencap_crop_png = fake_crop
+    png = xtc.capture_sticker((948, 267, 1068, 387))
+    check("按气泡区域截图", captured.get("box") == (948, 267, 1068, 387), str(captured))
+    check("返回 PNG 字节", bool(png) and png.startswith(b"\x89PNG"), str(png)[:20])
+    # 截图失败 -> None（调用方退回文字），不能抛
+    adb.screencap_crop_png = lambda box: (_ for _ in ()).throw(RuntimeError("截图炸了"))
+    check("截图异常返回 None（不抛）", xtc.capture_sticker((948, 267, 1068, 387)) is None)
+    check("气泡太小/不在屏内都不截",
+          xtc.capture_sticker((0, 0, 5, 5)) is None and xtc.capture_sticker((9999, 9999, 10050, 10050)) is None)
+
+
+def test_sticker_forward_one_way() -> None:
+    """表情包只走 小天才 -> QQ；截图失败自动退回发文字；QQ -> 小天才 一律文字。"""
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self):
+            self.texts: list = []
+            self.images: list = []
+
+        def send_detail(self, t, i, m):
+            self.texts.append((t, i, m))
+            return True, ""
+
+        def send_image(self, t, i, image_b64, caption=""):
+            self.images.append((t, i, image_b64, caption))
+            return True, ""
+
+    sticker_xml = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]"))
+    try:
+        # ① 有截图 -> 发图片（带说明文字）
+        fwd = _Fwd()
+        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+               "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=fwd, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        xtc, adb = make_xtc(sticker_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        adb.screencap_crop_png = lambda box: b"\x89PNG" + b"y" * 400
+        br.xtc = xtc
+        image = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
+        check("轮询线程里能截到表情图", bool(image), str(image)[:20])
+        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", image=image)
+        check("表情走图片通道", len(fwd.images) == 1 and not fwd.texts,
+              f"images={len(fwd.images)} texts={fwd.texts}")
+        t, i, b64, caption = fwd.images[0]
+        check("图片内容是 base64 PNG",
+              t == "private" and i == "2218631043"
+              and base64.b64decode(b64).startswith(b"\x89PNG"), f"{t}:{i} {b64[:12]}")
+        check("说明文字带来源与时间（可关）",
+              "屑猹不喝茶" in caption and "13:03" in caption, caption)
+
+        # ② 截图失败 -> 退回文字（不丢消息）
+        fwd2 = _Fwd()
+        br.forwarder = fwd2
+        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", image=None)
+        check("没有图片时走文字（老行为）",
+              len(fwd2.texts) == 1 and not fwd2.images, f"{fwd2.texts} {fwd2.images}")
+
+        # ③ 关掉表情图开关 -> 只发文字
+        fwd3 = _Fwd()
+        cfg3 = dict(cfg)
+        cfg3["emoji"] = {"forward_image": False}
+        br3 = bridge_mod.MessageBridge(cfg3, adb=None, xtc=None, forwarder=fwd3, logger=None)
+        br3.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br3._cmd_done_file = str(_paths(root)["done"])
+        br3.xtc = xtc
+        check("emoji.forward_image=false 时不截图",
+              br3._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊") is None)
+        br3._forward("屑猹不喝茶", "表情啊啊啊", "13:03",
+                     image=br3._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊"))
+        check("关掉后只发文字", len(fwd3.texts) == 1 and not fwd3.images, str(fwd3.images))
+
+        # ④ 单向：QQ -> 小天才 的发送路径里没有任何图片逻辑
+        fwd4 = _Fwd()
+        xtc4 = Xiaotiancai(FakeAdb(chat_page_xml(), "com.xtc.watch/.ChatActivity"),
+                           {"ui": {}}, logger=None)
+        sent = {"n": 0}
+
+        def fake_send(text):
+            sent["n"] += 1
+            return True
+
+        xtc4.send_message = fake_send
+        br4 = bridge_mod.MessageBridge(cfg, adb=None, xtc=xtc4, forwarder=fwd4, logger=None)
+        br4.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br4._cmd_done_file = str(_paths(root)["done"])
+        br4._do_send_job("普通文字", "2218631043", "", "")
+        check("QQ->小天才 只用文字（图片是单向的）",
+              sent["n"] == 1 and not fwd4.images and not fwd4.texts,
+              f"sent={sent} images={fwd4.images}")
     finally:
         cleanup(root)
 
@@ -2421,7 +2629,7 @@ def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
     br._catchup_max = catchup_max
     # 线上是"入队 + 工作线程异步转发"；测试里没有工作线程，
     # 这里把入队替换成同步执行，逻辑（撞库判定/入库/顺序）保持一致。
-    br._queue_forward = lambda c, t, l: br._do_forward_job(c, t, l)
+    br._queue_forward = lambda c, t, l, image=None: br._do_forward_job(c, t, l, image=image)
     for t in (known or []):
         br.msgs.append("xtc", "屑猹不喝茶", t)
     return br
@@ -2584,7 +2792,9 @@ def main() -> int:
                test_send_result_is_honest, test_send_speed_fast_path,
                test_recent_snapshot_window, test_plain_injection_skips_dump,
                test_ime_check_is_cached, test_launch_app_skips_hard_failures_fast,
-               test_poll_loop_yields_to_pending_send, test_confirm_sent_rule,
+               test_poll_loop_yields_to_pending_send,
+               test_png_encoder_and_crop, test_screencap_header_parsing,
+               test_sticker_detection_and_capture, test_sticker_forward_one_way, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

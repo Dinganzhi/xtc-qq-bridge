@@ -1,0 +1,18 @@
+表情包转发（仅 小天才 -> QQ 单向）
+
+手表发来的表情/贴纸现在当**图片**发到 QQ，而不是只发"表情啊啊啊"这样的文字。
+
+- xiaotiancai：气泡解析标出 sticker（ImageView + desc「…,表情X」，文字消息不算），
+  新增 sticker_of_latest()（取最新表情气泡的位置）与 capture_sticker()（按气泡区域截图）
+- adb_controller：screencap_rgba()（原始 RGBA 像素，按"总长-头部=w*h*4"判定 12/16 字节头，
+  实机 WSA 是 16 字节：第 12~15 字节 colorspace=1）+ screencap_crop_png()
+- utils/pngtool.py：纯标准库抠图 + PNG 编码（不引 Pillow：单文件产物不额外变大）
+- bridge：_capture_sticker() 在**轮询线程**里截图（那一刻气泡位置才准），
+  image 随转发任务传给工作线程；_forward() 有图就发图（可带说明文字），
+  任何一步失败都退回发文字，绝不因表情丢消息
+- plugin_client / 插件：/api/forward 多带 image_b64，插件用
+  MessageChain().message(caption).base64_image(b64) 发出去
+- 配置：emoji.forward_image（默认开）、emoji.caption（图片是否带说明）
+- 测试：新增 4 组（PNG 往返解码/头部解析/表情识别与截图/单向与退回文字），
+  349 回归 + 58 集成 + 25 路径 + 44 守护 全绿
+- 顺手把 AstrBot 插件目录里的旧副本（09-12）同步成仓库版本（已备份 xtc_qq_bridge.bak-20260924）

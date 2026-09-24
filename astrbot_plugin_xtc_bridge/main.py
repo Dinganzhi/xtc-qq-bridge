@@ -381,14 +381,18 @@ class Main(star.Star):
         self._httpd = ThreadingHTTPServer((host, port), handler)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
-    def _on_forward_request(self, target_type: str, target_id: str, text: str):
+    def _on_forward_request(self, target_type: str, target_id: str, text: str,
+                            image_b64: str = ""):
         """HTTP 线程调用：切到主事件循环发送，返回 Future 供等待实际结果。
-        未初始化（无事件循环）时入队并返回 None。"""
+        未初始化（无事件循环）时入队并返回 None。
+
+        image_b64：可选，小天才 -> QQ 的**表情包**截图（base64 PNG）。
+        """
         if self._loop is not None and self._loop.is_running():
             return asyncio.run_coroutine_threadsafe(
-                self._do_send(target_type, target_id, text), self._loop
+                self._do_send(target_type, target_id, text, image_b64), self._loop
             )
-        self._pending.append((target_type, target_id, text))
+        self._pending.append((target_type, target_id, text, image_b64))
         return None
 
     def _flush_pending(self) -> None:
@@ -398,11 +402,13 @@ class Main(star.Star):
             asyncio.run_coroutine_threadsafe(self._do_send(*item), self._loop)
         self._pending.clear()
 
-    async def _do_send(self, target_type: str, target_id: str, text: str):
+    async def _do_send(self, target_type: str, target_id: str, text: str,
+                       image_b64: str = ""):
         """把消息发到 QQ。返回 (是否成功, 失败原因)。
 
         带出原因很重要：桥接侧只看到 ok=false 时无法区分"QQ/NapCat 没连上"
         和"目标不存在"，日志会误导排查方向。
+        image_b64 非空时带上图片（表情包转发）。
         """
         platform = self.config.get("platform_id") or ""
         if not platform and self._platform_ids:
@@ -414,7 +420,14 @@ class Main(star.Star):
             return False, err
         msg_type = "GroupMessage" if target_type == "group" else "FriendMessage"
         session = f"{platform}:{msg_type}:{target_id}"
-        chain = MessageChain().message(text)
+        chain = MessageChain()
+        if text:
+            chain.message(text)
+        if image_b64:
+            try:
+                chain.base64_image(image_b64)
+            except Exception as e:  # noqa: BLE001 图片坏了就只发文字，别整条丢掉
+                self._lg().warning(f"[xtc_qq_bridge] 表情包图片解析失败，只发文字: {e}")
         try:
             ok = await self.context.send_message(session, chain)
             if not ok:
@@ -602,7 +615,8 @@ class Main(star.Star):
 class _HttpHandler(BaseHTTPRequestHandler):
     """本地端点：
     GET  /api/ping                -> 健康检查
-    POST /api/forward             -> 转发消息 {target_type, target_id, message}（等待实际结果）
+    POST /api/forward             -> 转发消息 {target_type, target_id, message[, image_b64]}
+                                     （等待实际结果；image_b64 = 表情包截图，可选）
     POST /api/result              -> 桥接结果回传 {request_id, message}（引用+@ 回复发送人）
     POST /api/qq_search           -> xtc 侧「搜索」：白名单私聊/群聊按昵称搜人
     POST /api/qq_online           -> xtc 侧「在线人数」：最近N分钟白名单会话发言人数
@@ -694,12 +708,13 @@ class _HttpHandler(BaseHTTPRequestHandler):
         target_type = body.get("target_type", "private")
         target_id = str(body.get("target_id", ""))
         text = body.get("message", "")
-        if not target_id or not text:
+        image_b64 = str(body.get("image_b64") or "")
+        if not target_id or not (text or image_b64):
             self._json({"ok": False, "error": "missing target_id/message"}, 400)
             return
         if self.plugin is not None:
             # 等待实际发送结果再返回，避免"假成功"（发送失败时桥侧会重试）
-            future = self.plugin._on_forward_request(target_type, target_id, text)
+            future = self.plugin._on_forward_request(target_type, target_id, text, image_b64)
             if future is not None:
                 try:
                     res = future.result(timeout=30)
