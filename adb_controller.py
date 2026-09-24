@@ -941,6 +941,34 @@ class ADBController:
             return False
         return self.screen_on() is not False
 
+    def wake_if_asleep(self) -> bool:
+        """**息屏才唤醒**，返回是否真的做了唤醒。
+
+        WSA 会随宿主窗口状态（窗口失去焦点/被别的窗口盖住）让虚拟屏睡过去：
+        `screen_off_timeout` 拉到极大值、`svc power stayon true` 都挡不住（实测设置都还在，
+        屏照样睡）。所以每次判断"App 是不是在前台"之前先花 ~0.3 秒问一次电源状态，
+        睡着就叫醒 —— 唤醒后 App 通常立刻回到前台（它本来就是 resumed 的 Activity），
+        比"重新拉起 App"（实测要 20 秒）划算得多。
+        """
+        if self.screen_on() is not False:
+            return False
+        self._screen_suspect = True          # 记住"这块屏会睡"，之后 dump 前主动先唤醒
+        self.wake_up()
+        return True
+
+    def poke_awake(self) -> bool:
+        """便宜的"别睡"心跳：直接发 WAKEUP（已经亮着时是无害空操作）。
+
+        桥接每隔 `adb.keep_awake_interval`（默认 30 秒）调一次：既把睡过去的屏叫醒，
+        也重置"用户活动"计时，让 App 尽量一直留在前台（前台判定的坑就少一大半）。
+        """
+        try:
+            self.shell("input keyevent 224", timeout=10)
+            self.invalidate_focus()
+            return True
+        except AdbError:
+            return False
+
     def keep_awake(self) -> bool:
         """让子系统**保持常亮**（桥接运行期间）。
 
@@ -961,7 +989,9 @@ class ADBController:
                 ok = True
         if self.screen_on() is not True:
             self.wake_up()
-        self._screen_suspect = self.screen_on() is not True
+        # 粘性：一旦见过息屏，就永远"可疑"，之后每次 dump 前都会先确认+唤醒
+        # （早先这里会被重置成 False，于是又走"dump 失败 -> 唤醒 -> 重试"的 5~8 秒慢路）
+        self._screen_suspect = self._screen_suspect or (self.screen_on() is not True)
         return ok
 
     # ------------------------------------------------------------------ 操作

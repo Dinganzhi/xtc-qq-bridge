@@ -134,6 +134,14 @@ class FakeAdb:
     def screen_on(self):
         return True
 
+    def wake_if_asleep(self) -> bool:
+        """假设备默认"屏幕亮着"（真实实现见 adb_controller.wake_if_asleep）。"""
+        return False
+
+    def poke_awake(self) -> bool:
+        self.calls.append("poke_awake")
+        return True
+
     def wake_up(self) -> bool:
         self.calls.append("wake_up")
         return True
@@ -1196,6 +1204,113 @@ def test_blind_send_fast_typing() -> None:
           br._blind_send_allowed("屑猹不喝茶") is True)
     br._chat_ok_ts = time.monotonic() - 60
     check("超过 15 秒没再确认过就不先手", br._blind_send_allowed("屑猹不喝茶") is False)
+
+
+def test_wake_before_relaunch() -> None:
+    """用户报"隔三差五就息屏/被判不在前台，其实我什么都没动"。
+
+    WSA 的虚拟屏会随**宿主窗口状态**睡过去（`screen_off_timeout` 拉到极大值、
+    `svc power stayon true` 都挡不住 —— 实测设置都在、屏照样睡）。屏一睡：
+      * App 看起来"不在前台"（前台变成 com.microsoft.windows.homeapp/PlaceholderActivity）；
+      * uiautomator 报 null root node。
+    旧逻辑遇到"不在前台"就直接**重新拉起 App**（实测 ~20 秒），而其实窗口还在、
+    Activity 还是 resumed —— 叫醒屏幕就回来了。这条用例盯住这个行为。
+    """
+    # ① 息屏导致"不在前台" -> 先唤醒，不重启 App
+    #  （息屏时 dump 出来的是 WSA 主屏的空壳，不是聊天页——所以要按"睡着就换 XML"来模拟）
+    adb = FakeAdb("",
+                  focus="com.microsoft.windows.homeapp/com.microsoft.windows.placeholder.PlaceholderActivity")
+    adb.asleep = True
+    adb.screen_on = lambda: not adb.asleep
+
+    def dump_ui(retries=3, delay=2.0):
+        return ET.fromstring(node_xml("") if adb.asleep else chat_page_xml())
+
+    adb.dump_ui = dump_ui
+
+    def wake_if_asleep():
+        if not adb.asleep:
+            return False
+        adb.asleep = False
+        adb.focus = "com.xtc.watch/com.xtc.wechat.view.chatlist.ChatActivity"
+        adb.calls.append("wake_if_asleep")
+        return True
+
+    adb.wake_if_asleep = wake_if_asleep
+    xtc = Xiaotiancai(adb, {"ui": {}}, logger=None)
+    ok = xtc.open_chat("屑猹不喝茶")
+    check("息屏时先唤醒就能用（返回成功）", ok is True)
+    check("确实走了「息屏先唤醒」这条路", "wake_if_asleep" in adb.calls, str(adb.calls))
+    check("没有白白重新拉起 App", not any("am start" in c or "monkey" in c for c in adb.calls),
+          str(adb.calls))
+
+    # ② 屏幕亮着、App 是真的不在前台（例如 WSA 停在主屏）-> 才启动 App
+    adb2 = FakeAdb(node_xml(n(cls="android.widget.TextView", text="桌面")),
+                   focus="com.android.launcher/.Launcher")
+    xtc2 = Xiaotiancai(adb2, {"ui": {}}, logger=None)
+    xtc2.open_chat("屑猹不喝茶")
+    check("真的不在前台才启动 App",
+          any("am start" in c or "monkey" in c for c in adb2.calls), str(adb2.calls))
+    check("没息屏时不乱唤醒", "wake_up" not in adb2.calls, str(adb2.calls))
+
+    # ③ wake_if_asleep 的语义：睡着才唤醒，并记住"这块屏会睡"（之后 dump 前主动先唤醒）
+    from adb_controller import ADBController as _C
+    ctl = _C(adb_path="adb")
+    ctl.screen_on = lambda: False
+    ctl.wake_up = lambda: (setattr(ctl, "_woke", getattr(ctl, "_woke", 0) + 1), True)[1]
+    check("睡着时会唤醒", ctl.wake_if_asleep() is True and getattr(ctl, "_woke", 0) == 1)
+    check("唤醒后把这块屏标记为可疑（dump 前会先确认）", ctl._screen_suspect is True)
+    ctl.screen_on = lambda: True
+    check("亮着时不重复唤醒",
+          ctl.wake_if_asleep() is False and getattr(ctl, "_woke", 0) == 1)
+
+
+def test_keep_awake_heartbeat() -> None:
+    """轮询里的"别睡"心跳：隔一会儿发一次 WAKEUP，屏不睡 -> App 一直在前台。"""
+    import threading
+
+    class PokeAdb(FakeAdb):
+        def __init__(self):
+            super().__init__("", "com.xtc.watch/.ChatActivity")
+            self.pokes = 0
+
+        def is_connected(self) -> bool:
+            return True
+
+        def ensure_connected(self) -> bool:
+            return True
+
+        def poke_awake(self) -> bool:
+            self.pokes += 1
+            return True
+
+    calls = {"n": 0}
+
+    class CountingXtc(Xiaotiancai):
+        def app_state_with_root(self, attempts: int = 2):
+            calls["n"] += 1
+            return (self.STATE_CHAT, ET.fromstring(chat_page_xml()))
+
+    root = tmp_root()
+    try:
+        adb = PokeAdb()
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=adb, xtc=CountingXtc(adb, {"ui": {}}, logger=None),
+                                      forwarder=None, logger=Recorder())
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._poll_interval = 0.2
+        br._keep_awake_interval = 0.25       # 压短以便测试
+        br._last_awake_poke = float("-inf")
+        br.running = True
+        t = threading.Thread(target=br._poll_loop, daemon=True)
+        t.start()
+        time.sleep(0.9)
+        br.running = False
+        t.join(3)
+        check("轮询会周期性发保活心跳", adb.pokes >= 2, f"pokes={adb.pokes}")
+    finally:
+        cleanup(root)
 
 
 def test_confirm_sent_rule() -> None:
@@ -3003,7 +3118,8 @@ def main() -> int:
                test_poll_loop_yields_to_pending_send,
                test_png_encoder_and_crop, test_screencap_header_parsing,
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
-               test_emoji_store_reads_original_file, test_blind_send_fast_typing, test_confirm_sent_rule,
+               test_emoji_store_reads_original_file, test_blind_send_fast_typing,
+               test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

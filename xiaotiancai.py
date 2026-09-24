@@ -1367,13 +1367,22 @@ class Xiaotiancai:
         # 0) App 不在前台（例如 WSA 停在主屏/别的窗口）-> 先把它拉到前台，
         #    否则会在 WSA 主屏上找联系人，然后报"找不到联系人"（实机测试发现的坑）。
         if not self.adb.is_in_foreground(self.package):
-            self.log("info", f"小天才 App 不在前台（当前={self.current_activity() or '未知'}），先启动它")
-            if not self.launch():
-                self.log("warning", "打开聊天失败：小天才 App 没能拉到前台")
-                return False
-            self._dismiss_blockers()
-            if self.is_in_chat():
-                return True
+            # 0.1) 先排除"只是息屏/窗口没焦点"：WSA 睡过去时 App 同样看起来不在前台，
+            #      但窗口还在、Activity 还是 resumed 的 —— 叫醒即可，不必重新拉起 App
+            #      （实测"重新拉起"要 20 秒，唤醒只要 ~1.5 秒）。
+            if self.adb.wake_if_asleep() and self.adb.is_in_foreground(self.package):
+                self.log("info", "子系统息屏导致 App 不在前台，唤醒后已回到前台（无需重启 App）")
+                self._dismiss_blockers()
+                if self.is_in_chat():
+                    return True
+            else:
+                self.log("info", f"小天才 App 不在前台（当前={self.current_activity() or '未知'}），先启动它")
+                if not self.launch():
+                    self.log("warning", "打开聊天失败：小天才 App 没能拉到前台")
+                    return False
+                self._dismiss_blockers()
+                if self.is_in_chat():
+                    return True
         self._dismiss_blockers()
         # 读到界面之前先看一眼登录态：未登录时没必要去找联系人
         # （实机测试：未登录时在登录页反复找联系人会白等 40 多秒）

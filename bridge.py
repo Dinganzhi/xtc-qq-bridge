@@ -165,6 +165,12 @@ class MessageBridge:
         # 最近一次"轮询确认过就在聊天页"的时刻与标题（"先手打字"快发的放行条件）
         self._chat_ok_ts = float("-inf")
         self._chat_ok_title = ""
+        # "别睡"心跳：每 keep_awake_interval 秒发一次 WAKEUP（0 = 关闭）
+        try:
+            self._keep_awake_interval = float((cfg.get("adb") or {}).get("keep_awake_interval", 30) or 0)
+        except (TypeError, ValueError):
+            self._keep_awake_interval = 30.0
+        self._last_awake_poke = float("-inf")
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
@@ -296,6 +302,16 @@ class MessageBridge:
             if self._send_pending and (loop_started - self._send_pending_ts) < 30:
                 time.sleep(0.05)
                 continue
+            # 轻量"别睡"心跳：WSA 会随宿主窗口状态息屏（screen_off_timeout 拉满也挡不住），
+            # 隔一会儿发一次 WAKEUP，把屏叫醒并重置用户活动计时 —— 屏不睡，App 就一直在前台，
+            # "App 不在前台 -> 重新拉起"（实测每次 ~20 秒）和"先手打字"被门闩挡住都会少很多。
+            if self._keep_awake_interval > 0 and \
+                    loop_started - self._last_awake_poke >= self._keep_awake_interval:
+                self._last_awake_poke = loop_started
+                try:
+                    self.adb.poke_awake()
+                except Exception as e:  # noqa: BLE001 心跳失败不影响轮询
+                    self._log("debug", f"保活心跳失败: {e}")
             try:
                 now = time.monotonic()
                 if now - last_heartbeat >= self._heartbeat_interval:
@@ -337,6 +353,15 @@ class MessageBridge:
                             self._log_once("state_login",
                                            "当前在小天才登录/安全验证页，等待登录完成"
                                            "（此时不会去找联系人）", interval=600)
+                        elif state == self.xtc.STATE_BACKGROUND:
+                            # WSA 窗口失去焦点/息屏时 App 会"看起来不在前台"，但窗口往往还在。
+                            # 先花 ~0.3 秒问一次电源状态：睡着就叫醒 —— 唤醒后 App 通常立刻
+                            # 回到前台（它本来就是 resumed 的 Activity），下一轮就能正常读消息，
+                            # 省掉"重新拉起 App"那 20 秒。
+                            if self.adb is not None and self.adb.wake_if_asleep():
+                                self._log_once("wake_asleep",
+                                               "子系统息屏导致 App 不在前台，已唤醒屏幕"
+                                               "（唤醒后通常直接回到聊天页）", interval=120)
                         elif state == self.xtc.STATE_POPUP:
                             # 弹窗遮挡（如"升级提醒"）：弹窗不关就完全读不到消息，
                             # 所以这里**不设冷却**，每次轮询都尝试关掉；
@@ -749,11 +774,11 @@ class MessageBridge:
 
         为什么要这个门闩：先手打字是按**缓存坐标**盲点输入框/发送按钮，
         只有"确实在目标聊天页"时才安全。条件：
-          * 近 15 秒内轮询判过 STATE_CHAT；
+          * 近 30 秒内轮询判过 STATE_CHAT；
           * 那次读到的聊天标题就是目标联系人（防止盲点把消息发到别的聊天里）；
           * 上次成功发送留下了坐标缓存（`blind_send_ready`）。
         """
-        if time.monotonic() - self._chat_ok_ts > 15.0:
+        if time.monotonic() - self._chat_ok_ts > 30.0:
             return False
         title = (self._chat_ok_title or "").strip()
         want = (self._display_name(contact) or contact or "").strip()
