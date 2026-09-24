@@ -1151,6 +1151,18 @@ class ADBController:
         rgba, w, h = self.screencap_rgba()
         return pngtool.crop_png_from_rgba(rgba, w, h, box)
 
+    def read_file(self, path: str, timeout: float = 30.0) -> bytes:
+        """读设备上的文件（`exec-out cat`，二进制直出）。
+
+        用途：读小天才 App 可读数据目录里的表情原图（含动图 GIF）——比截图保真得多。
+        读不到（不存在/没权限）返回 b""，不抛异常。
+        """
+        try:
+            out, _ = self._run(["exec-out", f"cat {path}"], timeout=timeout, binary=True)
+            return out or b""
+        except Exception:  # noqa: BLE001 调用方按"没有"处理
+            return b""
+
     # ------------------------------------------------------------------ UI 解析
     def dump_ui(self, retries: int | None = None, delay: float | None = None) -> ET.Element:
         """uiautomator dump 并解析为 XML 树。线程安全（串行化），失败自动重试。

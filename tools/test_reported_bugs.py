@@ -905,8 +905,91 @@ def test_sticker_detection_and_capture() -> None:
           xtc.capture_sticker((0, 0, 5, 5)) is None and xtc.capture_sticker((9999, 9999, 10050, 10050)) is None)
 
 
+def test_emoji_store_reads_original_file() -> None:
+    """表情**原文件**读取：优先缓存里刚写进来的那张（动图保动画），其次表情包目录按名字匹配。"""
+    from emoji_store import EmojiStore
+
+    def gif(w=90, h=90, frames=11, loop=True, pad=b"") -> bytes:
+        head = b"GIF89a" + struct.pack("<HH", w, h) + b"\x00" * 10
+        if loop:
+            head += b"NETSCAPE2.0"
+        return head + pad + b"\x21\xf9\x04" * frames + b";"
+
+    def png(w=120, h=120) -> bytes:
+        return (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+                + struct.pack(">II", w, h) + b"\x08\x06\x00\x00\x00")
+
+    # ① 只读文件头判断格式/尺寸/动图
+    check("GIF 识别为动图",
+          EmojiStore.sniff(gif()) == {"kind": "gif", "w": 90, "h": 90, "animated": True},
+          str(EmojiStore.sniff(gif())))
+    check("单帧 GIF 不算动图",
+          EmojiStore.sniff(gif(frames=1, loop=False, pad=b"\x00" * 3000))["animated"] is False,
+          str(EmojiStore.sniff(gif(frames=1, loop=False, pad=b"\x00" * 3000))))
+    check("PNG 识别（静态）", EmojiStore.sniff(png())["kind"] == "png"
+          and EmojiStore.sniff(png())["w"] == 120)
+    apng = png() + b"acTL" + b"\x00" * 32
+    check("APNG 识别为动图", EmojiStore.sniff(apng)["animated"] is True)
+    check("认不出的头返回空", EmojiStore.sniff(b"hello world") == {})
+
+    class FakeAdb:
+        """假设备：给几条 shell/read_file 的固定回答。"""
+
+        def __init__(self, files: dict, listing: str = "", now: int = 1000):
+            self.files = files
+            self.listing = listing
+            self.now = now
+            self.read_paths: list = []
+
+        def shell(self, cmd: str, timeout=None) -> str:
+            if cmd.startswith("date +%s;"):
+                return f"{self.now}\n{self.listing}"
+            if "-name desc.json" in cmd:
+                return "\n".join(p for p in self.files if p.endswith("desc.json"))
+            return ""
+
+        def read_file(self, path: str, timeout=None) -> bytes:
+            self.read_paths.append(path)
+            return self.files.get(path, b"")
+
+    root = "/sdcard/Android/data/com.xtc.watch"
+    cache_gif = f"{root}/cache/big_image/com.xtc.watch/v1/99/abc.cnt"
+    pack_png = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/138/1/tiancaituQ/big/tiancaituQ_003"
+    desc = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/138/1/tiancaituQ/desc.json"
+    index = json.dumps({"count": 1, "emojis": [{"code": "tiancaituQ_003", "desc": "爱你"}]},
+                       ensure_ascii=False).encode("utf-16")
+
+    # ② 缓存里有"刚写进来"的动图 -> 直接用它（保住动画）
+    adb = FakeAdb({cache_gif: gif(), desc: index},
+                  listing=f"995 28583 {cache_gif}\n960 9999 {root}/cache/old.jpg")
+    store = EmojiStore(adb, package="com.xtc.watch", recent_secs=45)
+    got = store.find("啊啊啊")
+    check("取缓存里最近的动图", bool(got) and got["source"] == "cache" and got["animated"] is True,
+          str({k: v for k, v in (got or {}).items() if k != "data"}))
+    check("时间窗外的老文件不会被当成本次表情",
+          "old.jpg" not in (got or {}).get("path", ""), str((got or {}).get("path")))
+
+    # ③ 缓存里没有 -> 用表情包目录按名字精确匹配（desc.json 是 UTF-16）
+    adb2 = FakeAdb({pack_png: png(), desc: index}, listing="")
+    store2 = EmojiStore(adb2, package="com.xtc.watch")
+    got2 = store2.find("爱你")
+    check("按名字从表情包目录取原图",
+          bool(got2) and got2["source"] == "pack" and got2["path"] == pack_png,
+          str({k: v for k, v in (got2 or {}).items() if k != "data"}))
+    check("名字对不上就不乱取", store2.find("不存在的表情") is None)
+    check("索引只建一次（第二次不再读 desc.json）",
+          store2._pack_index() is store2._pack_index())
+
+    # ④ 缓存里那张是"大照片"时不当表情（避免把聊天里的图当贴纸发）
+    big_jpeg = f"{root}/cache/big_image/com.xtc.watch/v1/11/photo.cnt"
+    jpeg = (b"\xff\xd8\xff\xe0" + b"\x00" * 4
+            + b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, 2000, 3000, 3))
+    adb3 = FakeAdb({big_jpeg: jpeg}, listing=f"999 2117629 {big_jpeg}")
+    check("过大的图不当表情", EmojiStore(adb3, package="com.xtc.watch").find("") is None)
+
+
 def test_sticker_forward_one_way() -> None:
-    """表情包只走 小天才 -> QQ；截图失败自动退回发文字；QQ -> 小天才 一律文字。"""
+    """表情包只走 小天才 -> QQ；原文件优先、截图兜底、失败退文字；QQ -> 小天才 一律文字。"""
     root = tmp_root()
 
     class _Fwd:
@@ -925,37 +1008,55 @@ def test_sticker_forward_one_way() -> None:
     sticker_xml = node_xml(
         n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
           rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]"))
+    cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+           "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
     try:
-        # ① 有截图 -> 发图片（带说明文字）
+        # ① 有原文件 -> 发原图（动图保住动画），截图通道根本不用
         fwd = _Fwd()
-        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
-               "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
         br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=fwd, logger=None)
         br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
         br._cmd_done_file = str(_paths(root)["done"])
         xtc, adb = make_xtc(sticker_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
-        adb.screencap_crop_png = lambda box: b"\x89PNG" + b"y" * 400
         br.xtc = xtc
-        image = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
-        check("轮询线程里能截到表情图", bool(image), str(image)[:20])
-        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", image=image)
+        shot = {"n": 0}
+        adb.screencap_crop_png = lambda box: (shot.__setitem__("n", shot["n"] + 1),
+                                              b"\x89PNG" + b"y" * 400)[1]
+
+        class _Store:
+            def find(self, name):
+                return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
+                        "animated": True, "path": "/x/y.cnt", "source": "cache"}
+
+        br._emoji_store = _Store()
+        br._emoji_from_data = True
+        got = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
+        check("优先取 App 里的原文件（动图）",
+              bool(got) and got["source"] == "cache" and got["animated"] is True, str(got))
+        check("拿到原文件就不截图了", shot["n"] == 0, f"screencap={shot['n']}")
+        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", sticker=got)
         check("表情走图片通道", len(fwd.images) == 1 and not fwd.texts,
               f"images={len(fwd.images)} texts={fwd.texts}")
         t, i, b64, caption = fwd.images[0]
-        check("图片内容是 base64 PNG",
+        check("图片内容是 base64 GIF",
               t == "private" and i == "2218631043"
-              and base64.b64decode(b64).startswith(b"\x89PNG"), f"{t}:{i} {b64[:12]}")
+              and base64.b64decode(b64).startswith(b"GIF89a"), f"{t}:{i} {b64[:12]}")
         check("说明文字带来源与时间（可关）",
               "屑猹不喝茶" in caption and "13:03" in caption, caption)
 
-        # ② 截图失败 -> 退回文字（不丢消息）
+        # ② 原文件取不到 -> 退回截图（静态一帧）
+        br._emoji_store = type("S", (), {"find": lambda self, name: None})()
+        got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
+        check("原文件取不到时退回截图",
+              bool(got2) and got2["source"] == "screenshot" and shot["n"] == 1, str(got2))
+
+        # ③ 全都没有 -> 退回发文字（不丢消息）
         fwd2 = _Fwd()
         br.forwarder = fwd2
-        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", image=None)
-        check("没有图片时走文字（老行为）",
+        br._forward("屑猹不喝茶", "表情啊啊啊", "13:03", sticker=None)
+        check("没有表情图时走文字（老行为）",
               len(fwd2.texts) == 1 and not fwd2.images, f"{fwd2.texts} {fwd2.images}")
 
-        # ③ 关掉表情图开关 -> 只发文字
+        # ④ 关掉表情图开关 -> 只发文字
         fwd3 = _Fwd()
         cfg3 = dict(cfg)
         cfg3["emoji"] = {"forward_image": False}
@@ -963,13 +1064,13 @@ def test_sticker_forward_one_way() -> None:
         br3.msgs = MessageLog(path=str(_paths(root)["msgs"]))
         br3._cmd_done_file = str(_paths(root)["done"])
         br3.xtc = xtc
-        check("emoji.forward_image=false 时不截图",
+        check("emoji.forward_image=false 时不取表情",
               br3._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊") is None)
         br3._forward("屑猹不喝茶", "表情啊啊啊", "13:03",
-                     image=br3._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊"))
+                     sticker=br3._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊"))
         check("关掉后只发文字", len(fwd3.texts) == 1 and not fwd3.images, str(fwd3.images))
 
-        # ④ 单向：QQ -> 小天才 的发送路径里没有任何图片逻辑
+        # ⑤ 单向：QQ -> 小天才 的发送路径里没有任何图片逻辑
         fwd4 = _Fwd()
         xtc4 = Xiaotiancai(FakeAdb(chat_page_xml(), "com.xtc.watch/.ChatActivity"),
                            {"ui": {}}, logger=None)
@@ -2629,7 +2730,8 @@ def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
     br._catchup_max = catchup_max
     # 线上是"入队 + 工作线程异步转发"；测试里没有工作线程，
     # 这里把入队替换成同步执行，逻辑（撞库判定/入库/顺序）保持一致。
-    br._queue_forward = lambda c, t, l, image=None: br._do_forward_job(c, t, l, image=image)
+    br._queue_forward = lambda c, t, l, sticker=None: br._do_forward_job(
+        c, t, l, sticker=sticker)
     for t in (known or []):
         br.msgs.append("xtc", "屑猹不喝茶", t)
     return br
@@ -2794,7 +2896,8 @@ def main() -> int:
                test_ime_check_is_cached, test_launch_app_skips_hard_failures_fast,
                test_poll_loop_yields_to_pending_send,
                test_png_encoder_and_crop, test_screencap_header_parsing,
-               test_sticker_detection_and_capture, test_sticker_forward_one_way, test_confirm_sent_rule,
+               test_sticker_detection_and_capture, test_sticker_forward_one_way,
+               test_emoji_store_reads_original_file, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,
                test_chat_page_detection, test_open_chat_when_already_in_chat,

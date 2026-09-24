@@ -144,11 +144,21 @@ class MessageBridge:
             (cfg.get("xiaotiancai") or {}).get("login_retry_after_risk", 900))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
-        # 表情包（**仅 小天才 -> QQ 单向**）：把贴纸按气泡位置截图发给 QQ；
-        # 截图/发送失败自动退回发"表情X"文字，绝不因为表情而丢消息。
+        # 表情包（**仅 小天才 -> QQ 单向**）：优先读 App 数据目录/图片缓存里的**原文件**
+        # （动图 GIF 能保住动画），拿不到再按气泡截图，最后退回发"表情X"文字。
         _emoji = cfg.get("emoji") or {}
         self._emoji_image = bool(_emoji.get("forward_image", True))
         self._emoji_caption = bool(_emoji.get("caption", True))
+        self._emoji_from_data = bool(_emoji.get("from_app_data", True))
+        self._emoji_store = None
+        if self._emoji_image and self._emoji_from_data and adb is not None:
+            try:
+                from emoji_store import EmojiStore
+                self._emoji_store = EmojiStore(
+                    adb, package=(cfg.get("xiaotiancai") or {}).get("package", "com.xtc.watch"),
+                    logger=logger, recent_secs=float(_emoji.get("cache_recent_secs", 45) or 45))
+            except Exception as e:  # noqa: BLE001 取原文件的能力不可用就只用截图
+                self._log("debug", f"表情原文件读取不可用（改为截图）: {e}")
         # 有发送任务在排队/执行时置位：轮询据此让路（见 _poll_loop），别和发送抢 dump
         self._send_pending = False
         self._send_pending_ts = float("-inf")
@@ -240,8 +250,8 @@ class MessageBridge:
                     # 小天才 -> QQ 的转发放在工作线程做：插件要等 QQ 侧真实结果才回包
                     # （最长 30 秒），放在轮询线程里会把"读屏"一起拖住。
                     _, f_contact, f_text, f_label = job[:4]
-                    f_image = job[4] if len(job) > 4 else None
-                    self._do_forward_job(f_contact, f_text, f_label, image=f_image)
+                    f_sticker = job[4] if len(job) > 4 else None
+                    self._do_forward_job(f_contact, f_text, f_label, sticker=f_sticker)
                 elif kind == "login":
                     _, request_id = job
                     self._do_login_job(request_id)
@@ -389,10 +399,11 @@ class MessageBridge:
                             and not self.dedup.seen(key) and not self.echo.is_echo(text):
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
-                        # 表情包：**必须在轮询线程里**截（此刻快照/气泡位置才是准的）
-                        image = self._capture_sticker(root, text)
+                        # 表情包：**必须在轮询线程里取**（此刻快照/气泡位置才准、
+                        # 缓存里刚写进来的原文件也还在）
+                        sticker = self._capture_sticker(root, text)
                         # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
-                        self._queue_forward(contact, text, time_label, image=image)
+                        self._queue_forward(contact, text, time_label, sticker=sticker)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             # 只补"剩下的"时间：一轮里 dump+转发可能已花 3~4 秒，再无条件 sleep
@@ -432,7 +443,7 @@ class MessageBridge:
             self._log("debug", f"补发扫描失败: {e}")
             return 0
 
-        pending: list[tuple[str, str, bytes | None]] = []
+        pending: list[tuple[str, str, dict | None]] = []
         for it in reversed(bubbles):                # 从最新往回走
             text = (it.get("text") or "").strip()
             if not text:
@@ -451,10 +462,9 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            # 补发的表情包也截图（此刻 root 里就有它的气泡位置，晚了就滚走了）
-            image = (self.xtc.capture_sticker(it.get("bounds"))
-                     if (self._emoji_image and it.get("sticker")) else None)
-            pending.append((text, it.get("time_label") or "", image))
+            # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）
+            sticker = (self._capture_sticker(root, text) if it.get("sticker") else None)
+            pending.append((text, it.get("time_label") or "", sticker))
 
         if not pending:
             return 0
@@ -466,33 +476,33 @@ class MessageBridge:
         self._log("info", f"[补发] 有 {len(pending)} 条消息库里没有，按时间顺序补发")
 
         sent = 0
-        for text, label, image in pending:
+        for text, label, sticker in pending:
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                               f"时间={label or '(无)'} 内容={text!r}（补发）")
             # 异步转发：不阻塞读屏（见 _queue_forward）
-            self._queue_forward(contact, text, label, image=image)
+            self._queue_forward(contact, text, label, sticker=sticker)
             sent += 1
         return sent
 
     def _queue_forward(self, contact: str, text: str, label: str,
-                       image: bytes | None = None) -> None:
+                       sticker: dict | None = None) -> None:
         """把"小天才 -> QQ"的转发丢给工作线程，立刻返回。
 
         为什么异步：插件要等 QQ 侧真实发送结果才回包（最长 30 秒），同步做的话
         轮询线程会被卡住，读屏/检测跟着变慢（转发越快，漏消息窗口也越小）。
         这里立刻 short-term 去重，避免下一轮把同一条再入队。
 
-        image：表情包截图（PNG 字节）。**必须在轮询线程里截**——那一刻界面快照/气泡位置
-        才是准的，等到工作线程再截图，聊天可能已经滚走了。没有它就按文字发（老行为）。
+        sticker：表情图（{data, kind, animated, source}）。**必须在轮询线程里取**——
+        那一刻界面快照/气泡位置才准、缓存里刚写进来的文件也还在；没有它就按文字发。
         """
         self.dedup.mark(("xtc", contact or "", text))
-        self._job_queue.put(("forward", contact, text, label or "", image))
+        self._job_queue.put(("forward", contact, text, label or "", sticker))
 
     def _do_forward_job(self, contact: str, text: str, label: str,
-                        image: bytes | None = None) -> None:
+                        sticker: dict | None = None) -> None:
         """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。"""
         try:
-            ok = self._forward(contact, text, label, image=image)
+            ok = self._forward(contact, text, label, sticker=sticker)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
             ok = False
@@ -504,13 +514,32 @@ class MessageBridge:
             self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
                              source=self._xtc_source(contact), source_id=contact or "")
 
-    def _capture_sticker(self, root, text: str) -> bytes | None:
-        """表情包（仅小天才 -> QQ 单向）：按气泡位置把贴纸截图抠成 PNG。
+    def _capture_sticker(self, root, text: str) -> dict | None:
+        """表情包（仅小天才 -> QQ 单向）：拿到贴纸图片，返回 {data, kind, animated, source}。
 
-        拿不到就返回 None，调用方照样发"表情X"文字，功能不会因为截图失败而丢消息。
+        顺序：
+          1) **App 数据目录/图片缓存里的原文件**（`emoji_store`）：保真，动图保住动画，
+             也不依赖气泡在屏幕上（实测缓存里就是多帧循环 GIF）；
+          2) 按气泡区域截图（原来的做法）：原文件取不到时兜底，只有一帧；
+          3) 都失败返回 None —— 调用方照样发"表情X"文字，不会因为表情丢消息。
         """
         if not self._emoji_image:
             return None
+        name = (text or "").strip()
+        if name.startswith("表情"):
+            name = name[len("表情"):].strip()
+        if self._emoji_from_data and self._emoji_store is not None:
+            try:
+                got = self._emoji_store.find(name)
+            except Exception as e:  # noqa: BLE001 读原文件失败就走截图
+                self._log("debug", f"读表情原文件失败（改用截图）: {e}")
+                got = None
+            if got and got.get("data"):
+                anim = "动图" if got.get("animated") else "静态"
+                where = "图片缓存" if got.get("source") == "cache" else "表情包文件"
+                self._log("info", f"[表情包] 取自{where}：{got.get('kind', '?')} {anim} "
+                                  f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）")
+                return got
         try:
             item = self.xtc.sticker_of_latest(root, text)
             if not item:
@@ -518,9 +547,9 @@ class MessageBridge:
                 return None
             png = self.xtc.capture_sticker(item.get("bounds"))
             if png:
-                self._log("info", f"[表情包] 已截取贴纸 {len(png)} 字节"
+                self._log("info", f"[表情包] 按气泡截图 {len(png)} 字节（静态一帧）"
                                   f"（{item.get('bounds')}），随转发发给 QQ")
-            return png
+                return {"data": png, "kind": "png", "animated": False, "source": "screenshot"}
         except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
             self._log("debug", f"表情包截图失败（按文字转发）: {e}")
             return None
@@ -541,11 +570,11 @@ class MessageBridge:
                   "详见 README「WSA 网络守护」）")
 
     def _forward(self, contact, text: str, time_label: str = "",
-                 image: bytes | None = None) -> bool:
+                 sticker: dict | None = None) -> bool:
         """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。
 
-        image：表情包截图（PNG）。给了就发"图片（+说明文字）"，失败自动退回纯文字。
-        **单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字（见 forward_to_xiaotiancai）。
+        sticker：表情图（{data, kind, animated}）。给了就发"图片（+说明文字）"，
+        失败自动退回纯文字。**单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字。
         """
         targets = self._qq_targets()
         if not targets:
@@ -558,11 +587,13 @@ class MessageBridge:
         nickname = self._display_name(contact)
         message = f"[{time_str}] [{nickname}] {text}"
         image_b64 = ""
-        if image:
+        image_size = 0
+        if sticker and sticker.get("data"):
             try:
-                image_b64 = base64.b64encode(image).decode("ascii")
+                image_b64 = base64.b64encode(sticker["data"]).decode("ascii")
+                image_size = len(sticker["data"])
             except Exception as e:  # noqa: BLE001 编码失败就退回文字
-                self._log("warning", f"表情包编码失败（按文字转发）: {e}")
+                self._log("warning", f"表情图编码失败（按文字转发）: {e}")
                 image_b64 = ""
         ok_all = True
         queued = False
@@ -590,7 +621,7 @@ class MessageBridge:
                 self._log("warning", f"[转发未确认] {target_type}:{target_id} "
                                      "插件刚启动，消息只是排队（未确认已发出）")
                 continue
-            shown = message + (f"（+表情包图片 {len(image)} 字节）" if image_b64 else "")
+            shown = message + (f"（+表情图 {image_size} 字节）" if image_b64 else "")
             if ok:
                 self._log("info", f"[转发成功] {target_type}:{target_id} <- {shown}")
             else:
