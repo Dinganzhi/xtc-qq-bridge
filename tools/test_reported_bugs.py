@@ -136,6 +136,7 @@ class FakeAdb:
 
     def wake_if_asleep(self) -> bool:
         """假设备默认"屏幕亮着"（真实实现见 adb_controller.wake_if_asleep）。"""
+        self.calls.append("wake_if_asleep")
         return False
 
     def poke_awake(self) -> bool:
@@ -1165,6 +1166,8 @@ def test_blind_send_fast_typing() -> None:
     check("有缓存+快照时可以先手", xtc.blind_send_ready() is True)
     staged2, why2 = xtc.begin_blind_send("你好")
     check("先手输入成功", staged2 is True, why2)
+    check("打字前先确认屏幕是亮的（息屏时点下去等于打在空壳上）",
+          "wake_if_asleep" in adb.calls, str(adb.calls))
     check("先点了输入框、再注入、再点发送",
           xy.get("taps") == [(1006, 699), (1200, 699)], str(xy.get("taps")))
     check("注入走的是不做校验的纯广播",

@@ -1995,6 +1995,12 @@ class Xiaotiancai:
             "retryable": False,
         }
         try:
+            # 屏可能刚睡过去（WSA 随宿主窗口状态休眠虚拟屏）：先确认点亮，
+            # 否则点下去是打在 WSA 主屏的空壳上、文字进不了输入框（白费一轮复核）。
+            try:
+                self.adb.wake_if_asleep()
+            except Exception:  # noqa: BLE001 唤醒失败也照常试
+                pass
             self.adb.tap(point_in[0], point_in[1])          # 点输入框拿焦点
             time.sleep(min(self._delay, 0.4))
             if not self.adb.input_text_plain(text):         # 广播注入（不校验）
