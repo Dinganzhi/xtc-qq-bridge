@@ -59,14 +59,20 @@ class EmojiStore:
         """找这张表情的原图，返回 {data, kind, w, h, animated, path, source}；没有则 None。
 
         name：界面 content-desc 里的表情名（如 '啊啊啊'）；只用于"表情包目录"精确匹配。
+
+        顺序刻意是**先按名字查表情包、再查缓存**：名字命中是确定性的，
+        而"缓存里最近新增的图片"只是启发式 —— 若同一时间窗里还收到过照片，
+        先查缓存有把它当表情发出去的风险。缓存只用来兜底"名字查不到"的表情
+        （例如需要联网取回、不在本地表情包里的贴纸）。
         """
-        hit = self._from_cache()
-        if hit:
-            return hit
         hit = self._from_pack(name)
         if hit:
             return hit
-        return None
+        return self._from_cache()
+
+    def warm(self) -> int:
+        """预热表情包名字索引（可放后台线程调用，避免第一次收到表情时才建索引卡一下）。"""
+        return len(self._pack_index())
 
     # ------------------------------------------------------------------ 缓存
     def _from_cache(self) -> dict | None:

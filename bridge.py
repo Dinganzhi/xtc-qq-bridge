@@ -210,6 +210,11 @@ class MessageBridge:
         self.running = True
         self._thread = threading.Thread(target=self._poll_loop, name="xtc-poll", daemon=True)
         self._thread.start()
+        # 表情包名字索引后台预热：第一次收到表情时才建要 ~4 秒（会卡一下读屏），
+        # 提前在后台建好，索引本身缓存 10 分钟。
+        if self._emoji_store is not None:
+            threading.Thread(target=self._warm_emoji_store, name="xtc-emoji-warm",
+                             daemon=True).start()
         self._login_thread = threading.Thread(target=self._login_check_loop, name="xtc-login-check", daemon=True)
         self._login_thread.start()
         self._job_thread = threading.Thread(target=self._job_worker, name="xtc-jobs", daemon=True)
@@ -513,6 +518,14 @@ class MessageBridge:
         if not self.msgs.seen(text, "xtc"):
             self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
                              source=self._xtc_source(contact), source_id=contact or "")
+
+    def _warm_emoji_store(self) -> None:
+        """后台预热表情包名字索引（失败无所谓，收到表情时会按需再建）。"""
+        try:
+            n = self._emoji_store.warm()
+            self._log("debug", f"表情包索引预热完成：{n} 个名字")
+        except Exception as e:  # noqa: BLE001
+            self._log("debug", f"表情包索引预热失败: {e}")
 
     def _capture_sticker(self, root, text: str) -> dict | None:
         """表情包（仅小天才 -> QQ 单向）：拿到贴纸图片，返回 {data, kind, animated, source}。

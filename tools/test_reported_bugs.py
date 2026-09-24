@@ -959,15 +959,25 @@ def test_emoji_store_reads_original_file() -> None:
     index = json.dumps({"count": 1, "emojis": [{"code": "tiancaituQ_003", "desc": "爱你"}]},
                        ensure_ascii=False).encode("utf-16")
 
-    # ② 缓存里有"刚写进来"的动图 -> 直接用它（保住动画）
+    # ② 缓存里有"刚写进来"的动图 -> 名字查不到时用它（保住动画）
     adb = FakeAdb({cache_gif: gif(), desc: index},
                   listing=f"995 28583 {cache_gif}\n960 9999 {root}/cache/old.jpg")
     store = EmojiStore(adb, package="com.xtc.watch", recent_secs=45)
     got = store.find("啊啊啊")
-    check("取缓存里最近的动图", bool(got) and got["source"] == "cache" and got["animated"] is True,
+    check("名字查不到时取缓存里最近的动图",
+          bool(got) and got["source"] == "cache" and got["animated"] is True,
           str({k: v for k, v in (got or {}).items() if k != "data"}))
     check("时间窗外的老文件不会被当成本次表情",
           "old.jpg" not in (got or {}).get("path", ""), str((got or {}).get("path")))
+
+    # ②b 名字能命中时**优先**用表情包文件（确定性），不冒险用缓存里"最近的那张"
+    adb_b = FakeAdb({cache_gif: gif(), pack_png: png(), desc: index},
+                    listing=f"995 28583 {cache_gif}")
+    got_b = EmojiStore(adb_b, package="com.xtc.watch", recent_secs=45).find("爱你")
+    check("名字命中时优先用表情包原文件（避免把同时收到的照片当表情）",
+          bool(got_b) and got_b["source"] == "pack" and got_b["path"] == pack_png,
+          str({k: v for k, v in (got_b or {}).items() if k != "data"}))
+    check("warm() 能预热索引", EmojiStore(adb_b, package="com.xtc.watch").warm() >= 1)
 
     # ③ 缓存里没有 -> 用表情包目录按名字精确匹配（desc.json 是 UTF-16）
     adb2 = FakeAdb({pack_png: png(), desc: index}, listing="")
