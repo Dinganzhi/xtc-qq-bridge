@@ -165,11 +165,14 @@ class MessageBridge:
         # 最近一次"轮询确认过就在聊天页"的时刻与标题（"先手打字"快发的放行条件）
         self._chat_ok_ts = float("-inf")
         self._chat_ok_title = ""
-        # "别睡"心跳：每 keep_awake_interval 秒发一次 WAKEUP（0 = 关闭）
+        # "别睡"心跳：每 keep_awake_interval 秒发一次 WAKEUP（0 = 关闭）。
+        # 实测：WSA 大约每 50 秒把虚拟屏睡一次（stayOn/screen_off_timeout 都挡不住），
+        # 而每 10 秒发一次 WAKEUP 能让它连续 2 分钟保持 Awake、App 一直留在前台
+        # （单次开销仅 0.08 秒）。这是"先手打字"能稳定命中、发送不再莫名 10~30 秒的关键。
         try:
-            self._keep_awake_interval = float((cfg.get("adb") or {}).get("keep_awake_interval", 30) or 0)
+            self._keep_awake_interval = float((cfg.get("adb") or {}).get("keep_awake_interval", 10) or 0)
         except (TypeError, ValueError):
-            self._keep_awake_interval = 30.0
+            self._keep_awake_interval = 10.0
         self._last_awake_poke = float("-inf")
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
@@ -1080,6 +1083,10 @@ class MessageBridge:
                 # 5) 文字模式/输入框：只有真的有残留才清空
                 if self.xtc.is_in_chat():
                     msgs.append(self.xtc.ensure_input_clean())
+                    # 6) 顺手学一次"发送按钮坐标"：先手打字要用它，学完**重启后的第一条**
+                    #    QQ 消息也能 ~1 秒内把文字打进去（只注入一个探针字符随即清空，不发消息）
+                    if self.xtc.learn_send_point():
+                        msgs.append("已记录发送按钮坐标")
             reply = "初始化完成：" + "，".join(msgs)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"初始化异常: {e}")

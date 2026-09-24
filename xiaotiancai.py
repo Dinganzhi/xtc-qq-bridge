@@ -1792,6 +1792,13 @@ class Xiaotiancai:
           或注入没生效时走这条），结果照样如实判定。
         """
         try:
+            # 0) 先确保屏幕是亮的：WSA 大约每分钟就会把虚拟屏睡一次（stayOn 也挡不住），
+            #    息屏时 dump 必失败（null root node），整条发送就要多花 10 秒以上。
+            #    这一步只花 ~0.2 秒，能把"发送撞上息屏"的概率压到很低。
+            try:
+                self.adb.wake_if_asleep()
+            except Exception:  # noqa: BLE001 唤醒失败也照常往下走
+                pass
             # 1) 发送前基线：优先复用很新的界面快照（轮询每 2 秒 dump 一次）
             root = self.recent_snapshot()
             if root is None or self._find_input(root) is None:
@@ -1873,6 +1880,17 @@ class Xiaotiancai:
                 except AdbError:
                     send_root = root
             send_node = self._find_send(send_root)
+            if send_node is None:
+                # 快照可能是息屏/过渡帧里读到的（没有发送按钮）：先唤醒再重读一次，
+                # 别拿旧快照去点，也别糊里糊涂按回车（实测这一下能省一整轮 10 秒）。
+                try:
+                    if self.adb.wake_if_asleep():
+                        again = self._dump_with_retry(1)
+                        if again is not None:
+                            send_root = again
+                            send_node = self._find_send(send_root)
+                except Exception:  # noqa: BLE001 重读失败就按原逻辑兜底
+                    pass
             if send_node is None:
                 self.log("warning", "未找到发送按钮，改用回车发送")
                 self.adb.keyevent(66)  # KEYCODE_ENTER
@@ -2034,6 +2052,41 @@ class Xiaotiancai:
             # 没发出去（文字还在输入框里）：清掉缓存坐标，让稳妥流程重来
             self._send_cache = None
         return ok, why, retryable
+
+    def learn_send_point(self, probe: str = "a") -> bool:
+        """启动时用一次"探针注入"学出发送按钮坐标（不会发出任何消息）。
+
+        为什么需要：先手打字靠**发送按钮的坐标**，而它只在输入框有内容时才出现 ——
+        不先学一次的话，**重启后的第一条** QQ 消息只能走稳妥流程（两次 dump）。
+        这里往输入框注入一个探针字符 -> dump 一次 -> 记下输入框与发送按钮坐标 ->
+        立刻清空输入框。全程只输入、不点发送，所以不会有任何消息被发出去。
+        """
+        try:
+            root = self.recent_snapshot() or self._dump_with_retry(1)
+            edit = self._find_input(root) if root is not None else None
+            if edit is None:
+                return False
+            bounds = self._bounds(edit)
+            self._focus_input(edit)
+            if not self.adb.input_text_plain(probe):
+                return False
+            time.sleep(0.25)
+            snap = self._dump_with_retry(1)          # 有内容了 -> 发送按钮出现
+            if snap is None:
+                return False
+            send_node = self._find_send(snap)
+            if send_node is not None and bounds:
+                self._remember_send_point(bounds, send_node, snap)
+            # 清掉探针字符：绝不留内容在输入框里（否则会被拼进下一条消息）
+            self._clear_chat_input(self._dump_with_retry(1) or snap)
+            done = self._send_cache is not None
+            self.log("info" if done else "debug",
+                     "已学出发送按钮坐标（先手打字可用）" if done
+                     else "没能学出发送按钮坐标（首次发送仍走稳妥流程）")
+            return done
+        except Exception as e:  # noqa: BLE001 学不到就退回稳妥流程
+            self.log("debug", f"学习发送按钮坐标失败: {e}")
+            return False
 
     def _focus_input(self, edit) -> None:
         """点击输入框让它获得焦点，并等软键盘/输入连接就绪。

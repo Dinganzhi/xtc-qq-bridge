@@ -310,7 +310,7 @@ adb:
   heartbeat_interval: 10       # ADB 心跳（秒）：掉线自动重连
   disable_animations: true     # 关系统动画（uiautomator dump 需要界面空闲）
   keep_awake: true             # 保持常亮（启动时设置一次）
-  keep_awake_interval: 30      # 每隔多少秒发一次 WAKEUP 保活（0=关；WSA 会随宿主窗口状态息屏）
+  keep_awake_interval: 10      # 每隔多少秒发一次 WAKEUP 保活（0=关；实测 10 秒一次能让屏连续 Awake）
   input_retries: 2             # 文本注入重试轮数
   dump_retries: 2              # UI dump 重试次数
   dump_delay: 0.8              # UI dump 重试间隔（秒，逐轮递增）
@@ -656,7 +656,7 @@ python tools/wsa_net_guard.py --test
 | **弹窗挡住界面导致读不到消息** | 已修复：常见弹窗（权限/无响应/更新/评价/活动/网络/警告）会自动处理；**自研自定义弹窗**（如"升级提醒" `com.xtc.widget.phone.popup.activity.CustomActivity14`）也按结构识别并自动关闭（点负向按钮/返回键，绝不点"立即安装"）；状态机会报 `弹窗遮挡界面`，轮询每轮都会清它。实在认不出的弹窗，把它的跳过按钮文案加进 `xiaotiancai.ui.popup_skip_texts` 即可 |
 | **消息时间不对（时间总是"当前时间"）** | 已修复：WSA 上旧版默认用的 `--compressed` dump 会把时间标签节点（`tv_chat_msg_item_date`）整片裁掉（实机同一屏：压缩版 0 个标签，完整版 3 个 `11:19`/`19:18`/`20:46`），于是每条消息的时间都退化成"当前时间"。现在默认用**完整 dump**，并且万一只拿到压缩版也会从 `ll_chat_top_layout` 的 content-desc 还原时间（`十1点十9分` -> `11:19`） |
 | **QQ 侧 `/小天才 历史消息` 没反应 / 提示"群不在白名单"** | 已修复：动作类回调（历史消息 / 登录 / 初始化 / 自动登录）在 `qq_webhook` 里曾被"空消息"分支**提前 return 掉**（插件转发带 `source=astrbot` 且 `message` 为空），于是这些命令永远不执行，日志还写成"未转发（空消息或来源不在白名单）"，看着像白名单没配好。现在动作先分派、日志分开写；白名单确实不含该群时会明确说"不在白名单（webhook.allow_from / allow_groups）"。插件侧也会在桥接未受理时直接回话（不再干等 150 秒超时） |
-| **隔三差五说"小天才息屏了 / App 不在前台"（其实一直没动它）** | 根因是 **WSA 的虚拟屏随宿主窗口状态休眠**（窗口失去焦点、被别的窗口盖住、最小化时都会），跟 `screen_off_timeout` 无关——实测 `screen_off_timeout=2147483647`、`stay_on_while_plugged_in=7`、`mStayOn=true` 全都还在，屏照样睡。屏一睡：Android 前台就变成 `com.microsoft.windows.homeapp/...PlaceholderActivity`，`uiautomator` 报 `null root node`。现在三招：① 轮询每 `adb.keep_awake_interval`（默认 30 秒，实测一次仅 0.08s）发一次 WAKEUP 保活；② 判定"不在前台"之前先花 ~0.24s 问一次电源状态，睡着就叫醒——唤醒后 App 通常**直接回到前台**，不再白白"重新拉起 App"（实测省 ~20 秒）；③ 一旦见过息屏就把这块屏记为"可疑"，之后每次 dump 前主动先确认+唤醒，不再走"dump 失败→唤醒→重试"的 5~8 秒慢路。根治仍是别让 WSA 窗口最小化/长期失去焦点 |
+| **隔三差五说"小天才息屏了 / App 不在前台"（其实一直没动它）** | 根因是 **WSA 的虚拟屏会自己睡**：实测大约每 **50 秒**就把屏睡一次（`stayOn=true`、`screen_off_timeout=2147483647` 全都还在、屏照样睡），睡下时 Android 前台变成 `com.microsoft.windows.homeapp/...PlaceholderActivity`、`uiautomator` 报 `null root node`。现在：① 轮询每 `adb.keep_awake_interval`（默认 **10 秒**，实测一次仅 **0.08s**）发一次 WAKEUP —— **实测这样能让屏连续 2 分钟保持 Awake、App 一直留在前台**；② 判定"不在前台"之前先花 ~0.24s 问电源状态，睡着就叫醒，唤醒后 App 通常**直接回到前台**，不再白白"重新拉起 App"（实测省 ~20 秒）；③ 一旦见过息屏就把这块屏记为"可疑"，之后每次 dump / 每次发送前都先确认+唤醒；④ 重启后初始化时会用一次"探针注入"**学出发送按钮坐标**（只输入随即清空、不发消息），所以**重启后的第一条**也能走 ~1 秒的快路径。根治仍是别让 WSA 窗口最小化/长期失去焦点 |
 | Linux 真机看不到设备 | udev 规则/权限问题：配 `/etc/udev/rules.d/51-android.rules` 并把用户加入 `plugdev`（见「Linux」小节），再 `sudo udevadm control --reload-rules && sudo udevadm trigger` |
 | Waydroid 连不上 | `waydroid session start`（X11 加 `-X`）后再 `adb connect 127.0.0.1:5555`；容器/无桌面环境需 `/dev/kvm` 与显示输出 |
 | 连错设备（多个模拟器/真机） | 在 `adb.serial` 里写死要用的序列号（`python main.py --check` 会打印当前选中的是哪个） |

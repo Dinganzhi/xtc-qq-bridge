@@ -20,8 +20,9 @@ adb:
   heartbeat_interval: 10
   disable_animations: true                       # 关闭系统动画（uiautomator dump 需要界面空闲才能工作）
   keep_awake: true                               # 让子系统保持常亮（息屏后 dump 会一直报 null root node）
-  keep_awake_interval: 30                        # 每隔多少秒发一次 WAKEUP 保活（0=关；WSA 会随宿主窗口状态息屏，
-                                                 # screen_off_timeout 拉满也挡不住，靠这个把屏叫醒、让 App 留在前台）
+  keep_awake_interval: 10                        # 每隔多少秒发一次 WAKEUP 保活（0=关）。
+                                                 # 实测 WSA 约每 50 秒睡一次虚拟屏（screen_off_timeout 拉满也挡不住），
+                                                 # 每 10 秒一次 WAKEUP 能连续保持 Awake、App 一直留在前台（单次仅 0.08s）
   input_retries: 2                               # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
   dump_retries: 2                                # UI dump 默认重试次数（交互路径自动用更快的单次 dump）
   dump_delay: 0.8                                # UI dump 重试间隔（秒，逐轮递增等待界面空闲）
