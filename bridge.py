@@ -390,9 +390,12 @@ class MessageBridge:
                     self._op_lock.release()
                 # 补发：从最新一条往回走、撞库即停（弹窗挡住期间漏掉的、启动前积压的都补齐）。
                 # 放在命令流程之前：它会跳过命令文本与系统提示，只处理真实消息。
-                if state == self.xtc.STATE_CHAT and contact is not None:
+                # 注意：聊天窗口模式下 get_latest_message 的 contact 本来就是 None，
+                # 所以这里**不能**用 `contact is not None` 当条件 —— 那样补发永远不会跑
+                # （用户报的"漏掉的消息再也补不上"就是这么来的）。
+                if state == self.xtc.STATE_CHAT:
                     try:
-                        self._forward_backlog(root, contact)
+                        self._forward_backlog(root, contact or "")
                     except Exception as e:  # noqa: BLE001
                         self._log("warning", f"补发流程异常: {e}")
                 # 连续读不到任何东西（且不在聊天页/被弹窗挡住）-> 自愈
@@ -433,9 +436,18 @@ class MessageBridge:
                         break
                 # 普通手表消息 -> 转发（命令已被上面拦截，绝不转发/入库）
                 if text and not is_cmd_text:
-                    key = ("xtc", contact or "", text)
-                    if not self.history.seen("xtc", contact or "", text) \
-                            and not self.dedup.seen(key) and not self.echo.is_echo(text):
+                    # 事件身份 = 文本 + **这条消息自己的时间标签**。
+                    # 只看文本的话，"同一张贴纸 / 同一句'好'"发第二次就再也转发不出去
+                    # （长期表 TTL 7 天，history.seen 一直为真，日志里连
+                    # "收到小天才消息"都不会出现 —— 用户报的"消息读不出来"就是这个）。
+                    label = (time_label or "").strip()
+                    key = ("xtc", contact or "", text, label)
+                    dup = (self.history.seen(*key) or self.dedup.seen(key)
+                           or self.echo.is_echo(text))
+                    if not dup and not label:
+                        # 读不到时间标签时只能按文本保守判定：宁可不重发，也不要反复刷同一条
+                        dup = self.msgs.seen(text, "xtc")
+                    if not dup:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
                         # 表情包：**必须在轮询线程里取**（此刻快照/气泡位置才准、
@@ -449,16 +461,19 @@ class MessageBridge:
             # 一个完整间隔就变成 6 秒一轮（检测延迟白白翻倍）。
             time.sleep(max(0.0, self._poll_interval - (time.monotonic() - loop_started)))
 
-    def _in_store(self, contact: str, text: str) -> bool:
-        """这条消息"库里有没有"（撞库判定，只认**持久**记录）。
+    def _in_store(self, contact: str, text: str, label: str = "") -> bool:
+        """这条消息"库里有没有"（**补发**时的撞库判定，只认持久记录）。
 
-        依次看：本地消息库（最新分库）-> 7 天历史表 -> 回声过滤。
+        依次看：长期已处理表（同一文本 + 同一时间标签）-> 本地消息库（同文本）-> 回声过滤。
+
+        补发这里刻意**保守**：同文本就算"有"（消息库/长期表都存了文本），
+        宁可少补一条同名消息，也不要往 QQ 刷屏。
         注意这里**不看**短期去重表（120 秒那个）：它只是防重发的节流，
         转发失败的消息不该因为它而被当成"已处理"（否则永远不会重试）。
         """
-        if self.msgs.seen(text, "xtc"):
+        if self.history.seen("xtc", contact or "", text, label or ""):
             return True
-        if self.history.seen("xtc", contact or "", text):
+        if self.msgs.seen(text, "xtc"):
             return True
         return bool(self.echo.is_echo(text))
 
@@ -494,9 +509,9 @@ class MessageBridge:
                 pass
             if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
                 continue                            # 命令文本由命令流程处理
-            if self._in_store(contact, text):
+            if self._in_store(contact, text, it.get("time_label") or ""):
                 break                               # 撞库 -> 停，不再往上翻
-            if self.dedup.seen(("xtc", contact or "", text)):
+            if self.dedup.seen(("xtc", contact or "", text, it.get("time_label") or "")):
                 # 刚试过（120 秒内，多为上次转发失败）：本轮先跳过它，
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
@@ -534,7 +549,7 @@ class MessageBridge:
         sticker：表情图（{data, kind, animated, source}）。**必须在轮询线程里取**——
         那一刻界面快照/气泡位置才准、缓存里刚写进来的文件也还在；没有它就按文字发。
         """
-        self.dedup.mark(("xtc", contact or "", text))
+        self.dedup.mark(("xtc", contact or "", text, label or ""))
         self._job_queue.put(("forward", contact, text, label or "", sticker))
 
     def _do_forward_job(self, contact: str, text: str, label: str,
@@ -548,7 +563,7 @@ class MessageBridge:
         if not ok:
             self._log("warning", f"[转发] 这条没发出去，稍后重试: {text[:24]!r}")
             return
-        self.history.mark("xtc", contact or "", text)
+        self.history.mark("xtc", contact or "", text, label or "")
         if not self.msgs.seen(text, "xtc"):
             self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
                              source=self._xtc_source(contact), source_id=contact or "")

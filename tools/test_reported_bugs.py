@@ -1316,6 +1316,133 @@ def test_keep_awake_heartbeat() -> None:
         cleanup(root)
 
 
+class _FwdHist:
+    """最简转发器：send/send_detail/send_image 都算成功，并记录发出去的文本。"""
+
+    def __init__(self, ok: bool = True):
+        self.sent: list = []
+        self.ok = ok
+
+    def send(self, t, i, m):
+        self.sent.append(m)
+        return self.ok
+
+    def send_detail(self, t, i, m):
+        self.sent.append(m)
+        return self.ok, ""
+
+    def send_image(self, t, i, b64, caption=""):
+        self.sent.append(caption)
+        return self.ok, ""
+
+
+def test_repeated_message_is_forwarded_again() -> None:
+    """用户报"未能成功读取消息"的**真凶**：去重只看文本（长期表 TTL 7 天）。
+
+    实测：09-23 转发过的贴纸"表情流汗"，09-25 又发了一次 —— 文本一样，
+    `history.seen("xtc", contact, "表情流汗")` 一直为真 -> 这条消息被**静默丢掉**，
+    日志里连"收到小天才消息"都没有（用户看到的就是"消息读不出来"）。
+    聊天里能出现同一张贴纸/同一句短文本（"好""1""嗯"）无数次，所以身份必须是
+    **文本 + 这条消息自己的时间标签**。
+    """
+    root = tmp_root()
+    try:
+        fwd = _FwdHist()
+        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+               "xiaotiancai": {"ui": {}}, "webhook": {}}
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=fwd, logger=None)
+        # 用本用例专属的状态文件：否则会读写真实 data/ 下的历史/回声缓存（用例互相污染）
+        prefix = f".bugtest{_SEQ['n']}_"
+        br.msgs = MessageLog(path=str(root / f"{prefix}msg_log.json"))
+        br.history = bridge_mod.HistoryFilter(store_path=str(root / f"{prefix}history.json"))
+        br.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo.json"))
+        br._cmd_done_file = str(root / f"{prefix}cmd_done.json")
+
+        # 09-23 转发过一次"表情流汗"
+        br.history.mark("xtc", "屑猹不喝茶", "表情流汗", "20:58")
+        br.msgs.append("xtc", "屑猹不喝茶", "表情流汗", source="手表-屑猹不喝茶")
+        check("同一文本 + 同一时间标签 -> 判为已处理",
+              br.history.seen("xtc", "屑猹不喝茶", "表情流汗", "20:58") is True)
+        check("同一文本 + **不同**时间标签 -> 不算已处理（隔天再发能转发）",
+              br.history.seen("xtc", "屑猹不喝茶", "表情流汗", "14:39") is False)
+
+        # 用真实的长文本路径记录一次，确认写入的 key 也带标签
+        br._do_forward_job("屑猹不喝茶", "表情流汗", "14:39", sticker=None)
+        check("转发成功后按（文本+标签）登记",
+              br.history.seen("xtc", "屑猹不喝茶", "表情流汗", "14:39") is True
+              and bool(fwd.sent), str(fwd.sent))
+        br._queue_forward("屑猹不喝茶", "表情流汗", "15:10", sticker=None)
+        check("入队时按（文本+标签）短期去重（同一件事不会每轮重复入队）",
+              br.dedup.seen(("xtc", "屑猹不喝茶", "表情流汗", "15:10")) is True
+              and br.dedup.seen(("xtc", "屑猹不喝茶", "表情流汗", "15:11")) is False)
+    finally:
+        cleanup(root)
+
+
+def test_backlog_runs_without_contact() -> None:
+    """补发在**正常轮询**里必须真的被调用：聊天窗口模式下 contact 恒为 None。
+
+    `get_latest_message` 在聊天窗口模式返回的 contact 就是 None，而轮询里写的条件是
+    `if state == CHAT and contact is not None:` —— 于是补发**永远不会执行**
+    （用户要的"从最新往回走、撞库即停"补发形同虚设）。
+    """
+    import threading
+
+    class PollAdb(FakeAdb):
+        def __init__(self, xml):
+            super().__init__(xml, "com.xtc.watch/.ChatActivity")
+
+        def is_connected(self) -> bool:
+            return True
+
+        def ensure_connected(self) -> bool:
+            return True
+
+        def wake_if_asleep(self) -> bool:
+            return False
+
+    root = tmp_root()
+    try:
+        chat = node_xml(
+            n(cls="android.widget.TextView", text="屑猹不喝茶", desc="和屑猹不喝茶的聊天",
+              rid="com.xtc.watch:id/tv_titleBar_title", bounds="[983,67][1068,92]") +
+            n(cls="android.widget.TextView", text="漏掉的一条",
+              desc="屑猹不喝茶发的消息,漏掉的一条",
+              rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,200][965,280]") +
+            n(cls="android.widget.EditText", text="", rid="com.xtc.watch:id/et_chat_text_content",
+              bounds="[833,678][1179,721]") +
+            n(cls="android.widget.TextView", text="发送", rid="com.xtc.watch:id/tv_send_view",
+              bounds="[1179,677][1221,721]"))
+        adb = PollAdb(chat)
+        xtc = Xiaotiancai(adb, {"ui": {}}, logger=None)
+        fwd = _FwdHist()
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {"ui": {}}, "webhook": {}},
+                                      adb=adb, xtc=xtc, forwarder=fwd, logger=Recorder())
+        prefix = f".bugtest{_SEQ['n']}_"
+        br.msgs = MessageLog(path=str(root / f"{prefix}msg_log.json"))
+        br.history = bridge_mod.HistoryFilter(store_path=str(root / f"{prefix}history.json"))
+        br.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo.json"))
+        br._cmd_done_file = str(root / f"{prefix}cmd_done.json")
+        br._forward = lambda contact, text, time_label="", sticker=None: (
+            fwd.sent.append(text), True)[1]
+        br._queue_forward = bridge_mod.MessageBridge._queue_forward.__get__(br)
+        br._job_queue = __import__("queue").Queue()
+        br.running = True
+        t = threading.Thread(target=br._poll_loop, daemon=True)
+        t.start()
+        time.sleep(1.0)
+        br.running = False
+        t.join(3)
+        jobs = []
+        while not br._job_queue.empty():
+            jobs.append(br._job_queue.get_nowait())
+        check("轮询里补发真的会跑（contact 为 None 也算）",
+              any(j[0] == "forward" and j[2] == "漏掉的一条" for j in jobs), str(jobs))
+    finally:
+        cleanup(root)
+
+
 def test_confirm_sent_rule() -> None:
     """_confirm_sent 的判定规则单测（新气泡 / 失败提示 / 输入框残留 / 读不到界面）。"""
     adb = ChatAdb()
@@ -3057,7 +3184,9 @@ def test_backlog_walk_until_known() -> None:
         check("补发走的是异步队列（不会阻塞轮询）",
               n8 == 1 and jobs and jobs[0][0] == "forward", f"n={n8} jobs={jobs}")
         check("入队时就短期去重，避免下一轮重复入队",
-              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息")) is True)
+              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息", "19:52")) is True)
+        check("去重键带上了时间标签（同文本不同时间算两条）",
+              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息", "19:53")) is False)
         br6._do_forward_job(*jobs[0][1:4])          # 工作线程真正执行
         check("工作线程执行后才入长期历史/消息库",
               fwd6.sent and br6.msgs.seen("异步消息", "xtc") is True, str(fwd6.sent))
@@ -3150,6 +3279,7 @@ def main() -> int:
                test_monotonic_sentinels_survive_fresh_boot,
                test_nuitka_version_args_are_numeric, test_guard_is_windows_only,
                test_backlog_walk_until_known,
+               test_repeated_message_is_forwarded_again, test_backlog_runs_without_contact,
                test_msg_log_sharding_and_cap,
                test_logger_tolerant_stream):
         print(f"--- {fn.__name__} ---")
