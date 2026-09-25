@@ -1051,7 +1051,7 @@ def test_sticker_forward_one_way() -> None:
                                               b"\x89PNG" + b"y" * 400)[1]
 
         class _Store:
-            def find(self, name):
+            def find(self, name, near_epoch=None):
                 return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
                         "animated": True, "path": "/x/y.cnt", "source": "cache"}
 
@@ -1072,7 +1072,7 @@ def test_sticker_forward_one_way() -> None:
               "屑猹不喝茶" in caption and "13:03" in caption, caption)
 
         # ② 原文件取不到 -> 退回截图（静态一帧）
-        br._emoji_store = type("S", (), {"find": lambda self, name: None})()
+        br._emoji_store = type("S", (), {"find": lambda self, name, near_epoch=None: None})()
         got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
         check("原文件取不到时退回截图",
               bool(got2) and got2["source"] == "screenshot" and shot["n"] == 1, str(got2))

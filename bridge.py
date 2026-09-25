@@ -516,8 +516,11 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）
-            sticker = (self._capture_sticker(root, text) if it.get("sticker") else None)
+            # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）；
+            # 传消息自己的时间，让缓存查找能找到"当时写进来的那张"（保住动图）
+            sticker = (self._capture_sticker(root, text,
+                                            near_epoch=self._label_epoch(it.get("time_label") or ""))
+                       if it.get("sticker") else None)
             pending.append((text, it.get("time_label") or "", sticker))
 
         if not pending:
@@ -576,7 +579,7 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001
             self._log("debug", f"表情包索引预热失败: {e}")
 
-    def _capture_sticker(self, root, text: str) -> dict | None:
+    def _capture_sticker(self, root, text: str, near_epoch: float | None = None) -> dict | None:
         """表情包（仅小天才 -> QQ 单向）：拿到贴纸图片，返回 {data, kind, animated, source}。
 
         顺序：
@@ -584,6 +587,9 @@ class MessageBridge:
              也不依赖气泡在屏幕上（实测缓存里就是多帧循环 GIF）；
           2) 按气泡区域截图（原来的做法）：原文件取不到时兜底，只有一帧；
           3) 都失败返回 None —— 调用方照样发"表情X"文字，不会因为表情丢消息。
+
+        near_epoch：补发老消息时传"这条消息自己的时间"，好让缓存查找按消息时间去匹配
+        （缓存文件是消息显示时写进来的），否则补发的贴纸会退化成静态截图。
         """
         if not self._emoji_image:
             return None
@@ -592,7 +598,7 @@ class MessageBridge:
             name = name[len("表情"):].strip()
         if self._emoji_from_data and self._emoji_store is not None:
             try:
-                got = self._emoji_store.find(name)
+                got = self._emoji_store.find(name, near_epoch=near_epoch)
             except Exception as e:  # noqa: BLE001 读原文件失败就走截图
                 self._log("debug", f"读表情原文件失败（改用截图）: {e}")
                 got = None

@@ -39,11 +39,15 @@ class EmojiStore:
 
     def __init__(self, adb, package: str = "com.xtc.watch", logger=None,
                  recent_secs: float = 45.0, index_ttl: float = 600.0,
-                 max_px: int = 600, max_bytes: int = 3 * 1024 * 1024):
+                 max_px: int = 600, max_bytes: int = 3 * 1024 * 1024,
+                 near_window: float = 300.0, fresh_window: float = 120.0):
         self.adb = adb
         self.package = package
         self.logger = logger
         self.recent_secs = max(5.0, float(recent_secs))   # 缓存"刚写进来"的时间窗
+        self.near_window = max(10.0, float(near_window))  # 按消息时间找缓存时允许的偏差
+        # 补发老消息时，App 会在"重新显示聊天"时把贴纸重新写进缓存 —— 这个窗口覆盖那种情况
+        self.fresh_window = max(10.0, float(fresh_window))
         self.index_ttl = max(0.0, float(index_ttl))       # 名字索引缓存时长
         self.max_px = max(64, int(max_px))                # 太大的图不当表情（多半是照片）
         self.max_bytes = max(1024, int(max_bytes))
@@ -55,10 +59,13 @@ class EmojiStore:
     def root(self) -> str:
         return f"/sdcard/Android/data/{self.package}"
 
-    def find(self, name: str = "") -> dict | None:
+    def find(self, name: str = "", near_epoch: float | None = None) -> dict | None:
         """找这张表情的原图，返回 {data, kind, w, h, animated, path, source}；没有则 None。
 
         name：界面 content-desc 里的表情名（如 '啊啊啊'）；只用于"表情包目录"精确匹配。
+        near_epoch：这条消息**自己的时间**（补发老消息时用）。缓存里的图片是"消息显示时"
+        写进来的，所以按消息时间去缓存里找，补发的贴纸也能拿到**原始动图**，
+        而不是退化成静态截图。
 
         顺序刻意是**先按名字查表情包、再查缓存**：名字命中是确定性的，
         而"缓存里最近新增的图片"只是启发式 —— 若同一时间窗里还收到过照片，
@@ -68,21 +75,28 @@ class EmojiStore:
         hit = self._from_pack(name)
         if hit:
             return hit
-        return self._from_cache()
+        return self._from_cache(near_epoch)
 
     def warm(self) -> int:
         """预热表情包名字索引（可放后台线程调用，避免第一次收到表情时才建索引卡一下）。"""
         return len(self._pack_index())
 
     # ------------------------------------------------------------------ 缓存
-    def _from_cache(self) -> dict | None:
-        """缓存里**最近刚写进来**的那张图片（刚收到的表情会被 App 立刻写进来）。"""
-        # find 的 -mmin 只支持分钟：按时间窗取上界（多算一分钟，精筛交给下面的 mtime 比较）。
-        # 这一步很快（实测 0.2~0.3s），因为先按分钟粗筛，不会遍历整个缓存目录。
-        mins = max(1, int(self.recent_secs // 60) + 1)
+    def _from_cache(self, near_epoch: float | None = None) -> dict | None:
+        """缓存里那张表情图：默认取"最近刚写进来"的；给了 near_epoch 就取时间最接近它的。
+
+        为什么要按时间找：缓存文件是**消息显示时**写进来的，所以补发一条几小时前的贴纸时，
+        "最近 45 秒内新增"什么也找不到（只能退回截图）；但"mtime 接近这条消息时间"的那张
+        就是它 —— 于是补发也能拿到原始动图。
+        """
+        # find 的 -mmin 只支持分钟：先按分钟粗筛（避免遍历整个缓存目录），精筛交给 mtime 比较
+        if near_epoch:
+            age_min = max(2, int(max(0.0, time.time() - near_epoch) // 60) + 2)
+        else:
+            age_min = max(1, int(self.recent_secs // 60) + 1)
         try:
             listing = self.adb.shell(
-                f"date +%s; find {self.root}/cache -type f -mmin -{mins} "
+                f"date +%s; find {self.root}/cache -type f -mmin -{age_min} "
                 f"-exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", timeout=30)
         except Exception as e:  # noqa: BLE001 取不到就走别的路
             self._log("debug", f"读图片缓存失败: {e}")
@@ -99,11 +113,19 @@ class EmojiStore:
                 rows.append((float(parts[0]), int(parts[1]), parts[2].strip()))
         if not rows or not now:
             return None
-        rows.sort(key=lambda r: r[0], reverse=True)       # 新的在前
+        # 候选打分：表情基本都是 GIF/WebP（动图）或 PNG，照片多是 JPEG —— 先按类型偏好，
+        # 再按时间距离（离"这条消息的时间"最近，或"刚被重新渲染写进来"最近）。
+        cands: list[tuple] = []
         for mtime, size, path in rows:
-            if now - mtime > self.recent_secs:
-                break                                     # 后面的都更老
             if size <= 0 or size > self.max_bytes:
+                continue
+            d_msg = abs(mtime - near_epoch) if near_epoch else None
+            d_now = now - mtime
+            if near_epoch:
+                if not ((d_msg is not None and d_msg <= self.near_window)
+                        or d_now <= self.fresh_window):
+                    continue
+            elif d_now > self.recent_secs:
                 continue
             data = self._read(path)
             if not data:
@@ -113,10 +135,13 @@ class EmojiStore:
                 continue
             if max(info.get("w") or 0, info.get("h") or 0) > self.max_px:
                 continue                                  # 太大 -> 多半是聊天里的照片
-            out = dict(info)
-            out.update({"data": data, "path": path, "source": "cache"})
-            return out
-        return None
+            penalty = 1 if info.get("kind") == "jpeg" else 0
+            score = min([d for d in (d_msg, d_now) if d is not None])
+            cands.append((penalty, score, {**info, "data": data, "path": path, "source": "cache"}))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: (c[0], c[1]))
+        return cands[0][2]
 
     # ------------------------------------------------------------------ 表情包目录
     def _pack_index(self) -> dict:
