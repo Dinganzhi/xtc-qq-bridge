@@ -40,13 +40,14 @@ class EmojiStore:
     def __init__(self, adb, package: str = "com.xtc.watch", logger=None,
                  recent_secs: float = 45.0, index_ttl: float = 600.0,
                  max_px: int = 600, max_bytes: int = 3 * 1024 * 1024,
-                 near_window: float = 300.0, fresh_window: float = 120.0):
+                 near_window: float = 300.0, fresh_window: float = 1800.0):
         self.adb = adb
         self.package = package
         self.logger = logger
         self.recent_secs = max(5.0, float(recent_secs))   # 缓存"刚写进来"的时间窗
         self.near_window = max(10.0, float(near_window))  # 按消息时间找缓存时允许的偏差
-        # 补发老消息时，App 会在"重新显示聊天"时把贴纸重新写进缓存 —— 这个窗口覆盖那种情况
+        # 补发/重渲染时，App 会重新写缓存文件（mtime 与消息时间能差十几分钟），
+        # 所以"最近写过"的窗口给到 30 分钟；挑哪张靠形状+动图判定，不靠时间
         self.fresh_window = max(10.0, float(fresh_window))
         self.index_ttl = max(0.0, float(index_ttl))       # 名字索引缓存时长
         self.max_px = max(64, int(max_px))                # 太大的图不当表情（多半是照片）
@@ -59,41 +60,45 @@ class EmojiStore:
     def root(self) -> str:
         return f"/sdcard/Android/data/{self.package}"
 
-    def find(self, name: str = "", near_epoch: float | None = None) -> dict | None:
+    def find(self, name: str = "", near_epoch: float | None = None,
+             aspect: float | None = None) -> dict | None:
         """找这张表情的原图，返回 {data, kind, w, h, animated, path, source}；没有则 None。
 
         name：界面 content-desc 里的表情名（如 '啊啊啊'）；只用于"表情包目录"精确匹配。
-        near_epoch：这条消息**自己的时间**（补发老消息时用）。缓存里的图片是"消息显示时"
-        写进来的，所以按消息时间去缓存里找，补发的贴纸也能拿到**原始动图**，
-        而不是退化成静态截图。
+        near_epoch：这条消息**自己的时间**（能找到"消息显示时写进缓存"的那张时最准）。
+        aspect：屏幕上那个表情气泡的宽高比。缓存里同时会有聊天里的**照片**，
+        用"形状对得上 + 是动图"来挑，比只看时间可靠得多（实测 App 会在重新渲染时
+        重写缓存文件，mtime 与消息时间可以差十几分钟）。
 
         顺序刻意是**先按名字查表情包、再查缓存**：名字命中是确定性的，
-        而"缓存里最近新增的图片"只是启发式 —— 若同一时间窗里还收到过照片，
-        先查缓存有把它当表情发出去的风险。缓存只用来兜底"名字查不到"的表情
+        而"缓存里最近的图片"只是启发式。缓存只用来兜底"名字查不到"的表情
         （例如需要联网取回、不在本地表情包里的贴纸）。
         """
         hit = self._from_pack(name)
         if hit:
             return hit
-        return self._from_cache(near_epoch)
+        return self._from_cache(near_epoch, aspect)
 
     def warm(self) -> int:
         """预热表情包名字索引（可放后台线程调用，避免第一次收到表情时才建索引卡一下）。"""
         return len(self._pack_index())
 
     # ------------------------------------------------------------------ 缓存
-    def _from_cache(self, near_epoch: float | None = None) -> dict | None:
-        """缓存里那张表情图：默认取"最近刚写进来"的；给了 near_epoch 就取时间最接近它的。
+    def _from_cache(self, near_epoch: float | None = None,
+                    aspect: float | None = None) -> dict | None:
+        """缓存里那张表情图：按"形状对得上 + 是动图 + 时间接近"挑最像的一张。
 
-        为什么要按时间找：缓存文件是**消息显示时**写进来的，所以补发一条几小时前的贴纸时，
-        "最近 45 秒内新增"什么也找不到（只能退回截图）；但"mtime 接近这条消息时间"的那张
-        就是它 —— 于是补发也能拿到原始动图。
+        为什么不纯按时间：实测 App 会在**重新渲染聊天时重写**缓存文件，mtime 与消息时间
+        能差十几分钟（实例：15:24 的消息，缓存文件的 mtime 是 15:41），纯按时间全落空。
+        贴纸与照片天然不同：贴纸多是**动图 GIF/WebP**、画面是**正方形**（与气泡同形状），
+        照片多是 JPEG、长宽比也不同 —— 用这些特征挑稳得多。
         """
-        # find 的 -mmin 只支持分钟：先按分钟粗筛（避免遍历整个缓存目录），精筛交给 mtime 比较
+        # find 的 -mmin 只支持分钟：先按分钟粗筛（避免遍历整个缓存目录），精筛在下面
         if near_epoch:
             age_min = max(2, int(max(0.0, time.time() - near_epoch) // 60) + 2)
         else:
             age_min = max(1, int(self.recent_secs // 60) + 1)
+        age_min = min(age_min, max(1, int(self.fresh_window // 60) + 1))
         try:
             listing = self.adb.shell(
                 f"date +%s; find {self.root}/cache -type f -mmin -{age_min} "
@@ -113,19 +118,14 @@ class EmojiStore:
                 rows.append((float(parts[0]), int(parts[1]), parts[2].strip()))
         if not rows or not now:
             return None
-        # 候选打分：表情基本都是 GIF/WebP（动图）或 PNG，照片多是 JPEG —— 先按类型偏好，
-        # 再按时间距离（离"这条消息的时间"最近，或"刚被重新渲染写进来"最近）。
         cands: list[tuple] = []
         for mtime, size, path in rows:
             if size <= 0 or size > self.max_bytes:
                 continue
             d_msg = abs(mtime - near_epoch) if near_epoch else None
             d_now = now - mtime
-            if near_epoch:
-                if not ((d_msg is not None and d_msg <= self.near_window)
-                        or d_now <= self.fresh_window):
-                    continue
-            elif d_now > self.recent_secs:
+            if not (d_now <= self.fresh_window
+                    or (d_msg is not None and d_msg <= self.near_window)):
                 continue
             data = self._read(path)
             if not data:
@@ -133,15 +133,23 @@ class EmojiStore:
             info = self.sniff(data)
             if not info or info.get("kind") not in IMAGE_KINDS:
                 continue
-            if max(info.get("w") or 0, info.get("h") or 0) > self.max_px:
+            w, h = info.get("w") or 0, info.get("h") or 0
+            if max(w, h) > self.max_px:
                 continue                                  # 太大 -> 多半是聊天里的照片
-            penalty = 1 if info.get("kind") == "jpeg" else 0
-            score = min([d for d in (d_msg, d_now) if d is not None])
-            cands.append((penalty, score, {**info, "data": data, "path": path, "source": "cache"}))
+            # ① 形状：与屏幕上的气泡形状一致（贴纸是方的，气泡也是方的）
+            pen_shape = 0
+            if aspect and w and h:
+                ratio = w / h
+                pen_shape = 0 if abs(ratio - aspect) <= 0.25 * max(1.0, aspect) else 1
+            # ② 动图优先（表情基本是动图），JPEG 多半是照片 -> 排最后
+            pen_kind = 0 if info.get("animated") else (0.5 if info.get("kind") != "jpeg" else 1)
+            score = min([d for d in (d_msg, d_now) if d is not None] or [0.0])
+            cands.append((pen_shape, pen_kind, score,
+                          {**info, "data": data, "path": path, "source": "cache"}))
         if not cands:
             return None
-        cands.sort(key=lambda c: (c[0], c[1]))
-        return cands[0][2]
+        cands.sort(key=lambda c: (c[0], c[1], c[2]))
+        return cands[0][3]
 
     # ------------------------------------------------------------------ 表情包目录
     def _pack_index(self) -> dict:

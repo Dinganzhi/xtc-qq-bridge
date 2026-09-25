@@ -1051,7 +1051,7 @@ def test_sticker_forward_one_way() -> None:
                                               b"\x89PNG" + b"y" * 400)[1]
 
         class _Store:
-            def find(self, name, near_epoch=None):
+            def find(self, name, near_epoch=None, aspect=None):
                 return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
                         "animated": True, "path": "/x/y.cnt", "source": "cache"}
 
@@ -1072,7 +1072,8 @@ def test_sticker_forward_one_way() -> None:
               "屑猹不喝茶" in caption and "13:03" in caption, caption)
 
         # ② 原文件取不到 -> 退回截图（静态一帧）
-        br._emoji_store = type("S", (), {"find": lambda self, name, near_epoch=None: None})()
+        br._emoji_store = type("S", (), {"find": lambda self, name, near_epoch=None,
+                                         aspect=None: None})()
         got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
         check("原文件取不到时退回截图",
               bool(got2) and got2["source"] == "screenshot" and shot["n"] == 1, str(got2))
@@ -1441,6 +1442,129 @@ def test_backlog_runs_without_contact() -> None:
               any(j[0] == "forward" and j[2] == "漏掉的一条" for j in jobs), str(jobs))
     finally:
         cleanup(root)
+
+
+def test_forwarder_wrapper_exposes_send_image() -> None:
+    """实机事故：`PluginClient` 有 send_image，但桥接用的是 `PluginForwarder` 包装类 ——
+    包装层没暴露这个方法，`getattr(forwarder, "send_image", None)` 就是 None，
+    于是**每张表情都退化成文字**（日志："转发器不支持图片，改发文字（插件需一并更新）"）。
+    所以这里断言"包装层确实有 send_image，并且表情真的走了图片通道"。
+    """
+    class _Client:
+        def __init__(self):
+            self.texts: list = []
+            self.images: list = []
+
+        def send_detail(self, t, i, m):
+            self.texts.append((t, i, m))
+            return True, ""
+
+        def send(self, t, i, m):
+            return self.send_detail(t, i, m)[0]
+
+        def send_image(self, t, i, b64, caption=""):
+            self.images.append((t, i, b64, caption))
+            return True, ""
+
+        def reply_result(self, *a, **k):
+            return True
+
+        def qq_search(self, *a, **k):
+            return None
+
+        def qq_online(self, *a, **k):
+            return None
+
+        def qq_remind(self, *a, **k):
+            return None
+
+    root = tmp_root()
+    try:
+        client = _Client()
+        fwd = bridge_mod.PluginForwarder(client, logger=None)
+        check("包装层必须暴露 send_image（否则表情永远只能发文字）",
+              hasattr(fwd, "send_image"))
+        ok, why = fwd.send_image("group", "472805002", "QUJD", "说明")
+        check("图片转发委托给客户端",
+              ok is True and client.images == [("group", "472805002", "QUJD", "说明")],
+              f"{client.images} {why}")
+
+        # 端到端：桥接 _forward 带图片时，必须走图片通道而不是文字
+        br = bridge_mod.MessageBridge(
+            {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+             "xiaotiancai": {"ui": {}}, "webhook": {}},
+            adb=None, xtc=None, forwarder=fwd, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        client.images.clear()
+        client.texts.clear()
+        br._forward("屑猹不喝茶", "表情弹吉他.png", "15:24",
+                    sticker={"data": b"GIF89a" + b"z" * 400, "kind": "gif",
+                             "animated": True, "source": "cache"})
+        check("有表情图时走图片通道（不再退化成文字）",
+              len(client.images) == 1 and not client.texts,
+              f"images={client.images} texts={client.texts}")
+        check("图片是 base64 的 GIF",
+              base64.b64decode(client.images[0][2]).startswith(b"GIF89a"),
+              client.images[0][2][:12])
+
+        # 客户端不支持图片时如实报告失败（调用方会退回文字，但日志要说清原因）
+        class _Old:
+            def send_detail(self, t, i, m):
+                return True, ""
+
+        old = bridge_mod.PluginForwarder(_Old(), logger=None)
+        ok2, why2 = old.send_image("private", "1", "QUJD")
+        check("旧客户端不支持图片时返回失败原因",
+              ok2 is False and "不支持图片" in why2, why2)
+    finally:
+        cleanup(root)
+
+
+def test_cache_pick_prefers_sticker_shape_and_animation() -> None:
+    """缓存里同时有照片和贴纸时，要挑**贴纸**：正方形 + 动图，而不是"时间最新的那张"。
+
+    实机数据：同一时刻缓存里有 4 张（JPEG 145x145、GIF 动图 240x240、PNG 243x324、
+    PNG 416x416），纯按时间分不出哪张是表情 —— 按"形状与气泡一致 + 是动图"才选得对。
+    """
+    from emoji_store import EmojiStore
+
+    root = "/sdcard/Android/data/com.xtc.watch"
+    jpeg = (b"\xff\xd8\xff\xe0" + b"\x00" * 4
+            + b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, 145, 145, 3) + b"\x00" * 200)
+    gif = (b"GIF89a" + struct.pack("<HH", 240, 240) + b"\x00" * 8
+           + b"NETSCAPE2.0" + b"\x21\xf9\x04" * 6 + b";")
+    png_wide = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", 243, 324)
+                + b"\x08\x06\x00\x00\x00")
+    png_big = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", 416, 416)
+               + b"\x08\x06\x00\x00\x00")
+    now = 1790322520
+    files = {
+        f"{root}/cache/big_image/x/1/a.cnt": jpeg,
+        f"{root}/cache/big_image/x/1/b.cnt": gif,
+        f"{root}/cache/big_image/x/1/c.cnt": png_wide,
+        f"{root}/cache/big_image/x/1/d.cnt": png_big,
+    }
+    listing = "\n".join(f"{now - 460} {len(v)} {k}" for k, v in files.items())
+
+    class FakeAdb:
+        def shell(self, cmd, timeout=None):
+            return f"{now}\n{listing}" if cmd.startswith("date +%s;") else ""
+
+        def read_file(self, path, timeout=None):
+            return files.get(path, b"")
+
+    store = EmojiStore(FakeAdb(), package="com.xtc.watch", logger=None)
+    got = store.find("弹吉他", near_epoch=now - 1021, aspect=1.0)
+    check("挑出的是那张动图贴纸（不是照片/宽图）",
+          bool(got) and got["kind"] == "gif" and got["animated"] is True
+          and got["w"] == 240, str({k: v for k, v in (got or {}).items() if k != "data"}))
+    check("别的候选（JPEG/宽 PNG）没被选中",
+          (got or {}).get("path", "").endswith("b.cnt"), str((got or {}).get("path")))
+    # 没有形状信息时也要优先动图（而不是 JPEG 照片）
+    got2 = store.find("弹吉他", near_epoch=now - 1021)
+    check("没有气泡形状时仍优先动图",
+          bool(got2) and got2["animated"] is True, str({k: v for k, v in (got2 or {}).items() if k != "data"}))
 
 
 def test_confirm_sent_rule() -> None:
@@ -3251,6 +3375,8 @@ def main() -> int:
                test_png_encoder_and_crop, test_screencap_header_parsing,
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,
+               test_forwarder_wrapper_exposes_send_image,
+               test_cache_pick_prefers_sticker_shape_and_animation,
                test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,

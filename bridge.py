@@ -52,6 +52,13 @@ class LogForwarder:
     def send_detail(self, target_type, target_id, message: str) -> tuple:
         return self.send(target_type, target_id, message), ""
 
+    def send_image(self, target_type, target_id, image_b64, caption="") -> tuple:
+        """log 模式：只打印不发送（表情包也一样，便于离线调试）。返回 (ok, why)。"""
+        if self.logger:
+            self.logger.info(f"[转发-占位] 图片 {target_type}:{target_id} "
+                             f"{len(image_b64)} 字节 base64 <- {caption}")
+        return True, ""
+
     def reply_result(self, request_id: str, message: str) -> bool:
         if self.logger:
             self.logger.info(f"[占位-回传] {request_id}: {message}")
@@ -90,6 +97,24 @@ class PluginForwarder:
         if fn is None:                       # 兼容旧的 client
             return self.client.send(target_type, target_id, message), ""
         return fn(target_type, target_id, message)
+
+    def send_image(self, target_type, target_id, image_b64, caption="") -> tuple:
+        """转发一张图片（表情包，base64）。返回 (ok, why)。
+
+        注意：这个方法**必须**在包装层也暴露 —— 实机踩过：`PluginClient` 有了 send_image，
+        但桥接用的是 `PluginForwarder` 包装类，包装层没有就 `getattr(..., 'send_image', None)`
+        得到 None，于是每张表情都退化成文字（日志里那句"转发器不支持图片"）。
+        """
+        fn = getattr(self.client, "send_image", None)
+        if fn is None:
+            return False, "插件客户端不支持图片（plugin_client.py 过旧）"
+        ok, why = fn(target_type, target_id, image_b64, caption)
+        if not ok and self.logger:
+            now = time.monotonic()
+            if now - self._last_err_log >= self._err_log_interval:
+                self.logger.error(f"表情图转发失败：{why or '未知原因'}")
+                self._last_err_log = now
+        return ok, why
 
     def reply_result(self, request_id: str, message: str) -> bool:
         return self.client.reply_result(request_id, message)
@@ -601,9 +626,21 @@ class MessageBridge:
             name = name[len("表情"):].strip()
         # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）——查表情包索引前先去掉
         name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
+        # 先在快照里定位气泡：① 拿它的**形状**去缓存里挑原图（贴纸是方的，照片不是）
+        # ② 后面截图兜底也要用它
+        item = None
+        try:
+            item = self.xtc.sticker_of_latest(root, text) or self.xtc.sticker_of_latest(root, "")
+        except Exception as e:  # noqa: BLE001 定位失败不影响取原图
+            self._log("debug", f"定位表情气泡失败: {e}")
+        aspect = None
+        if item and item.get("bounds"):
+            x1, y1, x2, y2 = item["bounds"]
+            if y2 > y1:
+                aspect = (x2 - x1) / (y2 - y1)
         if self._emoji_from_data and self._emoji_store is not None:
             try:
-                got = self._emoji_store.find(name, near_epoch=near_epoch)
+                got = self._emoji_store.find(name, near_epoch=near_epoch, aspect=aspect)
             except Exception as e:  # noqa: BLE001 读原文件失败就走截图
                 self._log("debug", f"读表情原文件失败（改用截图）: {e}")
                 got = None
@@ -618,11 +655,6 @@ class MessageBridge:
                                   f"（按消息时间 {near_epoch and int(near_epoch) or '最近'} 找过），"
                                   "改用气泡截图")
         try:
-            item = self.xtc.sticker_of_latest(root, text)
-            if not item:
-                # 文本对不上时退而求其次：只要屏上有表情气泡就用它
-                # （实机遇到过名字带扩展名/文案微差导致精确匹配落空）
-                item = self.xtc.sticker_of_latest(root, "")
             if not item:
                 self._log("info", f"[表情包] 界面上没找到这条表情的气泡（{text!r}），"
                                   "按文字转发")
