@@ -451,8 +451,11 @@ class MessageBridge:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
                         # 表情包：**必须在轮询线程里取**（此刻快照/气泡位置才准、
-                        # 缓存里刚写进来的原文件也还在）
-                        sticker = self._capture_sticker(root, text)
+                        # 缓存里刚写进来的原文件也还在）。
+                        # 传消息自己的时间：检测可能滞后几分钟（刚重启/刚唤醒时），
+                        # 缓存文件是"消息显示时"写进去的，只有按消息时间才找得回原图。
+                        sticker = self._capture_sticker(
+                            root, text, near_epoch=self._label_epoch(time_label or ""))
                         # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
                         self._queue_forward(contact, text, time_label, sticker=sticker)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
@@ -596,6 +599,8 @@ class MessageBridge:
         name = (text or "").strip()
         if name.startswith("表情"):
             name = name[len("表情"):].strip()
+        # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）——查表情包索引前先去掉
+        name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
         if self._emoji_from_data and self._emoji_store is not None:
             try:
                 got = self._emoji_store.find(name, near_epoch=near_epoch)
@@ -608,18 +613,29 @@ class MessageBridge:
                 self._log("info", f"[表情包] 取自{where}：{got.get('kind', '?')} {anim} "
                                   f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）")
                 return got
+            if self._emoji_from_data and self._emoji_store is not None:
+                self._log("info", f"[表情包] App 里没找到 {name!r} 的原图"
+                                  f"（按消息时间 {near_epoch and int(near_epoch) or '最近'} 找过），"
+                                  "改用气泡截图")
         try:
             item = self.xtc.sticker_of_latest(root, text)
             if not item:
-                self._log("debug", f"没找到表情气泡位置，按文字转发: {text!r}")
+                # 文本对不上时退而求其次：只要屏上有表情气泡就用它
+                # （实机遇到过名字带扩展名/文案微差导致精确匹配落空）
+                item = self.xtc.sticker_of_latest(root, "")
+            if not item:
+                self._log("info", f"[表情包] 界面上没找到这条表情的气泡（{text!r}），"
+                                  "按文字转发")
                 return None
             png = self.xtc.capture_sticker(item.get("bounds"))
             if png:
                 self._log("info", f"[表情包] 按气泡截图 {len(png)} 字节（静态一帧）"
                                   f"（{item.get('bounds')}），随转发发给 QQ")
                 return {"data": png, "kind": "png", "animated": False, "source": "screenshot"}
+            self._log("info", f"[表情包] 截图没成功（气泡 {item.get('bounds')}），按文字转发")
+            return None
         except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
-            self._log("debug", f"表情包截图失败（按文字转发）: {e}")
+            self._log("warning", f"[表情包] 取图异常（按文字转发）: {e}")
             return None
 
     def _hint_wsa_guard(self) -> None:

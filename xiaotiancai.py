@@ -2612,27 +2612,33 @@ class Xiaotiancai:
         为什么截图而不是拿原图：贴纸是 App 内部资源（可能在 so/apk 里、也可能是网络图），
         ADB 拿不到；而贴纸在屏幕上就是它本身，按气泡区域裁剪即得原图。
         只裁气泡本身的区域（不加内边距）：实机实测 ImageView 的 bounds 正好是贴纸范围。
+
+        截图偶发失败（刚唤醒/界面正在重绘）时**重试一次**：实机遇到过"明明气泡就在屏幕上，
+        却因为这一次 screencap 没成功而整条退化成了文字"。
         """
         if not bounds:
             return None
-        try:
-            w, h = self.adb.get_screen_size()
-            x1, y1, x2, y2 = (int(v) for v in bounds)
-            if x2 - x1 < 12 or y2 - y1 < 12:
-                self.log("debug", f"表情气泡太小，放弃截图: {bounds}")
-                return None
-            if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
-                self.log("debug", f"表情气泡不在屏幕内，放弃截图: {bounds}")
-                return None
-            png = self.adb.screencap_crop_png((max(0, x1), max(0, y1),
-                                               min(w, x2), min(h, y2)))
-        except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
-            self.log("debug", f"表情截图失败: {e}")
-            return None
-        if not png or len(png) < 200:
-            self.log("debug", "表情截图内容异常（过小），放弃")
-            return None
-        return png
+        for attempt in (1, 2):
+            try:
+                w, h = self.adb.get_screen_size()
+                x1, y1, x2, y2 = (int(v) for v in bounds)
+                if x2 - x1 < 12 or y2 - y1 < 12:
+                    self.log("debug", f"表情气泡太小，放弃截图: {bounds}")
+                    return None
+                if x2 <= 0 or y2 <= 0 or x1 >= w or y1 >= h:
+                    self.log("debug", f"表情气泡不在屏幕内，放弃截图: {bounds}")
+                    return None
+                png = self.adb.screencap_crop_png((max(0, x1), max(0, y1),
+                                                   min(w, x2), min(h, y2)))
+                if png and len(png) >= 200:
+                    return png
+                self.log("debug", f"表情截图内容异常（{len(png or b'')} 字节）"
+                                  + ("，重试一次" if attempt == 1 else ""))
+            except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
+                self.log("debug", f"表情截图失败（第 {attempt} 次）: {e}")
+            if attempt == 1:
+                time.sleep(0.4)
+        return None
 
     def _latest_own_in_chat(self, root: ET.Element) -> str:
         """聊天页内最新一条"自己发的"消息文本（系统/垃圾已过滤）；无则 ""。"""
