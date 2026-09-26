@@ -1053,9 +1053,13 @@ def test_sticker_forward_one_way() -> None:
                                               b"\x89PNG" + b"y" * 400)[1]
 
         class _Store:
-            def find(self, name, near_epoch=None, aspect=None):
+            def find(self, name, near_epoch=None, aspect=None, reference=None):
                 return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
-                        "animated": True, "path": "/x/y.cnt", "source": "cache"}
+                        "animated": True, "path": "/x/y.cnt", "source": "cache",
+                        "score": 0.97}
+
+            def name_is_unique(self, name):
+                return True                     # 名字唯一 -> 不必截图核对（省一次截屏）
 
         br._emoji_store = _Store()
         br._emoji_from_data = True
@@ -1074,8 +1078,9 @@ def test_sticker_forward_one_way() -> None:
               "屑猹不喝茶" in caption and "13:03" in caption, caption)
 
         # ② 原文件取不到 -> 退回截图（静态一帧）
-        br._emoji_store = type("S", (), {"find": lambda self, name, near_epoch=None,
-                                         aspect=None: None})()
+        br._emoji_store = type("S", (), {
+            "find": lambda self, name, near_epoch=None, aspect=None, reference=None: None,
+            "name_is_unique": lambda self, name: False})()
         got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
         check("原文件取不到时退回截图",
               bool(got2) and got2["source"] == "screenshot" and shot["n"] == 1, str(got2))
@@ -1523,50 +1528,210 @@ def test_forwarder_wrapper_exposes_send_image() -> None:
         cleanup(root)
 
 
-def test_cache_pick_prefers_sticker_shape_and_animation() -> None:
-    """缓存里同时有照片和贴纸时，要挑**贴纸**：正方形 + 动图，而不是"时间最新的那张"。
+def _png_solid(w: int, h: int, top: tuple, bottom: tuple) -> bytes:
+    """造一张"上下一半一半"的 PNG（给相似度比对当素材，不需要外部图片）。"""
+    from utils.pngtool import encode_png_rgb
+    rows = [bytes(top) * w] * (h // 2) + [bytes(bottom) * w] * (h - h // 2)
+    return encode_png_rgb(w, h, rows)
 
-    实机数据：同一时刻缓存里有 4 张（JPEG 145x145、GIF 动图 240x240、PNG 243x324、
-    PNG 416x416），纯按时间分不出哪张是表情 —— 按"形状与气泡一致 + 是动图"才选得对。
+
+def _png_pattern(w: int, h: int, rgb: tuple, box: tuple, color: tuple) -> bytes:
+    """在纯色底上加一个方块 —— 有结构才能验证"结构相关性"这一路。"""
+    from utils.pngtool import encode_png_rgb
+    x1, y1, x2, y2 = box
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            row += bytes(color if (x1 <= x < x2 and y1 <= y < y2) else rgb)
+        rows.append(bytes(row))
+    return encode_png_rgb(w, h, rows)
+
+
+def _gif_solid(w: int, h: int, colors: list, frames: list, path_size: int = 2) -> bytes:
+    """手写一张（可多帧的）GIF：每帧一组调色板索引。
+
+    编码用"每个像素前都发 CLEAR"的极简写法，码长永远停在 min+1，不需要写 LZW 字典。
     """
-    from emoji_store import EmojiStore
+    buf = bytearray(b"GIF89a")
+    buf += struct.pack("<HHBBB", w, h, 0x80 | (path_size - 1), 0, 0)
+    pal = list(colors) + [(0, 0, 0)] * ((1 << path_size) - len(colors))
+    for c in pal:
+        buf += bytes(c)
+    buf += b"NETSCAPE2.0\x03\x01\x00\x00\x00"                     # 循环播放
+    for idx in frames:
+        buf += b"\x21\xf9\x04\x00\x0a\x00\x00\x00"                 # GCE：延时 10
+        buf += b"\x2c" + struct.pack("<HHHHB", 0, 0, w, h, 0)      # 图像描述符（无局部色表）
+        buf += bytes([path_size])                                  # LZW min code size
+        codes = []
+        for v in idx:
+            codes += [1 << path_size, v]                           # CLEAR, 像素值
+        codes.append((1 << path_size) + 1)                         # EOI
+        bits = 0
+        nbits = 0
+        out = bytearray()
+        width = path_size + 1
+        for c in codes:
+            bits |= c << nbits
+            nbits += width
+            while nbits >= 8:
+                out.append(bits & 0xFF)
+                bits >>= 8
+                nbits -= 8
+        if nbits:
+            out.append(bits & 0xFF)
+        for i in range(0, len(out), 255):                          # 分块
+            chunk = out[i:i + 255]
+            buf += bytes([len(chunk)]) + chunk
+        buf += b"\x00"
+    buf += b"\x3b"
+    return bytes(buf)
+
+
+def test_image_decoders_match_fixtures() -> None:
+    """PNG / GIF / JPEG 解码必须与"真编码器"的结果对得上。
+
+    夹具（tools/fixtures/pattern.*）由 `tools/make_image_fixtures.ps1` 用 .NET
+    System.Drawing 画好、存盘、**再从存出来的文件里读回像素**当标准答案；
+    JPEG 因为只解 DC 系数，标准答案取 8x8 块均值（容差放到量化误差级别）。
+    """
+    from utils import imgtool
+
+    fx = Path(__file__).resolve().parent / "fixtures"
+    exp = json.loads((fx / "pattern_expected.json").read_text(encoding="utf-8"))
+    for fmt in ("png", "gif"):
+        frames = imgtool.decode_frames((fx / f"pattern.{fmt}").read_bytes())
+        worst = -1
+        ok = bool(frames) and [frames[0]["w"], frames[0]["h"]] == exp[fmt]["size"]
+        if ok:
+            f = frames[0]
+            worst = 0
+            for x, y, r, g, b in exp[fmt]["samples"]:
+                o = (y * f["w"] + x) * 3
+                worst = max(worst, abs(r - f["rgb"][o]), abs(g - f["rgb"][o + 1]),
+                            abs(b - f["rgb"][o + 2]))
+            ok = worst <= 2
+        check(f"{fmt.upper()} 解码逐像素与真编码器一致", ok, f"最大偏差 {worst}")
+    frames = imgtool.decode_frames((fx / "pattern.jpg").read_bytes())
+    worst = -1.0
+    ok = bool(frames) and [frames[0]["w"], frames[0]["h"]] == exp["jpg"]["grid"]
+    if ok:
+        f = frames[0]
+        worst = 0.0
+        for i, (r, g, b) in enumerate(exp["jpg"]["blocks"]):
+            o = i * 3
+            worst = max(worst, abs(r - f["rgb"][o]), abs(g - f["rgb"][o + 1]),
+                        abs(b - f["rgb"][o + 2]))
+        ok = worst <= 20
+    check("JPEG（只解 DC）缩略图与真解码的块均值一致", ok, f"最大偏差 {worst:.1f}")
+    check("空数据 / 坏数据不抛异常",
+          imgtool.decode_frames(b"") == []
+          and imgtool.decode_frames(b"\x89PNG\r\n\x1a\njunk") == []
+          and imgtool.decode_frames(b"RIFF\x00\x00\x00\x00WEBPVP8 ")[:1] == []
+          and imgtool.decode_frames(b"GIF89a") == [])
+    same = imgtool.similarity(imgtool.image_grid((fx / "pattern.png").read_bytes()),
+                             imgtool.image_grid((fx / "pattern.jpg").read_bytes()))
+    other = imgtool.similarity(
+        imgtool.image_grid((fx / "pattern.png").read_bytes()),
+        imgtool.image_grid(_png_pattern(64, 64, (10, 10, 10), (0, 0, 20, 20), (250, 250, 250))))
+    check("同一张图（PNG vs 同一张的 JPEG）相似度很高", same >= 0.8, f"{same:.3f}")
+    check("完全不同的图相似度低", other < 0.8, f"{other:.3f}")
+
+
+def test_cache_pick_verifies_pixels_against_screen() -> None:
+    """缓存里同时躺着照片 / **别的贴纸**时，必须拿界面气泡截图逐张比像素。
+
+    实测踩到的坑（用户报"我明明是小猫流汗，转发变成了乌龟"）：贴纸名在本地表情包里
+    查不到，于是退回"缓存里时间最近的那张"，而那张恰好是之前渲染过的
+    "弹吉他的乌龟"动图 —— 尺寸方正、还是动图，老启发式完全分不出来。
+    现在改成：**像不像由像素说话**，都不像就不发缓存里的图（退回截图，静止但一定对）。
+    """
+    from emoji_store import EmojiStore, MATCH_OK
+    from utils import imgtool
 
     root = "/sdcard/Android/data/com.xtc.watch"
-    jpeg = (b"\xff\xd8\xff\xe0" + b"\x00" * 4
-            + b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, 145, 145, 3) + b"\x00" * 200)
-    gif = (b"GIF89a" + struct.pack("<HH", 240, 240) + b"\x00" * 8
-           + b"NETSCAPE2.0" + b"\x21\xf9\x04" * 6 + b";")
-    png_wide = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", 243, 324)
-                + b"\x08\x06\x00\x00\x00")
-    png_big = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", 416, 416)
-               + b"\x08\x06\x00\x00\x00")
     now = 1790322520
-    files = {
-        f"{root}/cache/big_image/x/1/a.cnt": jpeg,
-        f"{root}/cache/big_image/x/1/b.cnt": gif,
-        f"{root}/cache/big_image/x/1/c.cnt": png_wide,
-        f"{root}/cache/big_image/x/1/d.cnt": png_big,
-    }
-    listing = "\n".join(f"{now - 460} {len(v)} {k}" for k, v in files.items())
+    # "小猫"：白底 + 中间红块；"乌龟"：橙底 + 中间棕块
+    cat = _png_pattern(120, 120, (245, 245, 245), (30, 30, 90, 90), (200, 40, 40))
+    turtle = _png_pattern(120, 120, (230, 90, 60), (36, 36, 84, 84), (110, 70, 40))
+    turtle_gif = _gif_solid(120, 120, [(230, 90, 60), (110, 70, 40)],
+                            [[0] * (120 * 60) + [1] * (120 * 60)] * 2)
+    cat_path = f"{root}/cache/big_image/x/1/cat.cnt"
+    turtle_path = f"{root}/cache/big_image/x/1/turtle.cnt"
+    # 乌龟的 mtime 更新（老代码就是被这个"最新"骗了）
+    listing = f"{now - 20} {len(turtle_gif)} {turtle_path}\n{now - 900} {len(cat)} {cat_path}"
 
     class FakeAdb:
         def shell(self, cmd, timeout=None):
             return f"{now}\n{listing}" if cmd.startswith("date +%s;") else ""
 
         def read_file(self, path, timeout=None):
-            return files.get(path, b"")
+            return {turtle_path: turtle_gif, cat_path: cat}[path]
 
     store = EmojiStore(FakeAdb(), package="com.xtc.watch", logger=None)
-    got = store.find("弹吉他", near_epoch=now - 1021, aspect=1.0)
-    check("挑出的是那张动图贴纸（不是照片/宽图）",
-          bool(got) and got["kind"] == "gif" and got["animated"] is True
-          and got["w"] == 240, str({k: v for k, v in (got or {}).items() if k != "data"}))
-    check("别的候选（JPEG/宽 PNG）没被选中",
-          (got or {}).get("path", "").endswith("b.cnt"), str((got or {}).get("path")))
-    # 没有形状信息时也要优先动图（而不是 JPEG 照片）
-    got2 = store.find("弹吉他", near_epoch=now - 1021)
-    check("没有气泡形状时仍优先动图",
-          bool(got2) and got2["animated"] is True, str({k: v for k, v in (got2 or {}).items() if k != "data"}))
+    got = store.find("流汗", near_epoch=now - 900, aspect=1.0, reference=cat)
+    check("按像素核对挑出界面上那张（而不是缓存里最新的动图）",
+          bool(got) and got["path"] == cat_path and got["source"] == "cache",
+          str({k: v for k, v in (got or {}).items() if k != "data"}))
+    check("相似度远高于门槛（乌龟那张明显不够像）",
+          bool(got) and got["score"] >= MATCH_OK,
+          f"score={(got or {}).get('score')}")
+    check("乌龟动图与这张的相似度确实低得多",
+          imgtool.best_grid_similarity(imgtool.image_grid(cat), turtle_gif) < MATCH_OK,
+          f"{imgtool.best_grid_similarity(imgtool.image_grid(cat), turtle_gif):.3f}")
+
+    # 缓存里**只有**不像的那张 -> 返回 None（调用方退回"就发界面截图"，绝不发乌龟）
+    class OnlyTurtle(FakeAdb):
+        def read_file(self, path, timeout=None):
+            return turtle_gif
+
+    listing = f"{now - 20} {len(turtle_gif)} {turtle_path}"
+    check("只有不像的候选时不硬发（宁可退回截图）",
+          EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find(
+              "流汗", near_epoch=now - 20, aspect=1.0, reference=cat) is None)
+
+    # 没有基准图时：只有"刚写进来"的候选才敢猜，老文件不许猜
+    listing = f"{now - 20} {len(turtle_gif)} {turtle_path}"
+    got_fresh = EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find(
+        "流汗", near_epoch=now - 20)
+    check("没有基准图时只信'刚写进来'的候选（老行为兜底）",
+          bool(got_fresh) and got_fresh["path"] == turtle_path, str(got_fresh and got_fresh["path"]))
+    listing = f"{now - 3000} {len(turtle_gif)} {turtle_path}"
+    check("没有基准图又不新鲜 -> 不乱取",
+          EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find("流汗") is None)
+    # 补发**老消息**又没有基准图时，哪怕缓存里有"刚写进来"的图也不许猜（就是踩过的坑）
+    listing = f"{now - 5} {len(turtle_gif)} {turtle_path}"
+    check("老消息 + 没有基准图 -> 连'刚写进来'的也不猜",
+          EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find(
+              "流汗", near_epoch=now - 86400) is None)
+
+    # 表情包重名（实测 99 个名字里 55 个在多套包里重名）时也要核对，不能想当然
+    desc = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/138/1/p/desc.json"
+    pack_a = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/138/1/p/big/p_001"
+    pack_b = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/139/1/q/big/q_001"
+    index = json.dumps({"count": 1, "emojis": [{"code": "p_001", "desc": "流汗"}]},
+                       ensure_ascii=False).encode("utf-16")
+    index2 = json.dumps({"count": 1, "emojis": [{"code": "q_001", "desc": "流汗"}]},
+                        ensure_ascii=False).encode("utf-16")
+    desc2 = f"{root}/files/xtcdata/telwatch/weichat/emoji/newEmoji/139/1/q/desc.json"
+
+    class DupAdb:
+        def shell(self, cmd, timeout=None):
+            if cmd.startswith("date +%s;"):
+                return f"{now}\n"
+            if "-name desc.json" in cmd:
+                return f"{desc}\n{desc2}"
+            return ""
+
+        def read_file(self, path, timeout=None):
+            return {desc: index, desc2: index2, pack_a: turtle, pack_b: cat}.get(path, b"")
+
+    dup = EmojiStore(DupAdb(), package="com.xtc.watch", logger=None)
+    got_dup = dup.find("流汗", aspect=1.0, reference=cat)
+    check("重名时按像素挑对的那一套包",
+          bool(got_dup) and got_dup["path"] == pack_b and got_dup["source"] == "pack",
+          str({k: v for k, v in (got_dup or {}).items() if k != "data"}))
+    check("重名的名字不算唯一（所以要截图核对）", dup.name_is_unique("流汗") is False)
 
 
 def test_time_label_is_absolute_and_stable() -> None:
@@ -3427,7 +3592,8 @@ def main() -> int:
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,
                test_forwarder_wrapper_exposes_send_image,
-               test_cache_pick_prefers_sticker_shape_and_animation,
+               test_cache_pick_verifies_pixels_against_screen,
+               test_image_decoders_match_fixtures,
                test_time_label_is_absolute_and_stable,
                test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,

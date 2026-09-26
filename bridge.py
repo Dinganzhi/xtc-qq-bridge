@@ -614,9 +614,10 @@ class MessageBridge:
 
         顺序：
           1) **App 数据目录/图片缓存里的原文件**（`emoji_store`）：保真，动图保住动画，
-             也不依赖气泡在屏幕上（实测缓存里就是多帧循环 GIF）；
-          2) 按气泡区域截图（原来的做法）：原文件取不到时兜底，只有一帧；
-          3) 都失败返回 None —— 调用方照样发"表情X"文字，不会因为表情丢消息。
+             也不依赖气泡在屏幕上；挑哪张**由像素比对决定** —— 先抠下界面上这张气泡的
+             截图当基准，再逐个候选比相似度，够像才发（根治"小猫流汗发成乌龟"）；
+          2) 没有可信原图时，**就发这张气泡截图**（静止一帧，但一定是对的）；
+          3) 连气泡都定位不到 -> 返回 None，调用方照样发"表情X"文字。
 
         near_epoch：补发老消息时传"这条消息自己的时间"，好让缓存查找按消息时间去匹配
         （缓存文件是消息显示时写进来的），否则补发的贴纸会退化成静态截图。
@@ -628,8 +629,7 @@ class MessageBridge:
             name = name[len("表情"):].strip()
         # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）——查表情包索引前先去掉
         name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
-        # 先在快照里定位气泡：① 拿它的**形状**去缓存里挑原图（贴纸是方的，照片不是）
-        # ② 后面截图兜底也要用它
+        # 先在快照里定位气泡：① 拿它的形状去缓存里挑原图 ② 抠它的截图当核对基准
         item = None
         try:
             item = self.xtc.sticker_of_latest(root, text) or self.xtc.sticker_of_latest(root, "")
@@ -640,27 +640,43 @@ class MessageBridge:
             x1, y1, x2, y2 = item["bounds"]
             if y2 > y1:
                 aspect = (x2 - x1) / (y2 - y1)
+        # 名字在本地表情包里唯一时无需核对（省一次截图）；否则必须抠基准图来比像素
+        need_ref = True
+        if self._emoji_store is not None and name:
+            try:
+                need_ref = not self._emoji_store.name_is_unique(name)
+            except Exception as e:  # noqa: BLE001 索引查不动就老老实实截图
+                self._log("debug", f"判断表情名是否唯一失败: {e}")
+        ref = None
+        if item and item.get("bounds") and need_ref:
+            try:
+                ref = self.xtc.capture_sticker(item.get("bounds"))
+            except Exception as e:  # noqa: BLE001 抠基准图失败就走老路
+                self._log("debug", f"抠表情气泡截图失败: {e}")
+                ref = None
         if self._emoji_from_data and self._emoji_store is not None:
             try:
-                got = self._emoji_store.find(name, near_epoch=near_epoch, aspect=aspect)
+                got = self._emoji_store.find(name, near_epoch=near_epoch,
+                                             aspect=aspect, reference=ref)
             except Exception as e:  # noqa: BLE001 读原文件失败就走截图
                 self._log("debug", f"读表情原文件失败（改用截图）: {e}")
                 got = None
             if got and got.get("data"):
                 anim = "动图" if got.get("animated") else "静态"
                 where = "图片缓存" if got.get("source") == "cache" else "表情包文件"
+                score = got.get("score")
+                tag = f"，与界面比对 {score:.2f}" if isinstance(score, (int, float)) else ""
                 self._log("info", f"[表情包] 取自{where}：{got.get('kind', '?')} {anim} "
-                                  f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）")
+                                  f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）{tag}")
                 return got
-            if self._emoji_from_data and self._emoji_store is not None:
-                self._log("info", f"[表情包] App 里没找到 {name!r} 的原图"
-                                  f"（按消息时间 {near_epoch and int(near_epoch) or '最近'} 找过），"
-                                  "改用气泡截图")
+        if ref:
+            self._log("info", f"[表情包] 没有可信原图（{name!r}），发界面气泡截图"
+                              f"{len(ref)} 字节（静止一帧）")
+            return {"data": ref, "kind": "png", "animated": False, "source": "screenshot"}
+        if not item:
+            self._log("info", f"[表情包] 界面上没找到这条表情的气泡（{text!r}），按文字转发")
+            return None
         try:
-            if not item:
-                self._log("info", f"[表情包] 界面上没找到这条表情的气泡（{text!r}），"
-                                  "按文字转发")
-                return None
             png = self.xtc.capture_sticker(item.get("bounds"))
             if png:
                 self._log("info", f"[表情包] 按气泡截图 {len(png)} 字节（静态一帧）"

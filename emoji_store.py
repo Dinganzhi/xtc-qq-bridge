@@ -14,17 +14,25 @@
 2. **图片缓存**（Glide）
    `<ext>/cache/big_image/<pkg>/<ver>/<bucket>/<hash>.cnt`
    扩展名统一是 `.cnt`，但**内容是原始格式**（GIF / PNG / JPEG / WebP）。
-   表情在消息显示时被写进缓存，所以"最近几十秒内新增的那张图片"就是刚收到的表情，
-   而且是原始文件 —— 动图 GIF 的动画得以保留。
+   缓存里同时躺着聊天照片、头像、**别的贴纸** —— 实测按时间/形状"猜"会把
+   小猫流汗的贴纸猜成弹吉他的乌龟。
 
-`find(name)` 的顺序：缓存里刚写的 -> 表情包目录按名字精确匹配；都拿不到返回 None，
-调用方再退回按气泡截图、最后退回发文字。
+所以挑图分三层，**像不像由像素说话**：
+
+1. 表情包目录里名字**唯一**命中 -> 直接用（确定性）；
+2. 名字重名（实测 99 个名字里 55 个在多套包里重名）或查不到 -> 拿**界面上气泡的
+   截图**当基准，逐个候选（表情包文件 + 缓存文件）比像素，够像才用；
+3. 没有任何候选够像 -> 返回 None，调用方退回"就发那张气泡截图"（静止但一定是对的）。
+
+`find(name, near_epoch, aspect, reference)` 就是这个入口。
 """
 from __future__ import annotations
 
 import json
 import struct
 import time
+
+from utils import imgtool
 
 # 表情包解包目录（相对 App 的外部数据根目录）
 EMOJI_SUBDIR = "files/xtcdata/telwatch/weichat/emoji"
@@ -33,79 +41,125 @@ CACHE_SUBDIRS = ("cache/big_image", "cache/small_image")
 
 IMAGE_KINDS = ("gif", "png", "webp", "jpeg")
 
+# 相似度门槛：实测"同一张"能到 0.95 上下，而缓存里最像的无关图片只有 0.63
+# （小猫流汗 vs 弹吉他的乌龟 = 0.50），0.80 留了很宽的余量。
+MATCH_OK = 0.80
+
 
 class EmojiStore:
-    """按名字/时间从小天才 App 的数据目录里取表情原图。"""
+    """按名字/像素比对从小天才 App 的数据目录里取表情原图。"""
 
     def __init__(self, adb, package: str = "com.xtc.watch", logger=None,
                  recent_secs: float = 45.0, index_ttl: float = 600.0,
-                 max_px: int = 600, max_bytes: int = 3 * 1024 * 1024,
-                 near_window: float = 300.0, fresh_window: float = 1800.0):
+                 max_px: int = 600, max_bytes: int = 512 * 1024,
+                 near_window: float = 300.0, fresh_window: float = 1800.0,
+                 match_ok: float = MATCH_OK, max_reads: int = 16,
+                 strict_secs: float = 120.0, match_stop: float = 0.90):
         self.adb = adb
         self.package = package
         self.logger = logger
         self.recent_secs = max(5.0, float(recent_secs))   # 缓存"刚写进来"的时间窗
         self.near_window = max(10.0, float(near_window))  # 按消息时间找缓存时允许的偏差
         # 补发/重渲染时，App 会重新写缓存文件（mtime 与消息时间能差十几分钟），
-        # 所以"最近写过"的窗口给到 30 分钟；挑哪张靠形状+动图判定，不靠时间
+        # 所以"最近写过"的窗口给到 30 分钟；挑哪张靠像素核对，不靠时间
         self.fresh_window = max(10.0, float(fresh_window))
         self.index_ttl = max(0.0, float(index_ttl))       # 名字索引缓存时长
         self.max_px = max(64, int(max_px))                # 太大的图不当表情（多半是照片）
+        # 贴纸文件都很小（实测表情包 4~70KB、缓存里的贴纸 0.5~80KB）；限制字节数是为了
+        # **不去读、更不去解**那些 1~2MB 的聊天照片（纯 Python 解一张 2000x3000 的 JPEG
+        # 要十几秒，实测曾把"找一张表情"拖到 80 秒以上）。
         self.max_bytes = max(1024, int(max_bytes))
-        self._index: dict[str, str] = {}                  # desc 名字 -> big/<code> 路径
+        self.match_ok = min(0.99, max(0.3, float(match_ok)))
+        self.match_stop = min(0.999, max(self.match_ok, float(match_stop)))
+        self.max_reads = max(1, int(max_reads))           # 每张表情最多核对多少个候选
+        self.strict_secs = max(20.0, float(strict_secs))  # 没有基准图时"时间上必须很近"
+        self._index: dict[str, list[str]] = {}            # desc 名字 -> [big/<code> ...]
         self._index_ts = float("-inf")
+        # path -> (mtime, info, [网格...])：核对过的候选不必重复解码
+        self._grids: dict[str, tuple] = {}
 
     # ------------------------------------------------------------------ 对外
     @property
     def root(self) -> str:
         return f"/sdcard/Android/data/{self.package}"
 
+    def name_is_unique(self, name: str) -> bool:
+        """这个名字在本地表情包里是不是只有一套包有（有就无需像素核对）。"""
+        hits = self._pack_hits(name)
+        return len(hits) == 1
+
     def find(self, name: str = "", near_epoch: float | None = None,
-             aspect: float | None = None) -> dict | None:
-        """找这张表情的原图，返回 {data, kind, w, h, animated, path, source}；没有则 None。
+             aspect: float | None = None, reference: bytes | None = None) -> dict | None:
+        """找这张表情的原图，返回 {data, kind, w, h, animated, path, source, score}。
 
-        name：界面 content-desc 里的表情名（如 '啊啊啊'）；只用于"表情包目录"精确匹配。
-        near_epoch：这条消息**自己的时间**（能找到"消息显示时写进缓存"的那张时最准）。
-        aspect：屏幕上那个表情气泡的宽高比。缓存里同时会有聊天里的**照片**，
-        用"形状对得上 + 是动图"来挑，比只看时间可靠得多（实测 App 会在重新渲染时
-        重写缓存文件，mtime 与消息时间可以差十几分钟）。
+        name：界面 content-desc 里的表情名（如 '流汗'）。
+        near_epoch：这条消息**自己的时间**（找不到像素依据时按它挑"当时写进缓存的"）。
+        aspect：屏幕上那个表情气泡的宽高比（没有基准图时用来排除照片）。
+        reference：**界面上那张气泡的截图**（PNG 字节）。给了它就逐个候选比像素，
+        只有真的像才敢发 —— 这是"货不对板"（小猫发成乌龟）的根治办法。
 
-        顺序刻意是**先按名字查表情包、再查缓存**：名字命中是确定性的，
-        而"缓存里最近的图片"只是启发式。缓存只用来兜底"名字查不到"的表情
-        （例如需要联网取回、不在本地表情包里的贴纸）。
+        拿不到可信的原图时返回 None，调用方退回"就发这张气泡截图"。
         """
-        hit = self._from_pack(name)
-        if hit:
-            return hit
-        return self._from_cache(near_epoch, aspect)
+        ref_grid = None
+        if reference:
+            try:
+                ref_grid = imgtool.image_grid(reference)
+                if not ref_grid[0]:
+                    ref_grid = None
+            except Exception as e:  # noqa: BLE001 解不出来就当没有基准
+                self._log("debug", f"基准截图解码失败: {e}")
+                ref_grid = None
+        hits = self._pack_hits(name)
+        if hits and len(hits) == 1:
+            hit = self._read_hit(hits[0])
+            if hit:
+                # 名字在本地表情包里唯一 -> 确定性最高，直接用（也省一次界面截图）
+                hit["score"] = None if ref_grid is None else 1.0
+                return hit
+        if hits and ref_grid is None:
+            # 重名又没基准图：只能按老行为信第一套（日志里会写明）
+            hit = self._read_hit(hits[0])
+            if hit:
+                self._log("debug", f"表情 {name!r} 在 {len(hits)} 套包里重名、"
+                                  "又没有基准截图，按第一套发送")
+                hit["score"] = None
+                return hit
+        best = None
+        for path in hits:
+            hit = self._read_hit(path)
+            if not hit:
+                continue
+            hit["score"] = self._score(ref_grid, hit["data"], path, hit.get("mtime"))
+            if best is None or hit["score"] > best["score"]:
+                best = hit
+        if best is not None and best["score"] >= self.match_ok:
+            return best
+        if hits and best is not None:
+            self._log("info", f"表情 {name!r} 在表情包里找到的原图都不像界面上的那张"
+                              f"（最像的 {best['score']:.2f} < {self.match_ok:.2f}），改去缓存里找")
+        got = self._from_cache(near_epoch, aspect, ref_grid)
+        if got:
+            return got
+        return None
 
     def warm(self) -> int:
         """预热表情包名字索引（可放后台线程调用，避免第一次收到表情时才建索引卡一下）。"""
         return len(self._pack_index())
 
     # ------------------------------------------------------------------ 缓存
-    def _from_cache(self, near_epoch: float | None = None,
-                    aspect: float | None = None) -> dict | None:
-        """缓存里那张表情图：按"形状对得上 + 是动图 + 时间接近"挑最像的一张。
+    def _cache_listing(self) -> tuple[list[tuple[float, int, str]], float]:
+        """缓存目录里的文件 ([(mtime, size, path)], 设备当前时间)。
 
-        为什么不纯按时间：实测 App 会在**重新渲染聊天时重写**缓存文件，mtime 与消息时间
-        能差十几分钟（实例：15:24 的消息，缓存文件的 mtime 是 15:41），纯按时间全落空。
-        贴纸与照片天然不同：贴纸多是**动图 GIF/WebP**、画面是**正方形**（与气泡同形状），
-        照片多是 JPEG、长宽比也不同 —— 用这些特征挑稳得多。
+        实测整个缓存也就几十个文件，一次 `find` 全列出来比按时间窗反复筛更省事，
+        也不会因为"文件被重新渲染过（mtime 被刷新）"而漏掉目标；挑哪张靠像素核对。
         """
-        # find 的 -mmin 只支持分钟：先按分钟粗筛（避免遍历整个缓存目录），精筛在下面
-        if near_epoch:
-            age_min = max(2, int(max(0.0, time.time() - near_epoch) // 60) + 2)
-        else:
-            age_min = max(1, int(self.recent_secs // 60) + 1)
-        age_min = min(age_min, max(1, int(self.fresh_window // 60) + 1))
         try:
             listing = self.adb.shell(
-                f"date +%s; find {self.root}/cache -type f -mmin -{age_min} "
-                f"-exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", timeout=30)
+                f"date +%s; find {self.root}/cache -type f "
+                f"-exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", timeout=60)
         except Exception as e:  # noqa: BLE001 取不到就走别的路
             self._log("debug", f"读图片缓存失败: {e}")
-            return None
+            return [], time.time()
         now = 0.0
         rows: list[tuple[float, int, str]] = []
         for line in (listing or "").splitlines():
@@ -115,48 +169,135 @@ class EmojiStore:
                 continue
             parts = line.split(None, 2)
             if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-                rows.append((float(parts[0]), int(parts[1]), parts[2].strip()))
-        if not rows or not now:
-            return None
-        cands: list[tuple] = []
-        for mtime, size, path in rows:
-            if size <= 0 or size > self.max_bytes:
-                continue
-            d_msg = abs(mtime - near_epoch) if near_epoch else None
-            d_now = now - mtime
-            if not (d_now <= self.fresh_window
-                    or (d_msg is not None and d_msg <= self.near_window)):
-                continue
+                size = int(parts[1])
+                if 0 < size <= self.max_bytes:
+                    rows.append((float(parts[0]), size, parts[2].strip()))
+        return rows, (now or time.time())
+
+    def _score(self, ref_grid, data: bytes, path: str, mtime: float | None) -> float:
+        """候选图片与基准网格的最佳相似度（解不出来返回 -1）。"""
+        grids = self._grids_of(path, mtime, data)
+        if not grids:
+            return -1.0
+        return max(imgtool.similarity(ref_grid, g) for g in grids)
+
+    def _grids_of(self, path: str, mtime: float | None, data: bytes | None = None) -> list:
+        """候选图片每帧的网格（带缓存）；解不出来的格式返回 []。"""
+        ent = self._grids.get(path)
+        if ent and mtime is not None and ent[0] == mtime:
+            return ent[2]
+        if data is None:
             data = self._read(path)
-            if not data:
-                continue
-            info = self.sniff(data)
-            if not info or info.get("kind") not in IMAGE_KINDS:
-                continue
+        if not data:
+            return []
+        frames = imgtool.decode_frames(data, max_frames=imgtool.FRAME_LIMIT)
+        if not frames:
+            return []
+        grids = [imgtool.frame_grid(f) for f in frames]
+        info = self.sniff(data)
+        self._grids[path] = (mtime, info, grids)
+        return grids
+
+    def _from_cache(self, near_epoch: float | None = None, aspect: float | None = None,
+                    ref_grid=None) -> dict | None:
+        """缓存里那张表情图。
+
+        有基准图：**按像素相似度选**（够像才返回；都不像返回 None，让调用方退回截图）。
+        没有基准图：按"刚写过 + 形状对 + 是动图"猜，而且只敢用**时间上非常确定**的候选。
+        """
+        rows, now = self._cache_listing()
+        if not rows:
+            return None
+        ordered = []
+        for mtime, size, path in rows:
+            fresh = (now - mtime) <= self.fresh_window
+            near = near_epoch is not None and abs(mtime - near_epoch) <= self.near_window
+            prio = 0 if fresh else (1 if near else 2)
+            ordered.append((prio, -mtime, mtime, size, path))
+        ordered.sort()
+
+        reads = 0
+        best: tuple | None = None
+        for prio, _neg, mtime, size, path in ordered:
+            if ref_grid is None:
+                # 没有基准图：不解码（解不开的格式也不影响），只按"时间非常确定 + 形状 + 动图"猜。
+                # 而且**老消息一律不猜**：补发一条几天前的消息时，缓存里可能有别的图
+                # 刚被重新渲染过（mtime 很新），猜它就会"货不对板"（小猫发成乌龟）。
+                if near_epoch is not None and abs(now - near_epoch) > self.strict_secs:
+                    continue
+                if not ((now - mtime) <= self.strict_secs
+                        or (near_epoch is not None and abs(mtime - near_epoch) <= 60)):
+                    continue
+                data = self._read(path)
+                if not data:
+                    continue
+                info = self.sniff(data)
+                if not info or info.get("kind") not in IMAGE_KINDS:
+                    continue
+                grids = []
+            else:
+                ent = self._grids.get(path)
+                cached = bool(ent) and ent[0] == mtime
+                if cached:
+                    info, grids = ent[1], ent[2]
+                else:
+                    if reads >= self.max_reads:
+                        break
+                    data = self._read(path)
+                    reads += 1
+                    if not data:
+                        continue
+                    info = self.sniff(data)
+                    if not info or info.get("kind") not in IMAGE_KINDS:
+                        continue
+                    w0, h0 = info.get("w") or 0, info.get("h") or 0
+                    if max(w0, h0) > self.max_px:
+                        continue      # 先按**文件头**尺寸筛掉照片，别花时间去解码大图
+                    grids = self._grids_of(path, mtime, data)
+                    if not grids:
+                        continue                              # WebP 之类解不了 -> 不能核对
             w, h = info.get("w") or 0, info.get("h") or 0
             if max(w, h) > self.max_px:
-                continue                                  # 太大 -> 多半是聊天里的照片
-            # ① 形状：与屏幕上的气泡形状一致（贴纸是方的，气泡也是方的）
-            pen_shape = 0
-            if aspect and w and h:
-                ratio = w / h
-                pen_shape = 0 if abs(ratio - aspect) <= 0.25 * max(1.0, aspect) else 1
-            # ② 动图优先（表情基本是动图），JPEG 多半是照片 -> 排最后
-            pen_kind = 0 if info.get("animated") else (0.5 if info.get("kind") != "jpeg" else 1)
-            score = min([d for d in (d_msg, d_now) if d is not None] or [0.0])
-            cands.append((pen_shape, pen_kind, score,
-                          {**info, "data": data, "path": path, "source": "cache"}))
-        if not cands:
+                continue
+            anim = 1 if info.get("animated") else 0
+            area = w * h
+            if ref_grid is not None:
+                score = max(imgtool.similarity(ref_grid, g) for g in grids)
+            else:
+                d = abs(mtime - near_epoch) if near_epoch else max(0.0, now - mtime)
+                pen_shape = 0
+                if aspect and w and h:
+                    ratio = w / h
+                    pen_shape = 0 if abs(ratio - aspect) <= 0.25 * max(1.0, aspect) else 1
+                pen_kind = 0 if info.get("animated") else (0.5 if info.get("kind") != "jpeg" else 1)
+                score = max(0.0, 1.0 - min(1.0, d / max(1.0, self.fresh_window)))
+                score -= 0.05 * pen_shape + 0.03 * pen_kind
+            key = (score, anim, area)
+            if best is None or key > best[0]:
+                best = (key, path, mtime, info, score)
+            if ref_grid is not None and score >= self.match_stop:
+                break                       # 已经非常像了，不必再翻后面的候选（省时间）
+        if best is None:
             return None
-        cands.sort(key=lambda c: (c[0], c[1], c[2]))
-        return cands[0][3]
+        _key, path, mtime, info, score = best
+        if ref_grid is not None and score < self.match_ok:
+            self._log("info", f"[表情包] 缓存里没有像界面这张的原图"
+                              f"（最像的 {score:.2f} < {self.match_ok:.2f}），改用气泡截图")
+            return None
+        data = self._read(path)
+        if not data:
+            return None
+        out = dict(info)
+        out.update({"data": data, "path": path, "source": "cache",
+                    "mtime": mtime, "score": score if ref_grid is not None else None})
+        return out
 
     # ------------------------------------------------------------------ 表情包目录
     def _pack_index(self) -> dict:
-        """desc 名字 -> 表情文件路径（带 TTL 缓存；只在缓存里找不到时才建）。"""
+        """desc 名字 -> [表情文件路径...]（带 TTL 缓存；同名的包都留着，供"重名"判断）。"""
         if self._index and time.monotonic() - self._index_ts < self.index_ttl:
             return self._index
-        index: dict[str, str] = {}
+        index: dict[str, list[str]] = {}
         try:
             jsons = self.adb.shell(
                 f"find {self.root}/{EMOJI_SUBDIR} -name desc.json 2>/dev/null", timeout=30)
@@ -176,25 +317,29 @@ class EmojiStore:
                 for e in (json.loads(text).get("emojis") or []):
                     desc = str(e.get("desc") or "").strip()
                     code = str(e.get("code") or "").strip()
-                    if not desc or not code or desc in index:
+                    if not desc or not code:
                         continue
                     pack = jp.rsplit("/", 1)[0]
-                    index[desc] = f"{pack}/big/{code}"    # big 优先（清晰）
+                    path = f"{pack}/big/{code}"                # big 优先（清晰）
+                    lst = index.setdefault(desc, [])
+                    if path not in lst:
+                        lst.append(path)
             except Exception as e:  # noqa: BLE001 单个包坏了不影响其它
                 self._log("debug", f"解析表情包索引失败 {jp}: {e}")
         if index:
             self._index = index
             self._index_ts = time.monotonic()
-            self._log("info", f"表情包索引已建立：{len(index)} 个名字")
+            dup = sum(1 for v in index.values() if len(v) > 1)
+            self._log("info", f"表情包索引已建立：{len(index)} 个名字（其中 {dup} 个重名）")
         return self._index or index
 
-    def _from_pack(self, name: str) -> dict | None:
+    def _pack_hits(self, name: str) -> list[str]:
         name = (name or "").strip()
         if not name:
-            return None
-        path = self._pack_index().get(name)
-        if not path:
-            return None
+            return []
+        return list(self._pack_index().get(name) or [])
+
+    def _read_hit(self, path: str) -> dict | None:
         data = self._read(path)
         if not data:
             return None
@@ -202,7 +347,8 @@ class EmojiStore:
         if not info or info.get("kind") not in IMAGE_KINDS:
             return None
         out = dict(info)
-        out.update({"data": data, "path": path, "source": "pack"})
+        out.update({"data": data, "path": path, "source": "pack",
+                    "mtime": -1.0})            # -1：表情包文件没有"写入时间"概念
         return out
 
     # ------------------------------------------------------------------ 工具
