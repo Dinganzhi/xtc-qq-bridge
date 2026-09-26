@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -26,6 +27,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1565,6 +1567,53 @@ def test_cache_pick_prefers_sticker_shape_and_animation() -> None:
     got2 = store.find("弹吉他", near_epoch=now - 1021)
     check("没有气泡形状时仍优先动图",
           bool(got2) and got2["animated"] is True, str({k: v for k, v in (got2 or {}).items() if k != "data"}))
+
+
+def test_time_label_is_absolute_and_stable() -> None:
+    """App 的时间标签会**随日期变化**：同一条消息当天是 `16:18`，第二天变成 `昨天 16:18`。
+
+    两个后果（都踩过）：
+      * 转发文本里出现"昨天"这种相对时间，而不是绝对的 `09-25 16:18`；
+      * 拿原始标签当"消息身份" -> 隔天标签一变，这条**旧消息就被当成新消息重复转发**。
+    所以标签必须先统一成绝对时间，既用于显示也用于去重身份。
+    """
+    br = bridge_mod.MessageBridge.__new__(bridge_mod.MessageBridge)   # 只借用这几个纯函数
+    d1 = datetime(2026, 9, 25, 16, 20)
+    d2 = datetime(2026, 9, 26, 15, 53)
+
+    check("当天标签 -> 绝对", br._abs_time_label("16:18", d1) == "09-25 16:18",
+          br._abs_time_label("16:18", d1))
+    check("隔天读到「昨天」-> 同一个绝对时间（身份稳定，不会重复转发）",
+          br._abs_time_label("昨天 16:18", d2) == "09-25 16:18",
+          br._abs_time_label("昨天 16:18", d2))
+    check("两种读法算出的去重键完全相同",
+          ("xtc", "", "表情流汗", br._abs_time_label("16:18", d1))
+          == ("xtc", "", "表情流汗", br._abs_time_label("昨天 16:18", d2)))
+    check("前天/星期X/月日 都能绝对化",
+          br._abs_time_label("前天 09:05", d2) == "09-24 09:05"
+          and br._abs_time_label("8月30日 16:18", d2) == "08-30 16:18"
+          and br._abs_time_label("星期一 16:18", d2) == "09-21 16:18",
+          f"{br._abs_time_label('前天 09:05', d2)} "
+          f"{br._abs_time_label('8月30日 16:18', d2)} "
+          f"{br._abs_time_label('星期一 16:18', d2)}")
+    check("已经是绝对时间的标签保持原样",
+          br._abs_time_label("09-25 16:18", d2) == "09-25 16:18")
+    check("只写月日且落在未来的按去年算（12月31日）",
+          br._abs_time_label("12月31日 23:59", d2).endswith("12-31 23:59")
+          and datetime.fromtimestamp(br._label_epoch("12月31日 23:59", d2)).year == 2025,
+          str(datetime.fromtimestamp(br._label_epoch("12月31日 23:59", d2))))
+    check("认不出的标签不硬编（返回空，交给调用方兜底）",
+          br._abs_time_label("乱七八糟", d2) == "")
+
+    # 转发文本：永远不带"昨天/前天/今天/星期"
+    for raw in ("16:18", "今天 16:18", "昨天 16:18", "前天 16:18", "星期一 16:18",
+                "8月30日 16:18", "09-25 16:18", "", "乱七八糟"):
+        text = br._format_xtc_time(raw)
+        if not re.fullmatch(r"\d{2}-\d{2} \d{2}:\d{2}", text):
+            check(f"转发时间必须是绝对的 MM-DD HH:MM（输入 {raw!r}）", False, text)
+            break
+    else:
+        check("转发时间永远是绝对的 MM-DD HH:MM（含相对标签与空标签）", True)
 
 
 def test_confirm_sent_rule() -> None:
@@ -3307,10 +3356,12 @@ def test_backlog_walk_until_known() -> None:
             jobs.append(br6._job_queue.get_nowait())
         check("补发走的是异步队列（不会阻塞轮询）",
               n8 == 1 and jobs and jobs[0][0] == "forward", f"n={n8} jobs={jobs}")
+        lbl_abs = br6._abs_time_label("19:52")
         check("入队时就短期去重，避免下一轮重复入队",
-              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息", "19:52")) is True)
+              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息", lbl_abs)) is True, lbl_abs)
         check("去重键带上了时间标签（同文本不同时间算两条）",
-              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息", "19:53")) is False)
+              br6.dedup.seen(("xtc", "屑猹不喝茶", "异步消息",
+                              br6._abs_time_label("19:53"))) is False)
         br6._do_forward_job(*jobs[0][1:4])          # 工作线程真正执行
         check("工作线程执行后才入长期历史/消息库",
               fwd6.sent and br6.msgs.seen("异步消息", "xtc") is True, str(fwd6.sent))
@@ -3377,6 +3428,7 @@ def main() -> int:
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,
                test_forwarder_wrapper_exposes_send_image,
                test_cache_pick_prefers_sticker_shape_and_animation,
+               test_time_label_is_absolute_and_stable,
                test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,
                test_launch_skips_when_foreground, test_recover_is_state_driven,
                test_popup_handling, test_custom_popup_auto_close,

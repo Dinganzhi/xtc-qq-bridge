@@ -461,11 +461,11 @@ class MessageBridge:
                         break
                 # 普通手表消息 -> 转发（命令已被上面拦截，绝不转发/入库）
                 if text and not is_cmd_text:
-                    # 事件身份 = 文本 + **这条消息自己的时间标签**。
-                    # 只看文本的话，"同一张贴纸 / 同一句'好'"发第二次就再也转发不出去
-                    # （长期表 TTL 7 天，history.seen 一直为真，日志里连
-                    # "收到小天才消息"都不会出现 —— 用户报的"消息读不出来"就是这个）。
-                    label = (time_label or "").strip()
+                    # 事件身份 = 文本 + **绝对时间**（把 App 的"今天/昨天/星期X"标签统一成
+                    # MM-DD HH:MM）。用 App 原始标签当身份会出事：同一条消息隔天标签从
+                    # "16:18" 变成 "昨天 16:18"，于是一条旧消息会被当成新消息重复转发。
+                    raw_label = (time_label or "").strip()
+                    label = self._abs_time_label(raw_label) or raw_label
                     key = ("xtc", contact or "", text, label)
                     dup = (self.history.seen(*key) or self.dedup.seen(key)
                            or self.echo.is_echo(text))
@@ -537,19 +537,21 @@ class MessageBridge:
                 pass
             if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
                 continue                            # 命令文本由命令流程处理
-            if self._in_store(contact, text, it.get("time_label") or ""):
+            # 身份与显示都用**绝对时间**（理由同 live 路径：App 的标签会随日期变化）
+            raw_lbl = (it.get("time_label") or "").strip()
+            lbl = self._abs_time_label(raw_lbl) or raw_lbl
+            if self._in_store(contact, text, lbl):
                 break                               # 撞库 -> 停，不再往上翻
-            if self.dedup.seen(("xtc", contact or "", text, it.get("time_label") or "")):
+            if self.dedup.seen(("xtc", contact or "", text, lbl)):
                 # 刚试过（120 秒内，多为上次转发失败）：本轮先跳过它，
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
             # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）；
             # 传消息自己的时间，让缓存查找能找到"当时写进来的那张"（保住动图）
-            sticker = (self._capture_sticker(root, text,
-                                            near_epoch=self._label_epoch(it.get("time_label") or ""))
+            sticker = (self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_lbl))
                        if it.get("sticker") else None)
-            pending.append((text, it.get("time_label") or "", sticker))
+            pending.append((text, lbl, sticker))
 
         if not pending:
             return 0
@@ -764,16 +766,28 @@ class MessageBridge:
         return bool(self.forwarder.send(target_type, target_id, message)), ""
 
     def _format_xtc_time(self, time_label: str) -> str:
-        """把 App 内的时间标签转成 [日期时间] 格式：
-        - '06:56'（当天）-> '08-31 06:56'（补当天日期）
-        - '昨天 23:42' / '8月30日 23:42' -> 原样
-        - 空 -> 当前时间 'MM-DD HH:MM'"""
-        label = (time_label or "").strip()
-        if not label:
-            return datetime.now().strftime("%m-%d %H:%M")
-        if re.fullmatch(r"\d{1,2}:\d{2}", label):
-            return datetime.now().strftime("%m-%d") + " " + label
-        return label
+        """把 App 内的时间标签转成**绝对** `MM-DD HH:MM`。
+
+        为什么必须转绝对：App 对**同一条消息**的标签会随日期变化 ——
+        当天显示 `16:18`，第二天变成 `昨天 16:18`，再往后可能变成 `09-25 16:18`。
+        原样输出就会出现"转发里写着昨天"这种相对时间；拿它当消息身份更会导致
+        同一条消息隔天被当成新消息重复转发。
+        """
+        return self._abs_time_label(time_label) or datetime.now().strftime("%m-%d %H:%M")
+
+    def _abs_time_label(self, time_label: str, now: datetime | None = None) -> str:
+        """把任意 App 时间标签统一成绝对 `MM-DD HH:MM`；解析不出来返回 ""。
+
+        支持：`16:18`（今天）/ `今天 16:18` / `昨天 16:18` / `前天 16:18` /
+        `星期一 16:18` / `8月30日 16:18` / 已经是绝对的 `09-25 16:18`、`2026-09-25 16:18`。
+        """
+        epoch = self._label_epoch(time_label, now)
+        if epoch is None:
+            return ""
+        try:
+            return datetime.fromtimestamp(epoch).strftime("%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):  # noqa: BLE001 时间戳异常就当解析不出来
+            return ""
 
     def _qq_targets(self) -> list[tuple[str, str]]:
         """转发目标列表 [(type, id)]；qq_private/qq_group 支持单个字符串或列表。"""
@@ -1303,14 +1317,32 @@ class MessageBridge:
         return [str(p) for p in prefixes if str(p or "").strip()]
 
     def _label_epoch(self, time_label: str, now: datetime | None = None) -> float | None:
-        """把 App 时间标签解析成时间戳（本地消息库归档用）：
-        'HH:MM'->今天；'昨天 HH:MM'/'前天 HH:MM'->对应日期；'M月D日 HH:MM'->该日期。
-        解析失败返回 None（归档时用当前时间兜底）。显示层用时间戳输出明确日期，
-        不再出现"昨天/前天"字样。"""
+        """把 App 时间标签解析成时间戳（本地消息库归档 / 绝对化都用它）：
+        'HH:MM'->今天；'今天'/'昨天'/'前天 HH:MM'->对应日期；'星期X HH:MM'->最近的那个星期X；
+        'M月D日 HH:MM'、'09-25 16:18'、'2026-09-25 16:18'->该日期。
+        解析失败返回 None（归档时用当前时间兜底）。"""
         label = (time_label or "").strip()
         if not label:
             return None
         now = now or datetime.now()
+        # 已经是绝对时间：09-25 16:18 / 2026-09-25 16:18 / 2026/09/25 16:18
+        m = re.search(r"(?:(\d{4})[-/])?(\d{1,2})[-/](\d{1,2})[\sT]+(\d{1,2}):(\d{2})", label)
+        if m:
+            try:
+                dt = now.replace(year=int(m.group(1)) if m.group(1) else now.year,
+                                 month=int(m.group(2)), day=int(m.group(3)),
+                                 hour=int(m.group(4)), minute=int(m.group(5)),
+                                 second=0, microsecond=0)
+            except ValueError:
+                return None
+            if not m.group(1) and dt > now + timedelta(days=1):
+                dt = dt.replace(year=dt.year - 1)   # 没写年份且落在未来 -> 多半是去年的
+            return dt.timestamp()
+        # "今天 16:18" / "今日 16:18"
+        m = re.fullmatch(r"(?:今天|今日)\s*(\d{1,2}):(\d{2})", label)
+        if m:
+            return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                               second=0, microsecond=0).timestamp()
         m = re.fullmatch(r"(\d{1,2}):(\d{2})", label)
         if m:
             return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
@@ -1321,16 +1353,31 @@ class MessageBridge:
             return (now - timedelta(days=days_back)).replace(
                 hour=int(m.group(2)), minute=int(m.group(3)),
                 second=0, microsecond=0).timestamp()
+        # "星期一 16:18" -> 最近一个已经过去的那个星期几
+        m = re.search(r"星期([一二三四五六日天])", label)
+        if m:
+            tm = re.search(r"(\d{1,2}):(\d{2})", label)
+            idx = "一二三四五六日天".index(m.group(1)) + 1        # 周一=1 ... 周日=7
+            days_back = (now.isoweekday() - idx) % 7
+            dt = (now - timedelta(days=days_back)).replace(
+                hour=int(tm.group(1)) if tm else 0,
+                minute=int(tm.group(2)) if tm else 0, second=0, microsecond=0)
+            if dt > now:
+                dt = dt - timedelta(days=7)
+            return dt.timestamp()
         m = re.search(r"(\d{1,2})月(\d{1,2})日", label)
         if m:
             tm = re.search(r"(\d{1,2}):(\d{2})", label)
             try:
-                return now.replace(month=int(m.group(1)), day=int(m.group(2)),
-                                   hour=int(tm.group(1)) if tm else 0,
-                                   minute=int(tm.group(2)) if tm else 0,
-                                   second=0, microsecond=0).timestamp()
+                dt = now.replace(month=int(m.group(1)), day=int(m.group(2)),
+                                 hour=int(tm.group(1)) if tm else 0,
+                                 minute=int(tm.group(2)) if tm else 0,
+                                 second=0, microsecond=0)
             except ValueError:
                 return None
+            if dt > now + timedelta(days=1):
+                dt = dt.replace(year=dt.year - 1)   # 只写月日且落在未来 -> 去年
+            return dt.timestamp()
         return None
 
     # ------------------------------------------------------------------ xtc 侧命令（在小天才聊天输入，由本桥执行）
