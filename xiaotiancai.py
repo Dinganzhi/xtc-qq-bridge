@@ -53,6 +53,10 @@ _PERMISSION_ALLOW_IDS = (
 _CANCEL_DIALOG_ID = "com.xtc.watch:id/btn_cancel"
 # 网络提示条（会混进聊天文本，读取时排除）
 _TIP_IDS = ("tv_weichat_uninstall_hint", "iv_tips_content")
+# 图片消息（照片）在界面上的识别：气泡同样是 chat_msg_item_content，但 class 是 ImageView、
+# text 为空、content-desc 形如 '童武洋发的消息,图片消息，双击查看'（图片还在下载时可能只有
+# '童武洋发的消息'）。转成这个**固定文本**当消息内容/去重身份（不同照片靠时间标签区分）。
+IMAGE_TEXT = "图片"
 # 发送失败弹窗标题
 _SEND_FAIL_TITLE = "消息发送"
 
@@ -125,6 +129,9 @@ LOGIN_UNKNOWN = "unknown"
 
 
 class Xiaotiancai:
+    # 图片（照片）消息归一化后的文本（见模块级 IMAGE_TEXT 注释）；挂成类属性方便外部引用
+    IMAGE_TEXT = IMAGE_TEXT
+
     def __init__(self, adb: ADBController, cfg: dict | None = None, logger=None):
         self.adb = adb
         cfg = cfg or {}
@@ -2340,6 +2347,30 @@ class Xiaotiancai:
             self.log("warning", f"读取消息异常: {e}")
             return (None, None, "", "", [])
 
+    @staticmethod
+    def _is_image_bubble(cls: str, desc_body: str, bounds) -> bool:
+        """这个气泡是不是"图片（照片）消息"。
+
+        实测：class=ImageView、text 为空、content-desc 形如
+        `童武洋发的消息,图片消息，双击查看`；图片还没下载完时 desc 里可能还没有
+        "图片消息"几个字（只剩发送方），所以"空的说明 + 够大的 ImageView 气泡"
+        也算图片 —— 否则这张照片会被**静默丢掉**（用户报的"图片发不出去、
+        控制台一行都没有"）。
+        表情（desc_body 以"表情"开头）与语音等其它 ImageView 气泡（desc_body 是
+        "语音"这类文字）都不会被误判；尺寸门槛用来排除头像/小图标。
+        """
+        if "ImageView" not in (cls or ""):
+            return False
+        body = (desc_body or "").strip()
+        if body.startswith("表情"):
+            return False
+        if body and "图片" not in body and "照片" not in body:
+            return False
+        if not bounds:
+            return False
+        w, h = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        return w >= 60 and h >= 60
+
     def _latest_in_chat(self, root: ET.Element):
         """聊天窗口内：取最新一条"别人发来的"消息，返回 (contact, text, time_label)。
 
@@ -2370,6 +2401,7 @@ class Xiaotiancai:
                 continue  # 只关心消息气泡
             t = n.get("text", "").strip()
             desc = n.get("content-desc", "")
+            cls = n.get("class", "") or ""
             b = self._bounds(n)
             if b is None:
                 continue
@@ -2389,6 +2421,11 @@ class Xiaotiancai:
                     continue
                 if filter_own and center_x > screen_w * 0.55:
                     continue  # 右侧气泡 = 自己发的消息
+            # 图片消息（照片）：气泡是 ImageView、没有文字，desc 里写"图片消息，双击查看"
+            # （图片还没下完时 desc 可能只有"XX发的消息"）。以前这类消息 text 为空 -> 被
+            # 静默丢掉，控制台一行日志都没有（用户报的"图片发不出去、也没提示"）。
+            if self._is_image_bubble(cls, t, b):
+                t = IMAGE_TEXT
             if not t:
                 continue
             # 桥接系统提示（如"发送成功/发送失败"送达确认）一律不转发，防止循环
@@ -2543,6 +2580,7 @@ class Xiaotiancai:
                 continue
             t = (n.get("text", "") or "").strip()
             desc = (n.get("content-desc", "") or "").strip()
+            cls = n.get("class", "") or ""
             b = self._bounds(n)
             if b is None:
                 continue
@@ -2564,12 +2602,16 @@ class Xiaotiancai:
             else:
                 # 无标注：右侧气泡 = 自己发的消息
                 is_own = filter_own and center_x > screen_w * 0.55
-            if not t or t in junk:
-                continue
             # 表情/贴纸：气泡本身没有文字（文字消息的 text 一定非空），
             # content-desc 给的是"表情<名字>"，例如 '屑猹不喝茶发的消息,表情啊啊啊'。
             # 只按这个判，避免把"表情包发我"这种真的文字消息当成表情。
             is_sticker = bool(desc_body.startswith("表情")) and not (n.get("text", "") or "").strip()
+            # 图片（照片）：ImageView 气泡、desc 写"图片消息，双击查看"；下载中可能没有说明文字
+            is_image = self._is_image_bubble(cls, t, b)
+            if is_image:
+                t = IMAGE_TEXT
+            if not t or t in junk:
+                continue
             if self._is_system_msg(t):
                 continue
             if is_own and not include_own:
@@ -2581,9 +2623,26 @@ class Xiaotiancai:
                     break
             out.append({"text": t, "is_own": is_own, "contact": contact,
                         "time_label": time_label, "y_bottom": b[3],
-                        "sticker": is_sticker, "bounds": b})
+                        "sticker": is_sticker, "image": is_image, "bounds": b})
         out.sort(key=lambda it: it["y_bottom"])
         return out
+
+    def image_of_latest(self, root: ET.Element, text: str = "") -> dict | None:
+        """最新一条**对方发来的图片（照片）**气泡信息；没有则 None（给桥接取图用）。"""
+        try:
+            items = self._chat_bubbles(root, include_own=False)
+        except Exception as e:  # noqa: BLE001 判定失败不影响文字转发
+            self.log("debug", f"解析图片气泡失败: {e}")
+            return None
+        want = (text or "").strip()
+        hit = None
+        for it in items:                      # 已按 y 从小到大（旧->新）
+            if not it.get("image"):
+                continue
+            if want and it.get("text") != want:
+                continue
+            hit = it
+        return hit
 
     def sticker_of_latest(self, root: ET.Element, text: str = "") -> dict | None:
         """最新一条**对方发来的表情**气泡信息 {text, bounds, time_label}；没有则 None。

@@ -1050,13 +1050,16 @@ def test_sticker_forward_one_way() -> None:
         br.xtc = xtc
         shot = {"n": 0}
         adb.screencap_crop_png = lambda box: (shot.__setitem__("n", shot["n"] + 1),
-                                              b"\x89PNG" + b"y" * 400)[1]
+                                              _fake_shot())[1]
 
         class _Store:
             def find(self, name, near_epoch=None, aspect=None, reference=None):
                 return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
                         "animated": True, "path": "/x/y.cnt", "source": "cache",
                         "score": 0.97}
+
+            def index_ready(self):
+                return True
 
             def name_is_unique(self, name):
                 return True                     # 名字唯一 -> 不必截图核对（省一次截屏）
@@ -1080,6 +1083,7 @@ def test_sticker_forward_one_way() -> None:
         # ② 原文件取不到 -> 退回截图（静态一帧）
         br._emoji_store = type("S", (), {
             "find": lambda self, name, near_epoch=None, aspect=None, reference=None: None,
+            "index_ready": lambda self: True,
             "name_is_unique": lambda self, name: False})()
         got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
         check("原文件取不到时退回截图",
@@ -1535,6 +1539,11 @@ def _png_solid(w: int, h: int, top: tuple, bottom: tuple) -> bytes:
     return encode_png_rgb(w, h, rows)
 
 
+def _fake_shot(w: int = 120, h: int = 120) -> bytes:
+    """假的"气泡截图"：必须是**有内容的真 PNG** —— 空白图会被 looks_blank 判掉。"""
+    return _png_pattern(w, h, (235, 235, 235), (20, 20, 100, 100), (40, 30, 200))
+
+
 def _png_pattern(w: int, h: int, rgb: tuple, box: tuple, color: tuple) -> bytes:
     """在纯色底上加一个方块 —— 有结构才能验证"结构相关性"这一路。"""
     from utils.pngtool import encode_png_rgb
@@ -1586,6 +1595,257 @@ def _gif_solid(w: int, h: int, colors: list, frames: list, path_size: int = 2) -
         buf += b"\x00"
     buf += b"\x3b"
     return bytes(buf)
+
+
+def test_image_message_is_forwarded() -> None:
+    """手表发来的**图片（照片）**要能转发出去。
+
+    用户报的故障："表情包能发送，但是图片无法发送，控制台也没任何消息"。
+    根因：照片气泡 text 为空、content-desc 是 `屑猹不喝茶发的消息,图片消息，双击查看`
+    （图片没下完时可能只有 `屑猹不喝茶发的消息`），旧解析 `if not t: continue` 把它
+    **静默丢掉**了 —— 一条日志都没有。
+    """
+    root = tmp_root()
+    img_xml = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,图片消息，双击查看",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[475,368][611,548]"))
+    # 图片还在下载时 desc 里可能还没有"图片消息"几个字
+    loading_xml = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[475,368][611,548]"))
+    # 语音气泡同样是 ImageView，但 desc_body 是"语音" -> 不能当图片
+    voice_xml = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,语音",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[475,368][611,548]"))
+    try:
+        xtc, _adb = make_xtc(img_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        root_el = ET.fromstring(img_xml)
+        items = xtc._chat_bubbles(root_el)
+        check("图片消息被识别（内容是固定的'图片'）",
+              len(items) == 1 and items[0]["image"] is True
+              and items[0]["text"] == xtc.IMAGE_TEXT and items[0]["sticker"] is False,
+              str([{k: v for k, v in it.items() if k != "node"} for it in items]))
+        check("图片消息也能作为'最新一条'被读到",
+              xtc._latest_in_chat(root_el)[1] == xtc.IMAGE_TEXT, str(xtc._latest_in_chat(root_el)))
+        check("image_of_latest 能定位到气泡",
+              (xtc.image_of_latest(root_el) or {}).get("bounds") == (475, 368, 611, 548),
+              str(xtc.image_of_latest(root_el)))
+        xtc2, _ = make_xtc(loading_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        check("图片还没下完（desc 没写图片）也算图片消息，不再被静默丢掉",
+              xtc2._latest_in_chat(ET.fromstring(loading_xml))[1] == xtc2.IMAGE_TEXT)
+        xtc3, _ = make_xtc(voice_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        items3 = xtc3._chat_bubbles(ET.fromstring(voice_xml))
+        check("语音气泡不会被当成图片",
+              xtc3._is_image_bubble("android.widget.ImageView", "语音", (475, 368, 611, 548)) is False
+              and all(not it.get("image") for it in items3),
+              str([{k: v for k, v in it.items() if k != "node"} for it in items3]))
+
+        # 桥接取图：① 缓存里有原图 -> 发原图；② 没有 -> 发气泡截图；③ 关掉开关 -> 只发截图
+        class _Fwd:
+            def __init__(self):
+                self.texts, self.images = [], []
+
+            def send_detail(self, t, i, m):
+                self.texts.append((t, i, m))
+                return True, ""
+
+            def send_image(self, t, i, image_b64, caption=""):
+                self.images.append((t, i, image_b64, caption))
+                return True, ""
+
+        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+               "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
+        fwd = _Fwd()
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=fwd, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br.xtc = xtc
+        br._emoji_from_data = True
+        shot = {"n": 0}
+        _adb.screencap_crop_png = lambda box: (shot.__setitem__("n", shot["n"] + 1),
+                                               _fake_shot(136, 180))[1]
+
+        class _Store:
+            def __init__(self, photo):
+                self.photo = photo
+
+            def find_photo(self, near_epoch=None, aspect=None, min_px=0, allow_now=True):
+                return self.photo
+
+        big = {"data": b"\xff\xd8\xff" + b"p" * 4000, "kind": "jpeg", "w": 1944, "h": 2592,
+               "animated": False, "path": "/cache/big.cnt", "source": "cache-photo", "score": None}
+        br._emoji_store = _Store(big)
+        got = br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT)
+        check("照片优先取缓存里的原图",
+              bool(got) and got["source"] == "cache-photo" and got.get("label") == "图片",
+              str(got and {k: v for k, v in got.items() if k != "data"}))
+        check("照片会先把气泡抠下来（聊天会自动滚动，慢一步坐标就过期了）",
+              shot["n"] == 1, f"screencap={shot['n']}")
+        br._forward("屑猹不喝茶", xtc.IMAGE_TEXT, "20:26", sticker=got)
+        check("图片走图片通道（不是文字）",
+              len(fwd.images) == 1 and not fwd.texts,
+              f"images={len(fwd.images)} texts={fwd.texts}")
+        t, i, b64, caption = fwd.images[0]
+        check("图片内容是 base64 JPEG、说明文字带昵称与时间",
+              t == "private" and i == "2218631043"
+              and base64.b64decode(b64).startswith(b"\xff\xd8\xff")
+              and "屑猹不喝茶" in caption and "20:26" in caption,
+              f"{t}:{i} {caption}")
+
+        br._emoji_store = _Store(None)
+        before = shot["n"]
+        got2 = br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT)
+        check("缓存里没有原图时退回气泡截图（一定是对的）",
+              bool(got2) and got2["source"] == "screenshot" and shot["n"] - before == 1,
+              str(got2 and {k: v for k, v in got2.items() if k != "data"}))
+
+        br._emoji_store = _Store(big)
+        br._emoji_photo = False
+        before3 = shot["n"]
+        got3 = br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT)
+        check("emoji.forward_photo=false 时不取原图，只发截图",
+              bool(got3) and got3["source"] == "screenshot" and got3.get("label") == "图片"
+              and shot["n"] - before3 == 1,
+              str(got3 and {k: v for k, v in got3.items() if k != "data"}))
+        # 补发老消息：不允许拿"刚写进缓存的大图"当依据（那时它可能是别的照片）
+        seen_allow: list = []
+
+        class _Store2(_Store):
+            def find_photo(self, near_epoch=None, aspect=None, min_px=0, allow_now=True):
+                seen_allow.append(allow_now)
+                return None
+
+        br._emoji_photo = True
+        br._emoji_store = _Store2(None)
+        br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT, backlog=True)
+        check("补发时不允许'拿刚写进来的图猜'（allow_now=False）",
+              seen_allow == [False], str(seen_allow))
+
+        # ④ 关掉表情图总开关 -> 一个图都不取
+        cfg4 = dict(cfg)
+        cfg4["emoji"] = {"forward_image": False}
+        br4 = bridge_mod.MessageBridge(cfg4, adb=None, xtc=None, forwarder=_Fwd(), logger=None)
+        br4.xtc = xtc
+        check("emoji.forward_image=false 时不取图",
+              br4._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT) is None)
+
+        # ⑤ 图片消息和表情一样，也会进消息库（这样补发时不会重复发）
+        br.msgs.append("xtc", "屑猹不喝茶", xtc.IMAGE_TEXT)
+        check("图片消息能进消息库（补发撞库用）", br.msgs.seen(xtc.IMAGE_TEXT, "xtc") is True)
+    finally:
+        cleanup(root)
+
+
+def test_photo_original_pick_is_conservative() -> None:
+    """照片原图（缓存里的大图）只能"唯一候选"才敢用 —— 宁可发低清截图也不发错图。
+
+    照片 2000x3000，纯 Python 解不动（实测只解 DC 要 37 秒），所以这条路不比像素，
+    靠"比气泡大 + 形状一致 + 时间对得上"筛，并且有第二张同样符合的就放弃。
+    """
+    from emoji_store import EmojiStore
+
+    root = "/sdcard/Android/data/com.xtc.watch/cache"
+    now = 1790599568
+    photo_p = f"{root}/big_image/x/1/photo.cnt"
+    other_p = f"{root}/big_image/x/1/other.cnt"
+    sticker_p = f"{root}/big_image/x/1/sticker.cnt"
+
+    def jpeg_head(w, h):
+        return (b"\xff\xd8\xff\xe0" + b"\x00" * 4 + b"\xff\xc0"
+                + struct.pack(">HBHHB", 17, 8, h, w, 3) + b"\x00" * 8)
+
+    photo = jpeg_head(1944, 2592) + b"P" * 70000          # 大图（>60KB）
+    other = jpeg_head(1600, 2133) + b"O" * 70000
+    sticker = jpeg_head(240, 240) + b"S" * 70000
+    files = {photo_p: photo, other_p: other, sticker_p: sticker}
+
+    class FakeAdb:
+        def __init__(self, listing):
+            self.listing = listing
+
+        def shell(self, cmd, timeout=None):
+            if cmd.startswith("date +%s;"):
+                return f"{now}\n{self.listing}"
+            if "head -c" in cmd:
+                path = cmd.split("head -c")[1].split("|")[0].strip().split(None, 1)[1]
+                return base64.b64encode(files.get(path, b"")).decode("ascii")
+            return ""
+
+        def read_file(self, path, timeout=None):
+            return files.get(path, b"")
+
+    listing = f"{now - 5} {len(photo)} {photo_p}\n{now - 400} {len(sticker)} {sticker_p}"
+    store = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None)
+    got = store.find_photo(near_epoch=now - 5, aspect=136 / 180, min_px=180)
+    check("命中唯一的大图原图（形状一致、时间对得上）",
+          bool(got) and got["path"] == photo_p and got["source"] == "cache-photo",
+          str(got and {k: v for k, v in got.items() if k != "data"}))
+    check("小贴纸不会被当成照片原图（尺寸门槛）", got["w"] == 1944 and got["h"] == 2592,
+          f"{got and got['w']}x{got and got['h']}")
+
+    # 两张同样符合条件 -> 不猜
+    listing2 = (f"{now - 5} {len(photo)} {photo_p}\n"
+                f"{now - 8} {len(other)} {other_p}\n{now - 400} {len(sticker)} {sticker_p}")
+    got2 = EmojiStore(FakeAdb(listing2), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=now - 5, aspect=136 / 180, min_px=180)
+    check("有两张时间相近的大图时不猜（退回截图）", got2 is None, str(got2))
+
+    # 形状对不上 -> 不取
+    got3 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=now - 5, aspect=1.0, min_px=180)
+    check("形状对不上就不取", got3 is None, str(got3))
+
+    # 时间对不上 -> 不取
+    got4 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=now - 3600, aspect=136 / 180, min_px=180)
+    check("时间对不上就不取", got4 is None, str(got4))
+
+    # 补发老消息、又没有时间标签 -> 连"刚写进来的"也不许用
+    got5 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=None, aspect=136 / 180, min_px=180, allow_now=False)
+    check("allow_now=False 时不拿'刚写进来'当依据", got5 is None, str(got5))
+
+
+def test_blank_bubble_shot_is_not_sent() -> None:
+    """抠错位置 / 贴纸还没加载出来时的**空白占位图**绝不能发给 QQ。
+
+    实测踩到：界面自动滚动后按旧坐标抠，抠到的是灰底白块加一个问号的占位图
+    （主色占比 0.84、亮度标准差 **9.0**，而真贴纸是 0.19 / **81.5**）。
+    这种情况一律按文字转发（"表情X"），宁可没有图，也不要发一张灰底问号。
+    """
+    from utils import imgtool
+
+    blank = _png_pattern(120, 120, (240, 240, 240), (10, 10, 70, 70), (252, 252, 252))
+    real = _png_pattern(120, 120, (235, 235, 235), (20, 20, 100, 100), (40, 30, 200))
+    dom_b, std_b = imgtool.content_stats(blank)
+    dom_r, std_r = imgtool.content_stats(real)
+    check("空白/占位图被认出来（亮度标准差很小）", imgtool.looks_blank(blank) is True,
+          f"主色占比={dom_b:.2f} 标准差={std_b:.1f}")
+    check("有内容的图不会被误判", imgtool.looks_blank(real) is False,
+          f"主色占比={dom_r:.2f} 标准差={std_r:.1f}")
+    check("解不出来的字节按空白处理", imgtool.looks_blank(b"not an image") is True)
+
+    # 桥接侧：原图取不到 + 抠到的是空白 -> 不发图（返回 None，走文字）
+    root = tmp_root()
+    sticker_xml = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]"))
+    try:
+        xtc, adb = make_xtc(sticker_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        adb.screencap_crop_png = lambda box: blank
+        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+               "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=None, logger=None)
+        br.xtc = xtc
+        br._emoji_from_data = True
+        br._emoji_store = type("S", (), {
+            "find": lambda self, name, near_epoch=None, aspect=None, reference=None: None,
+            "index_ready": lambda self: True,
+            "name_is_unique": lambda self, name: False})()
+        check("抠到空白占位图时不发图（退回文字）",
+              br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊") is None)
+    finally:
+        cleanup(root)
 
 
 def test_image_decoders_match_fixtures() -> None:
@@ -3593,6 +3853,9 @@ def main() -> int:
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,
                test_forwarder_wrapper_exposes_send_image,
                test_cache_pick_verifies_pixels_against_screen,
+               test_image_message_is_forwarded,
+               test_photo_original_pick_is_conservative,
+               test_blank_bubble_shot_is_not_sent,
                test_image_decoders_match_fixtures,
                test_time_label_is_absolute_and_stable,
                test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,

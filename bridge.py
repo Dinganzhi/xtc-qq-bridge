@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from utils.deduplicate import Deduplicator, EchoFilter, HistoryFilter
+from utils import imgtool
 from msg_log import MessageLog
 from xiaotiancai import LOGIN_LOGGED_IN, LOGIN_NOT_LOGGED_IN, LOGIN_UNKNOWN
 import runtime_paths
@@ -169,12 +170,16 @@ class MessageBridge:
             (cfg.get("xiaotiancai") or {}).get("login_retry_after_risk", 900))
         # 操作锁：发送/导航期间暂停轮询，避免两个线程同时 uiautomator dump 冲突
         self._op_lock = threading.Lock()
-        # 表情包（**仅 小天才 -> QQ 单向**）：优先读 App 数据目录/图片缓存里的**原文件**
-        # （动图 GIF 能保住动画），拿不到再按气泡截图，最后退回发"表情X"文字。
+        # 表情包 / 照片（**仅 小天才 -> QQ 单向**）：优先读 App 数据目录/图片缓存里的
+        # **原文件**（动图 GIF 能保住动画、照片能拿回原图），拿不到再按气泡截图，
+        # 最后退回发"表情X"/"图片"文字。
         _emoji = cfg.get("emoji") or {}
         self._emoji_image = bool(_emoji.get("forward_image", True))
         self._emoji_caption = bool(_emoji.get("caption", True))
         self._emoji_from_data = bool(_emoji.get("from_app_data", True))
+        # 照片（图片消息）单独一个开关：原图动辄 1~2MB，想省流量/流量贵的可以关掉，
+        # 关掉后仍会发**气泡截图**（内容对，只是清晰度低）
+        self._emoji_photo = bool(_emoji.get("forward_photo", True))
         self._emoji_store = None
         if self._emoji_image and self._emoji_from_data and adb is not None:
             try:
@@ -548,9 +553,10 @@ class MessageBridge:
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
             # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）；
-            # 传消息自己的时间，让缓存查找能找到"当时写进来的那张"（保住动图）
-            sticker = (self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_lbl))
-                       if it.get("sticker") else None)
+            # 传消息自己的时间，让缓存查找能找到"当时写进来的那张"（保住动图/原图）
+            sticker = (self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_lbl),
+                                             backlog=True)
+                       if (it.get("sticker") or it.get("image")) else None)
             pending.append((text, lbl, sticker))
 
         if not pending:
@@ -609,51 +615,100 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001
             self._log("debug", f"表情包索引预热失败: {e}")
 
-    def _capture_sticker(self, root, text: str, near_epoch: float | None = None) -> dict | None:
-        """表情包（仅小天才 -> QQ 单向）：拿到贴纸图片，返回 {data, kind, animated, source}。
+    def _capture_sticker(self, root, text: str, near_epoch: float | None = None,
+                         backlog: bool = False) -> dict | None:
+        """取"要发到 QQ 的那张图"（表情包 **和** 照片都走这里）。
 
-        顺序：
+        表情包：
           1) **App 数据目录/图片缓存里的原文件**（`emoji_store`）：保真，动图保住动画，
              也不依赖气泡在屏幕上；挑哪张**由像素比对决定** —— 先抠下界面上这张气泡的
              截图当基准，再逐个候选比相似度，够像才发（根治"小猫流汗发成乌龟"）；
           2) 没有可信原图时，**就发这张气泡截图**（静止一帧，但一定是对的）；
           3) 连气泡都定位不到 -> 返回 None，调用方照样发"表情X"文字。
 
+        照片（`text` == `图片`）：
+          1) 缓存里的**原图**（大图；形状与气泡一致、写入时间就在消息时间附近才敢用）；
+          2) 拿不到就发气泡截图（低清但一定对）—— 照片动辄 2000x3000，纯 Python 解不动
+             （实测只解 DC 就要 37 秒），所以这条路不比像素，只认唯一候选。
+
         near_epoch：补发老消息时传"这条消息自己的时间"，好让缓存查找按消息时间去匹配
-        （缓存文件是消息显示时写进来的），否则补发的贴纸会退化成静态截图。
+        （缓存文件是消息显示时写进来的），否则补发的贴图会退化成静态截图。
         """
         if not self._emoji_image:
             return None
+        is_image = (text or "").strip() == getattr(self.xtc, "IMAGE_TEXT", "图片")
         name = (text or "").strip()
         if name.startswith("表情"):
             name = name[len("表情"):].strip()
         # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）——查表情包索引前先去掉
         name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
-        # 先在快照里定位气泡：① 拿它的形状去缓存里挑原图 ② 抠它的截图当核对基准
+        # 先在快照里定位气泡：① 拿它的形状去缓存里挑原图 ② 抠它的截图当核对基准/兜底
         item = None
         try:
-            item = self.xtc.sticker_of_latest(root, text) or self.xtc.sticker_of_latest(root, "")
+            if is_image:
+                item = self.xtc.image_of_latest(root, text)
+            else:
+                item = self.xtc.sticker_of_latest(root, text) or self.xtc.sticker_of_latest(root, "")
         except Exception as e:  # noqa: BLE001 定位失败不影响取原图
-            self._log("debug", f"定位表情气泡失败: {e}")
+            self._log("debug", f"定位图片/表情气泡失败: {e}")
         aspect = None
         if item and item.get("bounds"):
             x1, y1, x2, y2 = item["bounds"]
             if y2 > y1:
                 aspect = (x2 - x1) / (y2 - y1)
-        # 名字在本地表情包里唯一时无需核对（省一次截图）；否则必须抠基准图来比像素
-        need_ref = True
-        if self._emoji_store is not None and name:
-            try:
-                need_ref = not self._emoji_store.name_is_unique(name)
-            except Exception as e:  # noqa: BLE001 索引查不动就老老实实截图
-                self._log("debug", f"判断表情名是否唯一失败: {e}")
+        # **先把界面上的气泡抠下来**：聊天会自动滚动（新消息/送达确认都会把列表顶上去），
+        # 任何慢操作（建表情名索引 3~4 秒、扫缓存）之后再抠，坐标就对不上了 —— 实测
+        # 晚几秒抠到的是别处的**空白占位图**，转发出去就是一张灰底问号（用户会以为发错了）。
         ref = None
-        if item and item.get("bounds") and need_ref:
-            try:
-                ref = self.xtc.capture_sticker(item.get("bounds"))
-            except Exception as e:  # noqa: BLE001 抠基准图失败就走老路
-                self._log("debug", f"抠表情气泡截图失败: {e}")
-                ref = None
+        if item and item.get("bounds"):
+            need_ref = True
+            if self._emoji_store is not None and name and not is_image:
+                try:
+                    # 索引已就绪才能"秒判"名字是否唯一；没就绪就直接截图（别为了省一次
+                    # 截图去等 4 秒建索引，那样反而抠错位置）
+                    if self._emoji_store.index_ready():
+                        need_ref = not self._emoji_store.name_is_unique(name)
+                except Exception as e:  # noqa: BLE001 判不出来就老老实实截图
+                    self._log("debug", f"判断表情名是否唯一失败: {e}")
+            if need_ref:
+                try:
+                    ref = self.xtc.capture_sticker(item.get("bounds"))
+                except Exception as e:  # noqa: BLE001 抠图失败就走老路
+                    self._log("debug", f"抠气泡截图失败: {e}")
+                    ref = None
+                if ref and imgtool.looks_blank(ref):
+                    dom, std = imgtool.content_stats(ref)
+                    self._log("info", f"[图片] 抠到的气泡像是空白/占位图（主色占比 {dom:.2f}、"
+                                      f"亮度标准差 {std:.0f}），不用它当依据/兜底")
+                    ref = None
+        # ---------------- 照片（图片消息） ----------------
+        if is_image:
+            if self._emoji_photo and self._emoji_store is not None:
+                try:
+                    bw = item["bounds"][2] - item["bounds"][0] if item else 0
+                    bh = item["bounds"][3] - item["bounds"][1] if item else 0
+                    got = self._emoji_store.find_photo(near_epoch=near_epoch, aspect=aspect,
+                                                       min_px=max(bw, bh),
+                                                       allow_now=not backlog)
+                except Exception as e:  # noqa: BLE001 取不到就退回截图
+                    self._log("debug", f"找照片原图失败（改用截图）: {e}")
+                    got = None
+                if got and got.get("data"):
+                    self._log("info", f"[图片] 取自图片缓存原图：{got.get('kind', '?')} "
+                                      f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）")
+                    got["label"] = "图片"
+                    return got
+            if not item:
+                self._log("info", f"[图片] 界面上没找到这条图片消息的气泡（{text!r}），按文字转发")
+                return None
+            if ref:
+                self._log("info", f"[图片] 按气泡截图 {len(ref)} 字节（{item.get('bounds')}），"
+                                  "随转发发给 QQ（缓存里没找到原图）")
+                return {"data": ref, "kind": "png", "animated": False,
+                        "source": "screenshot", "label": "图片"}
+            self._log("info", f"[图片] 没能拿到这张照片（气泡 {item.get('bounds')}），按文字转发")
+            return None
+        # ---------------- 表情包 ----------------
         if self._emoji_from_data and self._emoji_store is not None:
             try:
                 got = self._emoji_store.find(name, near_epoch=near_epoch,
@@ -678,11 +733,12 @@ class MessageBridge:
             return None
         try:
             png = self.xtc.capture_sticker(item.get("bounds"))
-            if png:
+            if png and not imgtool.looks_blank(png):
                 self._log("info", f"[表情包] 按气泡截图 {len(png)} 字节（静态一帧）"
                                   f"（{item.get('bounds')}），随转发发给 QQ")
                 return {"data": png, "kind": "png", "animated": False, "source": "screenshot"}
-            self._log("info", f"[表情包] 截图没成功（气泡 {item.get('bounds')}），按文字转发")
+            self._log("info", f"[表情包] 抠到的气泡是空白/占位图（或截图失败），"
+                              f"按文字转发（气泡 {item.get('bounds')}）")
             return None
         except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
             self._log("warning", f"[表情包] 取图异常（按文字转发）: {e}")
@@ -755,7 +811,8 @@ class MessageBridge:
                 self._log("warning", f"[转发未确认] {target_type}:{target_id} "
                                      "插件刚启动，消息只是排队（未确认已发出）")
                 continue
-            shown = message + (f"（+表情图 {image_size} 字节）" if image_b64 else "")
+            shown = message + (f"（+{sticker.get('label') or '表情图'} {image_size} 字节）"
+                               if image_b64 else "")
             if ok:
                 self._log("info", f"[转发成功] {target_type}:{target_id} <- {shown}")
             else:

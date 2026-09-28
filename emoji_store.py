@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import time
@@ -54,7 +55,10 @@ class EmojiStore:
                  max_px: int = 600, max_bytes: int = 512 * 1024,
                  near_window: float = 300.0, fresh_window: float = 1800.0,
                  match_ok: float = MATCH_OK, max_reads: int = 16,
-                 strict_secs: float = 120.0, match_stop: float = 0.90):
+                 strict_secs: float = 120.0, match_stop: float = 0.90,
+                 head_bytes: int = 64 * 1024, photo_min_bytes: int = 60 * 1024,
+                 photo_max_bytes: int = 16 * 1024 * 1024,
+                 photo_window: float = 90.0, photo_tie_secs: float = 15.0):
         self.adb = adb
         self.package = package
         self.logger = logger
@@ -73,6 +77,12 @@ class EmojiStore:
         self.match_stop = min(0.999, max(self.match_ok, float(match_stop)))
         self.max_reads = max(1, int(max_reads))           # 每张表情最多核对多少个候选
         self.strict_secs = max(20.0, float(strict_secs))  # 没有基准图时"时间上必须很近"
+        # 照片原图（缓存里的大图）：只读文件头筛形状/尺寸，参数见 find_photo()
+        self.head_bytes = max(4096, int(head_bytes))
+        self.photo_min_bytes = max(1024, int(photo_min_bytes))
+        self.photo_max_bytes = max(self.photo_min_bytes, int(photo_max_bytes))
+        self.photo_window = max(10.0, float(photo_window))
+        self.photo_tie_secs = max(0.0, float(photo_tie_secs))
         self._index: dict[str, list[str]] = {}            # desc 名字 -> [big/<code> ...]
         self._index_ts = float("-inf")
         # path -> (mtime, info, [网格...])：核对过的候选不必重复解码
@@ -87,6 +97,15 @@ class EmojiStore:
         """这个名字在本地表情包里是不是只有一套包有（有就无需像素核对）。"""
         hits = self._pack_hits(name)
         return len(hits) == 1
+
+    def index_ready(self) -> bool:
+        """名字索引是否**已经在内存里且没过期**（没就绪时调用方宁可先截图，别等建索引）。
+
+        为什么重要：建索引要 3~4 秒（`find desc.json` + 读 12 个 UTF-16 的 JSON），
+        而聊天界面会**自动滚动** —— 等这几秒再抠气泡截图，坐标早就对不上了
+        （实测抠到的是别处的空白占位图，转发出去就是一张灰底问号）。
+        """
+        return bool(self._index) and (time.monotonic() - self._index_ts) < self.index_ttl
 
     def find(self, name: str = "", near_epoch: float | None = None,
              aspect: float | None = None, reference: bytes | None = None) -> dict | None:
@@ -147,7 +166,8 @@ class EmojiStore:
         return len(self._pack_index())
 
     # ------------------------------------------------------------------ 缓存
-    def _cache_listing(self) -> tuple[list[tuple[float, int, str]], float]:
+    def _cache_listing(self, max_bytes: int | None = None,
+                       min_bytes: int = 0) -> tuple[list[tuple[float, int, str]], float]:
         """缓存目录里的文件 ([(mtime, size, path)], 设备当前时间)。
 
         实测整个缓存也就几十个文件，一次 `find` 全列出来比按时间窗反复筛更省事，
@@ -162,6 +182,7 @@ class EmojiStore:
             return [], time.time()
         now = 0.0
         rows: list[tuple[float, int, str]] = []
+        cap = self.max_bytes if max_bytes is None else max(1024, int(max_bytes))
         for line in (listing or "").splitlines():
             line = line.strip()
             if not now and line.isdigit():
@@ -170,9 +191,81 @@ class EmojiStore:
             parts = line.split(None, 2)
             if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
                 size = int(parts[1])
-                if 0 < size <= self.max_bytes:
+                if min_bytes <= size <= cap:
                     rows.append((float(parts[0]), size, parts[2].strip()))
         return rows, (now or time.time())
+
+    def _read_head(self, path: str, nbytes: int | None = None) -> bytes:
+        """只读文件开头 n 字节（用 `head | base64`，避免把 2MB 照片整份搬回来）。
+
+        用途：照片原图的尺寸/形状筛选 —— 看文件头就够了，不需要整份内容。
+        """
+        n = int(nbytes or self.head_bytes)
+        try:
+            b64 = self.adb.shell(f"head -c {n} {path} | base64 -w0", timeout=30)
+        except Exception as e:  # noqa: BLE001 读不到就当没有
+            self._log("debug", f"读文件头失败 {path}: {e}")
+            return b""
+        try:
+            return base64.b64decode((b64 or "").strip())
+        except Exception:  # noqa: BLE001
+            return b""
+
+    def find_photo(self, near_epoch: float | None = None, aspect: float | None = None,
+                   min_px: int = 0, window: float | None = None,
+                   min_bytes: int | None = None, allow_now: bool = True) -> dict | None:
+        """找这张**照片**的原图（缓存里的大图）。没有可信候选返回 None。
+
+        为什么不能像贴纸那样比像素：照片动辄 2000x3000，纯 Python "只解 DC" 一张
+        2MB 的 JPEG 实测要 **37 秒**（79k 个块），根本来不及。所以这条路改用三条硬条件：
+        ① 比气泡更大（气泡是屏幕上的缩略渲染）；② 形状与气泡一致（App 按图片比例画气泡）；
+        ③ 写入时间就在**消息时间**附近（文件是消息显示时下载进来的）。
+        而且只接受**唯一**候选：有第二张同样符合条件的就返回 None —— 调用方退回
+        发气泡截图（一定是对的，只是清晰度低），**绝不赌**。
+
+        allow_now：消息没有时间标签时是否允许拿"刚刚写进缓存"当依据。实时读到的新消息
+        可以（文件就是刚下载的）；**补发老消息**时必须 False —— 那时"刚写进来"的图可能
+        只是界面重新渲染的**别的**照片。
+        """
+        if near_epoch:
+            target = float(near_epoch)
+        elif allow_now:
+            target = time.time()
+        else:
+            return None
+        win = float(window if window is not None else self.photo_window)
+        rows, _now = self._cache_listing(max_bytes=self.photo_max_bytes,
+                                         min_bytes=int(min_bytes or self.photo_min_bytes))
+        cands: list[tuple] = []
+        for mtime, size, path in rows:
+            d = abs(mtime - target)
+            if d > win:
+                continue
+            info = self.sniff(self._read_head(path))
+            if not info or info.get("kind") not in IMAGE_KINDS:
+                continue
+            w, h = info.get("w") or 0, info.get("h") or 0
+            if max(w, h) <= max(int(min_px), self.max_px):
+                continue
+            if aspect and h:
+                if abs(w / h - aspect) > 0.12 * max(1.0, aspect):
+                    continue
+            cands.append((d, -size, mtime, size, path, info))
+        if not cands:
+            return None
+        cands.sort()
+        if len(cands) > 1 and cands[1][0] - cands[0][0] <= self.photo_tie_secs:
+            self._log("info", "[图片] 缓存里有不止一张时间相近的大图，不猜，改用气泡截图")
+            return None
+        d, _neg, mtime, size, path, info = cands[0]
+        data = self._read(path)
+        if not data:
+            return None
+        self._log("debug", f"[图片] 命中缓存原图 {path}（{size} 字节，水位 {d:.0f}s）")
+        out = dict(info)
+        out.update({"data": data, "path": path, "source": "cache-photo",
+                    "mtime": mtime, "score": None})
+        return out
 
     def _score(self, ref_grid, data: bytes, path: str, mtime: float | None) -> float:
         """候选图片与基准网格的最佳相似度（解不出来返回 -1）。"""

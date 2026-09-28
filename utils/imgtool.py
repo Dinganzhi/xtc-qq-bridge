@@ -155,6 +155,56 @@ def best_grid_similarity(ref: tuple[list, list], data: bytes, gw: int = 10, gh: 
     return best
 
 
+def content_stats(data_or_frame) -> tuple[float, float]:
+    """(主色占比, 亮度标准差) —— 用来判断一张图是不是"空白/占位图"。
+
+    实测数据（120x120 的气泡截图）：
+      * 抠错位置/贴纸没加载出来的占位图：主色占比 0.84、亮度标准差 **9.0**；
+      * 真正的贴纸：主色占比 0.19、亮度标准差 **81.5**。
+    所以"亮度标准差很小"是最靠谱的空白判据（纯色底 + 一点点内容时主色占比也会很高，
+    但标准差不会这么低）。
+    """
+    frame = data_or_frame if isinstance(data_or_frame, dict) else None
+    if frame is None:
+        frames = decode_frames(data_or_frame, max_frames=1)
+        frame = frames[0] if frames else None
+    if not frame:
+        return 1.0, 0.0
+    w, h, rgb = frame["w"], frame["h"], frame["rgb"]
+    n = max(1, w * h)
+    bins: dict = {}
+    s = 0.0
+    s2 = 0.0
+    step = max(1, n // 20000)                       # 大图抽样，够用且快
+    cnt = 0
+    for i in range(0, n, step):
+        o = i * 3
+        r, g, b = rgb[o], rgb[o + 1], rgb[o + 2]
+        key = (r >> 4, g >> 4, b >> 4)
+        bins[key] = bins.get(key, 0) + 1
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        s += lum
+        s2 += lum * lum
+        cnt += 1
+    if not cnt:
+        return 1.0, 0.0
+    dom = max(bins.values()) / cnt
+    mean = s / cnt
+    var = max(0.0, s2 / cnt - mean * mean)
+    return dom, var ** 0.5
+
+
+def looks_blank(data_or_frame, min_std: float = 18.0, max_dom: float = 0.97) -> bool:
+    """这张图是不是"空白/占位图"（抠错位置、贴纸没加载出来）。
+
+    实测：占位图亮度标准差 9.0，真贴纸 81.5 —— 门槛取 18 很宽松；
+    纯色大底（主色占比 ≥0.97）也算空白。判为空白时**宁可不发图**（改发文字），
+    也不要往 QQ 发一张灰底问号。
+    """
+    dom, std = content_stats(data_or_frame)
+    return std < min_std or dom >= max_dom
+
+
 # --------------------------------------------------------------------------- PNG
 def _png_frame(data: bytes) -> dict | None:
     pos = 8
