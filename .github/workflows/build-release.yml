@@ -54,11 +54,9 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Offline test suites
         run: |
-          python tools/test_wsa.py
           python tools/test_integration.py
           python tools/test_reported_bugs.py
           python tools/test_paths.py
-          python tools/wsa_net_guard.py --test
 
   # ---------------------------------------------------------------- 矩阵编译
   build:
@@ -124,9 +122,8 @@ jobs:
           python tools/build_nuitka.py --check-env
 
       - name: Build with Nuitka (+ built-in smoke test)
-        # 驱动脚本编译完会自己在干净目录里跑 --version / --verify（bridge）或 --test（guard），
+        # 驱动脚本编译完会自己在干净目录里跑 --version / --verify，
         # 顺带验证"数据写在 exe 旁边、捆绑资源确实打进包了"，失败即整个 job 失败。
-        # WSA 网络守护只适用于 Windows，非 Windows 平台由驱动脚本自动跳过（只编主程序）。
         # 瘦身参数（anti-bloat / -OO / LTO）由驱动脚本自动加上；UPX 只在 Linux 上开。
         # 显式用 bash：Nuitka 会把大量进度写到 stderr，而 GitHub 的 pwsh 步骤带
         # $ErrorActionPreference='stop'，在 Windows runner 上可能把正常日志当错误中止步骤。

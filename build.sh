@@ -3,9 +3,8 @@
 #  Build machine-code single-file executables with Nuitka (Linux / macOS)
 #
 #  用法：
-#    bash build.sh                     # onefile，两个目标，产物在 dist/
+#    bash build.sh                     # onefile，产物在 dist/
 #    bash build.sh --mode standalone   # 目录模式（启动更快）
-#    bash build.sh --target guard      # 只编 WSA 守护
 #    bash build.sh --check-env         # 只检查 Python/pyyaml/Nuitka/gcc
 #    bash build.sh --dry-run           # 只打印 nuitka 命令行
 #

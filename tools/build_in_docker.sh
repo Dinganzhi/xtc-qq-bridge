@@ -3,7 +3,7 @@
 #  在 Docker 里编译 Linux 版单文件可执行程序（宿主机不用装 gcc/工具链）
 #
 #  用法（Linux / macOS / WSL 主机）：
-#    bash tools/build_in_docker.sh                     # x86_64，onefile，两个目标
+#    bash tools/build_in_docker.sh                     # x86_64，onefile
 #    bash tools/build_in_docker.sh --mode standalone   # 目录模式
 #    IMAGE=python:3.11-slim bash tools/build_in_docker.sh
 #    PLATFORM=linux/arm64 bash tools/build_in_docker.sh   # 编 arm64（需 QEMU/binfmt，较慢）
@@ -33,7 +33,7 @@ fi
 PLATFORM_ARG=()
 [ -n "$PLATFORM" ] && PLATFORM_ARG=(--platform "$PLATFORM")
 
-echo "[信息] 镜像=$IMAGE 平台=${PLATFORM:-默认} 参数=${ARGS:-（默认 onefile all）}"
+echo "[信息] 镜像=$IMAGE 平台=${PLATFORM:-默认} 参数=${ARGS:-（默认 onefile）}"
 
 docker run --rm "${PLATFORM_ARG[@]}" -v "$SRC":/app -w /app -e NUITKA_CACHE_DIR=/app/.nuitka-cache \
     "$IMAGE" bash -lc '

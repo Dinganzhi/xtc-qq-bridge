@@ -13,10 +13,9 @@
 ----
   python tools/build_nuitka.py --check-env            # 只检查编译环境
   python tools/build_nuitka.py --dry-run              # 只打印将要执行的命令（不构建）
-  python tools/build_nuitka.py                        # 默认 onefile + bridge + guard
+  python tools/build_nuitka.py                        # 默认 onefile 单文件
   python tools/build_nuitka.py --mode standalone      # 目录模式（启动更快，便于调试）
-  python tools/build_nuitka.py --target bridge        # 只编主程序
-  python tools/build_nuitka.py --target guard         # 只编 WSA 守护
+  python tools/build_nuitka.py --target bridge        # 显式指定目标（目前只有主程序）
   python tools/build_nuitka.py --out dist --jobs 8    # 指定输出目录与并行度
   python tools/build_nuitka.py --lto yes              # 开启 LTO（更慢的构建、更快的程序）
 
@@ -52,8 +51,6 @@ except Exception:  # noqa: BLE001
 TARGETS = {
     # 名字: (入口脚本, 是否带控制台, 说明)
     "bridge": ("main.py", True, "小天才 <-> QQ 桥接主程序"),
-    # 守护只适用于 Windows（WSA 是 Windows 独有组件）；其它平台会自动跳过
-    "guard": ("tools/wsa_net_guard.py", True, "WSA / WSABuilds 网络守护（仅 Windows）"),
 }
 # 瘦身：anti-bloat。这些库我们运行时一个都不用，但很容易被"顺带"打包进去
 # （例如某个依赖在 try/except 里 import 了它们），Nuitka 的 anti-bloat 插件能阻止跟随。
@@ -77,37 +74,24 @@ DATA_FILES = {
         ("LICENSE", "LICENSE"),
         ("requirements.txt", "requirements.txt"),
     ],
-    "guard": [
-        ("config.example.yaml", "config.example.yaml"),
-        ("README.md", "README.md"),
-        ("LICENSE", "LICENSE"),
-    ],
 }
 # 需要整目录打进包里的资源（**逐文件**添加，见 _data_dir_args 的原因说明）
 DATA_DIRS = {
     "bridge": [("astrbot_plugin_xtc_bridge", "astrbot_plugin_xtc_bridge")],
-    "guard": [],
 }
 # 函数内 import / 可选 import 的模块，显式声明，避免被静态分析漏掉（按目标裁剪，控制体积）
 INCLUDE_MODULES = {
     "bridge": [
         "adb_controller", "bridge", "xiaotiancai", "plugin_client", "qq_webhook", "msg_log",
-        "runtime_paths", "version", "utils.logger", "utils.deduplicate", "tools.dump_ui",
-    ],
-    "guard": [
-        "adb_controller", "runtime_paths", "version", "utils.logger",
+        "runtime_paths", "version", "utils.logger", "utils.deduplicate", "utils.imgtool",
+        "utils.pngtool", "emoji_store", "tools.dump_ui",
     ],
 }
 # 不需要进产物（开发/测试用），显式排除以缩小体积、避免拉进 pytest 之类
 EXCLUDE_MODULES = {
     "bridge": [
-        "tools.test_wsa", "tools.test_integration", "tools.test_reported_bugs",
-        "tools.test_paths", "tools.build_nuitka", "tools.wsa_net_guard", "tools.selftest",
-    ],
-    "guard": [
-        "tools.test_wsa", "tools.test_integration", "tools.test_reported_bugs",
-        "tools.test_paths", "tools.build_nuitka", "tools.dump_ui", "tools.selftest",
-        "bridge", "xiaotiancai", "plugin_client", "qq_webhook", "msg_log",
+        "tools.test_integration", "tools.test_reported_bugs",
+        "tools.test_paths", "tools.build_nuitka", "tools.selftest",
     ],
 }
 PRODUCT = "XTC QQ Bridge"
@@ -142,25 +126,15 @@ def host_arch() -> str:
 def select_targets(requested: str, is_windows: bool | None = None) -> tuple:
     """按平台决定编译哪些目标，返回 (targets, 提示文本)。
 
-    WSA 网络守护只适用于 Windows：WSA（Windows Subsystem for Android）是 Windows
-    独有组件，Linux / macOS 上既没有 WSA 也没有对应的宿主网络，编出来毫无意义
-    （之前 CI 给 macOS/Linux 也编了守护产物，是错的）。
-    - `--target all`   非 Windows -> 只编 bridge，并给出跳过提示
-    - `--target guard` 非 Windows -> 返回空列表（调用方按"明确拒绝"处理）
+    现在只有一个目标（bridge）；保留这个函数是为了兼容旧的 `--target all` 调用方式。
     """
-    if is_windows is None:
-        is_windows = os.name == "nt"
-    targets = ["bridge", "guard"] if requested == "all" else [requested]
-    if "guard" in targets and not is_windows:
-        if requested == "guard":
-            return [], ("WSA 网络守护只适用于 Windows（WSA 是 Windows 独有组件），"
-                        "本平台不提供该产物。")
-        return ["bridge"], "WSA 网络守护只适用于 Windows，本平台只编译主程序。"
-    return targets, ""
+    if requested == "all":
+        return ["bridge"], ""
+    return [requested], ""
 
 
 def product_name(target: str, version: str) -> str:
-    base = "xtc-qq-bridge" if target == "bridge" else "xtc-wsa-guard"
+    base = "xtc-qq-bridge"
     # 版本号不加 v 前缀（与 tag 一致：tag 就叫 1.0.0-alpha.1）
     return f"{base}-{version}-{host_os()}-{host_arch()}"
 
@@ -503,8 +477,7 @@ def clean_stale_dirs(out_dir: Path, target: str) -> list[str]:
 def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     """编译后冒烟测试（不需要设备）：把产物复制到干净目录里运行自检命令。
 
-    - bridge: `--version` + `--verify`（校验依赖与捆绑资源是否真的打进包了）
-    - guard : `--test`（守护自身的分级修复逻辑自测）
+    运行 `--version` + `--verify`（校验依赖与捆绑资源是否真的打进包了）。
     在干净目录里跑还能顺带验证"数据写在 exe 旁边"这条路径逻辑。
     """
     smoke_dir = ROOT / ".smoke_run"
@@ -526,8 +499,7 @@ def run_smoke(target: str, artifact: Path, mode: str) -> bool:
     if not exe or not exe.exists():
         print(f"[冒烟] 找不到可执行文件（artifact={artifact}），跳过")
         return False
-    # guard 没有 --version（它只有 --test 等参数），所以两个目标的自检命令不一样
-    cmds = [["--test"]] if target == "guard" else [["--version"], ["--verify"]]
+    cmds = [["--version"], ["--verify"]]
     ok = True
     for extra in cmds:
         try:
@@ -602,7 +574,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Nuitka 编译驱动（单文件机器码）")
     ap.add_argument("--mode", choices=["onefile", "standalone"], default="onefile",
                     help="onefile=单文件（默认）；standalone=目录（启动更快）")
-    ap.add_argument("--target", choices=["all", "bridge", "guard"], default="all")
+    ap.add_argument("--target", choices=["all", "bridge"], default="all")
     ap.add_argument("--out", default="dist", help="输出目录（默认 dist）")
     ap.add_argument("--jobs", type=int, default=0, help="并行编译进程数（默认 CPU 核数）")
     ap.add_argument("--lto", choices=["default", "yes", "no"], default="yes",

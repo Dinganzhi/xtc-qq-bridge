@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """消息桥接调度层：轮询小天才新消息 -> 转发（当前支持 log 打印 /
 AstrBot 插件端点两种模式），并负责去重、回声过滤与 ADB 断线重连。
 
@@ -221,7 +221,7 @@ class MessageBridge:
         _xc = cfg.get("xiaotiancai") or {}
         self._catchup_enabled = bool(_xc.get("catchup_missed", True))
         self._catchup_max = int(_xc.get("catchup_max", 0) or 0)   # 0 = 不限制（默认）
-        self._wsa_guard_hinted = False    # WSA 断网提示只打一次
+        self._wsa_reconnect_hinted = False  # WSA 断网提示只打一次
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
         self._job_queue: queue.Queue = queue.Queue()
@@ -356,7 +356,7 @@ class MessageBridge:
                             self._log("info", "ADB 已重连")
                         except Exception as e:  # noqa: BLE001
                             self._log("error", f"重连失败: {e}")
-                            self._hint_wsa_guard()
+                            self._hint_wsa_reconnect()
                             time.sleep(2)
                             continue
 
@@ -744,20 +744,16 @@ class MessageBridge:
             self._log("warning", f"[表情包] 取图异常（按文字转发）: {e}")
             return None
 
-    def _hint_wsa_guard(self) -> None:
-        """WSA/WSABuilds 反复断网时提示配套的独立守护工具（只提示一次）。
-
-        守护只适用于 Windows：WSA 是 Windows 独有组件，别的平台上没有它可用。
-        """
-        if self._wsa_guard_hinted:
+    def _hint_wsa_reconnect(self) -> None:
+        """WSA/WSABuilds 反复断网时的提示（只提示一次）。"""
+        if self._wsa_reconnect_hinted:
             return
-        self._wsa_guard_hinted = True
+        self._wsa_reconnect_hinted = True
         if os.name != "nt":
             return
         self._log("warning",
-                  "若使用 WSA / WSABuilds 且经常断网，可另开一个终端运行独立守护工具："
-                  "python tools/wsa_net_guard.py（自动重连/重置网络/必要时重启 WSA，"
-                  "详见 README「WSA 网络守护」）")
+                  "若使用 WSA / WSABuilds 且经常断网，可先在 WSA 设置里重启子系统"
+                  "（或执行 wsa:// 设置里的 Repair），桥接会自动重连 ADB 继续工作")
 
     def _forward(self, contact, text: str, time_label: str = "",
                  sticker: dict | None = None) -> bool:

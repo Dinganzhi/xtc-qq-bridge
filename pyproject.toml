@@ -32,7 +32,6 @@ build = ["nuitka>=4.1", "pyyaml>=6.0"]
 [project.scripts]
 # pip install 之后可用的命令（与 Nuitka 编译产物同名/同功能）
 xtc-qq-bridge = "main:main"
-xtc-wsa-guard = "tools.wsa_net_guard:main"
 
 [project.urls]
 Homepage = "https://github.com/Dinganzhi/xtc-qq-bridge"

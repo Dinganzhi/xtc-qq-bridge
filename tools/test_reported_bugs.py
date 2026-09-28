@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """回归测试：针对用户报告的具体问题（不需要设备，全部离线）。
 
 覆盖：
@@ -3618,34 +3618,22 @@ def test_nuitka_version_args_are_numeric() -> None:
           b.product_name("bridge", "1.0.0-alpha.1"))
 
 
-def test_guard_is_windows_only() -> None:
-    """WSA 网络守护只应在 Windows 上编译（WSA 是 Windows 独有组件）。
-
-    用户指出：给 Linux/macOS 也构建守护进程产物是错的。
-    """
+def test_build_driver_has_single_target() -> None:
+    """编译驱动现在只有主程序一个目标（WSA 网络守护已移除）。"""
     import sys as _sys
     _sys.path.insert(0, str(Path.cwd() / "tools"))
     import build_nuitka as b
 
-    t_all_win, note_win = b.select_targets("all", True)
-    check("Windows 上 --target all 编 bridge + guard",
-          t_all_win == ["bridge", "guard"] and note_win == "", f"{t_all_win} {note_win!r}")
-
-    t_all_nix, note_nix = b.select_targets("all", False)
-    check("非 Windows 上 --target all 只编主程序",
-          t_all_nix == ["bridge"] and "只适用于 Windows" in note_nix,
-          f"{t_all_nix} {note_nix!r}")
-
-    t_guard_nix, note_guard = b.select_targets("guard", False)
-    check("非 Windows 上显式要 guard 会被拒绝",
-          t_guard_nix == [] and "不提供该产物" in note_guard, f"{t_guard_nix} {note_guard!r}")
-
-    t_bridge_nix, note_bridge = b.select_targets("bridge", False)
-    check("非 Windows 上编 bridge 不受影响",
-          t_bridge_nix == ["bridge"] and note_bridge == "", f"{t_bridge_nix}")
-
-    t_guard_win, _ = b.select_targets("guard", True)
-    check("Windows 上显式要 guard 正常", t_guard_win == ["guard"])
+    check("只剩主程序一个编译目标", list(b.TARGETS) == ["bridge"], str(list(b.TARGETS)))
+    t_all, note_all = b.select_targets("all", True)
+    check("--target all -> 只编主程序", t_all == ["bridge"] and note_all == "",
+          f"{t_all} {note_all!r}")
+    t_bridge, note_bridge = b.select_targets("bridge", False)
+    check("显式 --target bridge 正常", t_bridge == ["bridge"] and note_bridge == "",
+          f"{t_bridge} {note_bridge!r}")
+    check("产物名只有一种前缀",
+          b.product_name("bridge", "1.0.0").startswith("xtc-qq-bridge-"),
+          b.product_name("bridge", "1.0.0"))
 
 
 def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
@@ -3884,7 +3872,7 @@ def main() -> int:
                test_app_state_machine, test_state_logged_once_and_warnings_throttled,
                test_poll_loop_dismisses_popup_without_cooldown,
                test_monotonic_sentinels_survive_fresh_boot,
-               test_nuitka_version_args_are_numeric, test_guard_is_windows_only,
+               test_nuitka_version_args_are_numeric, test_build_driver_has_single_target,
                test_backlog_walk_until_known,
                test_repeated_message_is_forwarded_again, test_backlog_runs_without_contact,
                test_msg_log_sharding_and_cap,

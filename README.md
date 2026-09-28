@@ -11,9 +11,8 @@
 双向消息桥接、账密自动登录、登录态检测、安全验证提醒与自动恢复、弹窗自动清理与界面自愈。
 
 > **一键安装**：Windows 双击 `install.bat`；Linux / macOS 执行 `bash install.sh`（详见「一键安装」）。
-> **WSA/WSABuilds 经常断网（仅 Windows）**：另开一个终端跑 `python tools/wsa_net_guard.py`
-> （独立守护工具，分级修复：重连 -> 网络复位 -> 重启子系统，见「WSA 网络守护」）。
-> WSA 是 Windows 独有组件，所以这个守护**只在 Windows 上有意义**，也不会为其它平台提供产物。
+> **WSA/WSABuilds 经常断网（仅 Windows）**：这是 WSA 自身的老问题，桥接会自动重连 ADB；
+> 真断网时在 WSA 设置里点「修复」或重启子系统即可（见「WSA 断网怎么办」）。
 > **不想装 Python**：可用 Nuitka 编成机器码单文件（Windows / Linux，x86_64 / arm64）——
 > `build.bat` 或 `bash build.sh` 一条命令出产物，详见「五、编译成单文件可执行程序」。
 
@@ -48,7 +47,7 @@
 | **同时连多个设备** | 多设备并存时日志会提示；**请在 `adb.serial` 显式指定**要用的那个（如 `"127.0.0.1:5555"`） |
 | **镜像差异** | 已做防御式处理：无 `cmd clipboard`（自动走 ADBKeyBoard）、`ime set` 不生效（自动双写 settings）、`mCurrentFocus` 为空（自动回退 `topResumedActivity`）等，一般无需干预 |
 | **小天才 App 需自行安装** | 每个环境都要装小天才 App 并登录家长账号；界面控件 id 与运行环境无关（同一 APK） |
-| **WSA 断网是环境问题（仅 Windows）** | WSA / WSABuilds 长时间运行后子系统网络栈会失效。桥接自身会重连 ADB，但**网络栈死了要靠独立守护工具救**：见「WSA 网络守护」。WSA 是 Windows 独有组件，别的平台没有这个问题 |
+| **WSA 断网是环境问题（仅 Windows）** | WSA / WSABuilds 长时间运行后子系统网络栈会失效。桥接自身会重连 ADB；真断网时在 WSA 设置里点「修复」或重启子系统（见「WSA 断网怎么办」）。WSA 是 Windows 独有组件，别的平台没有这个问题 |
 
 ## 2. 各平台接入指引
 
@@ -71,7 +70,8 @@
 - 首次连接若报 `10061`（Hyper-V 抢占端口）：管理员执行
   `netsh int ipv4 add excludedportrange protocol=tcp startport=58526 numberofports=1` 后重启电脑。
 - WSA 与宿主剪贴板共享：桥接运行期间**不要复制别的内容**再手动粘贴，调试时容易被误导。
-- **WSA / WSABuilds 隔三差五断网（仅 Windows）**：用 `python tools/wsa_net_guard.py` 常驻守护（见「WSA 网络守护」）。
+- **WSA / WSABuilds 隔三差五断网（仅 Windows）**：WSA 自身的老毛病，桥接会自动重连；
+  真断网时在 WSA 设置里点「修复」或重启子系统（见「WSA 断网怎么办」）。
 </details>
 
 <details>
@@ -152,8 +152,6 @@
 | 4. 打印当前界面控件 | `python main.py --debug dump-ui` |
 | 5. 打开 config.yaml | — |
 | 6. 查看日志 | `logs/bridge.log` 末尾 40 行 |
-| 7. WSA 网络守护状态（仅 Windows） | `python tools/wsa_net_guard.py --status` |
-| 8. 运行 WSA 网络守护 | `python tools/wsa_net_guard.py`（常驻，Ctrl+C 退出） |
 
 也支持参数透传（不进菜单，直接跑完退出）：
 
@@ -210,11 +208,8 @@ project/
 |   |-- emoji_live_probe.py   # 实机验证表情取图：抠气泡截图 -> 逐候选比像素 -> 导出挑中的图
 |   |-- image_live_probe.py   # 实机验证图片（照片）转发：定位图片气泡 -> 取原图/截图并导出
 |   |-- selftest.py          # 环境自检（不依赖配置）
-|   |-- wsa_net_guard.py     # WSA/WSABuilds 网络守护（独立程序，可单独常驻或注册计划任务；仅 Windows）
-|   |-- wsa_guard.bat        # Windows 双击启动上面的守护（纯 ASCII）
 |   |-- build_nuitka.py      # 编译驱动：一键编出单文件机器码（Windows/Linux/macOS 通用）
 |   |-- build_in_docker.sh   # 在 Docker 里编译 Linux 版（免装本机工具链）
-|   |-- test_wsa.py          # 离线单测：WSA 端口/解析等纯逻辑（无需设备）
 |   |-- make_image_fixtures.ps1  # 用 .NET 生成图片解码夹具（开发机专用，产物在 tools/fixtures/）
 |   |-- test_integration.py  # 离线集成：假 ADB 执行器跑连接/启动/注入链（无需设备）
 |   |-- test_paths.py        # 离线测试：运行路径解析（源码/冻结、配置与日志落点）
@@ -223,7 +218,7 @@ project/
 |-- astrbot_plugin_xtc_bridge/   # AstrBot 插件源码（安装见下文）
 |-- keyboardservice-debug.apk    # 捆绑的 ADBKeyBoard APK（新机器免下载）
 |-- install.bat / install.sh     # 一键安装（Windows / Linux·macOS）
-|-- start.bat   / start.sh       # 启动器：环境自检 + 菜单（启动/自检/干跑/看界面/看日志/WSA 守护）
+|-- start.bat   / start.sh       # 启动器：环境自检 + 菜单（启动/自检/干跑/看界面/看日志）
 |-- build.bat   / build.sh       # 一键编译单文件可执行程序（Nuitka）
 |-- pyproject.toml               # pip 安装元数据与命令入口（pip install . 后可直接用命令）
 `-- requirements.txt / requirements-build.txt
@@ -231,11 +226,9 @@ project/
 
 > 路径写法：下面命令里的 `\` 是 Windows 写法，Linux / macOS 换成 `/`（如 `python3 tools/selftest.py`）。
 > 改完输入/启动/连接/命令去重相关代码后建议跑一遍离线测试（都不需要设备）：
-> - `python tools/test_wsa.py` —— 纯逻辑单测（端口识别、activity/前台解析、端口顺序）
 > - `python tools/test_integration.py` —— 假 ADB 执行器跑通连接/启动/注入策略链
 > - `python tools/test_reported_bugs.py` —— 回归测试（历史来源 / 命令去重 / 登录判定 / 发送确认 / 弹窗 / 自动登录 / 日志）
 > - `python tools/test_paths.py` —— 运行路径解析（源码/冻结、配置与日志落点、捆绑 APK 识别）
-> - `python tools/wsa_net_guard.py --test` —— WSA 守护的分级修复逻辑自测
 >
 > 想在**真机/模拟器**上快速体检一遍（不发真实消息）：`python tools/live_probe.py`
 > —— 依次检查 adb 连接、界面读取、登录态、弹窗清理、聊天页判定、联系人匹配、读取消息、
@@ -294,9 +287,6 @@ project/
 | `xiaotiancai.ui.login_progress_markers` | "登录中/正在验证/请稍候"等进度文案（**出现即不判失败**） |
 | `xiaotiancai.ui.system_msg_prefixes` | 桥接系统提示前缀（发送成功/发送失败），读取时跳过不转发 |
 | `webhook.allow_from` / `allow_groups` | 接收白名单（私聊/群聊） |
-| `wsa_guard.*` | WSA 网络守护参数（只被 `tools/wsa_net_guard.py` 读取；仅 Windows） |
-| `wsa_guard.ping_command` | 自定义 ICMP 探测命令（`{host}` 占位）；留空自动尝试多种 ping 写法 |
-| `wsa_guard.tcp_targets` / `tcp_timeout` | TCP 探测目标（`host:port`）与超时；**WSA 上靠它判断断网**（ICMP 被屏蔽） |
 
 ## 2. config.yaml 详解
 
@@ -402,109 +392,34 @@ emoji:
   from_app_data: true          # 优先读 App 数据目录/图片缓存里的原图（动图保动画）
   cache_recent_secs: 45        # 图片缓存"刚写进来"的时间窗（秒）
 
-# ---------- WSA / WSABuilds 网络守护（独立工具，可选，仅 Windows） ----------
-wsa_guard:
-  interval: 30
-  ping_hosts: ["223.5.5.5", "8.8.8.8"]
-  recover_wait: 8
-  light_recover: true
-  allow_reboot: true
-  reboot_cooldown: 600
-  allow_restart_wsa: false
-  log_file: "logs/wsa_guard.log"
+# ---------- WSA / WSABuilds 断网怎么办 ----------
+# 本项目不再自带网络守护工具：断网时在 WSA 设置里点「修复」/重启子系统，或手动
+# `adb connect 127.0.0.1:58526` 重连一次即可（桥接会自动重连 ADB 继续工作）。
 ```
 
 > 需要 yaml 格式就装 pyyaml：`pip install pyyaml`。**完全没有 pyyaml 时**桥接主程序无法启动
-> （除非把配置写成 JSON），而 `tools/wsa_net_guard.py` 会退化成"只解析 `wsa_guard` 段"，
-> 不受影响。
+> （除非把配置写成 JSON）。
 
-## 3. WSA / WSABuilds 网络守护（独立工具，仅 Windows）
+## 3. WSA / WSABuilds 断网怎么办（仅 Windows）
 
 WSA（含 WSABuilds / MagiskOnWSA）跑久了会"隔三差五断网"：宿主侧 adb 还在、`adb devices` 时有时无，
 但 Android 子系统里的网络栈已经不通——表现就是界面读不到、消息发不出去、`uiautomator` 一直失败。
-这**不是桥接程序的 bug**，靠桥接自己重连也救不回来，所以单独提供了一个守护程序
-`tools/wsa_net_guard.py`：**和主程序完全分开**，各跑各的，互不依赖。
+这**不是桥接程序的 bug**：桥接自己会不断重连 ADB（日志里能看到"重连失败"后自动重试），
+但**网络栈死了要靠 WSA 自己救**。遇到时按下面顺序处理即可：
 
-> **仅 Windows**：WSA（Windows Subsystem for Android）是 Windows 独有组件，Linux / macOS 上
-> 既没有 WSA 也没有对应的宿主网络，这个守护在那里没有意义——编译脚本会自动跳过它
-> （非 Windows 平台只编主程序），本项目的 Release 也只为 Windows 提供守护产物。
-
-**检测 + 分级修复（由轻到重，成功后自动退回日常监测）**
-
-> **为什么不用 ping 判断断网**：WSA 的 NAT **不转发 ICMP** —— 实测镜像里 `/system/bin/ping`
-> 存在、IP 与默认网络都正常，但 ping 公共地址**永远 100% 丢包**。所以守护按这个顺序探测：
-> ① `nc` 发起 TCP 连接（`wsa_guard.tcp_targets`，默认几个公共 DNS 的 53 端口）→ 成功即判定正常；
-> ② 失败再看 `ping`（模拟器/Waydroid/真机有效）；③ 再看有没有非回环 IPv4；
-> ④ 最后看 `dumpsys connectivity` 的默认网络状态。**只有"没有 IP"或"系统明确说没有默认网络"
-> 才判定断网**，其余情况（典型就是 WSA 上 ping 不通）判为"无法判断"，只保活 adb、绝不误触发重启。
-> 顺带一提：探测命令的退出码为 1 时也要保留输出（`ping` 丢包、`nc` 连不上都是 rc=1），
-> 这也是早期版本"一直提示无法判断"的原因之一。
-
-**根因提醒：国内网络下 `PARTIAL_CONNECTIVITY`（App 说没网，其实能上网）**
-
-WSA 里 TCP/DNS 都通、但各种 App 仍然报"网络异常"，通常不是网真的断了，而是 Android
-自己的**联网验证探针**失败：默认探针地址 `connectivitycheck.gstatic.com` 在国内连不上，
-系统于是把网络标成 `PARTIAL_CONNECTIVITY`（有 `INTERNET` 但没有 `VALIDATED`），
-App 一律当作没网。守护现在会：
-① 在状态里显示"联网验证: validated / partial / unknown"；
-② 发现"能上网但没验证通过"时**自动改写验证探针**（换成实测可达的
-`connectivitycheck.platform.hicloud.com` / `connect.rom.miui.com` / `wifi.vivo.com.cn`
-的 `generate_204`，并关掉 DoT），而不是去重启子系统——重启治不了这个病，还会打断桥接。
-
-```bash
-python tools/wsa_net_guard.py --fix-validation   # 立刻改写探针（幂等，写入 /data）
-```
-
-设置写在 `/data` 里，重启子系统后依然有效；但 Android 要等**下一轮验证**（或子系统重启）
-才会把状态翻成 `VALIDATED`，所以改完当场看到 `partial` 属正常。
-
-> **必须和主程序共用一个 adb**：守护默认读取 `config.yaml` 的 `adb.path`（也可用 `--adb` 指定）。
-> 两个**不同版本**的 `adb.exe` 会互相杀掉对方在 5037 上的 server，表现就是设备一会儿在线一会儿掉线。
-
-| 级别 | 触发条件 | 动作 |
+| 顺序 | 做法 | 说明 |
 |---|---|---|
-| 0 | 一切正常 | 只记录状态（写入 `data/wsa_guard_state.json`，含**探测证据**文本） |
-| 0.5 | 能上网但 `PARTIAL_CONNECTIVITY` | 改写联网验证探针 + 关 DoT（10 分钟内最多一次） |
-| 1 | ADB 掉线 / 子系统网络不通 | `adb connect` 重连；网络问题则关飞行模式 + `svc wifi/data enable` |
-| 2 | 连续 2 轮仍未恢复 | `adb kill-server` + `start-server` 重连；网络栈复位（飞行模式开->关、wifi 关->开） |
-| 3 | 连续 3 轮仍未恢复 | `adb reboot` 重启 Android 子系统（**有冷却期**，默认 10 分钟内只做轻量修复） |
-| 4 | 允许 `--restart-wsa` 且多轮失败 | 重启宿主 WSA 客户端（`WsaClient` 杀掉后重新拉起）并等新端口 |
+| 1 | WSA 设置 → 「修复」 | 最快，多数情况一次就好 |
+| 2 | 重启子系统：任务管理器结束 `WsaClient` 再打开，或 `adb reboot` | 约 30~90 秒；桥接会自动重连并重新打开聊天页 |
+| 3 | 手动重连一次：`adb connect 127.0.0.1:58526` | 只是 adb 掉线时够用 |
 
-**用法**
-
-```bash
-# 常驻守护（推荐：和桥接各开一个终端）
-python tools/wsa_net_guard.py
-python tools/wsa_net_guard.py --interval 20            # 20 秒检测一次
-# Windows 也可以直接双击 tools\wsa_guard.bat（等价于常驻运行）
-
-# 只想看一眼 / 修一次
-python tools/wsa_net_guard.py --status                 # 打印状态（正常时退出码 0）
-python tools/wsa_net_guard.py --once                   # 检测一次，必要时修
-python tools/wsa_net_guard.py --dry-run                # 只诊断，不动手
-
-# 更重/更保守的策略
-python tools/wsa_net_guard.py --no-reboot              # 禁止重启子系统
-python tools/wsa_net_guard.py --restart-wsa            # 允许重启宿主 WSA 客户端
-python tools/wsa_net_guard.py --no-light-recover        # 禁止网络轻量修复（只保活 adb）
-
-# 不想常驻：注册 Windows 计划任务，每 5 分钟自动跑一次 --once
-python tools/wsa_net_guard.py --install-task
-python tools/wsa_net_guard.py --uninstall-task
-
-# 纯逻辑自测（不需要设备）
-python tools/wsa_net_guard.py --test
-```
-
-**日志与状态**
-
-- 控制台 + `logs/wsa_guard.log`（可用 `--quiet` 只写文件、`--log-file` 改路径）。
-- 最近一次检测结果写在 `data/wsa_guard_state.json`（`problem` / `action` / `streak` …），方便其它脚本读取。
-- **注意**：第 3/4 级修复会重启子系统或 WSA，桥接会短暂断连（约 30~90 秒），恢复后桥接
-  会自动重连并重新打开聊天页；这是预期行为，不是桥接崩了。
-
-**为什么不做进主程序？** 因为断网时主程序的 ADB 链路本身也不可用，把修复逻辑塞进主程序会
-互相拖累；分开之后：守护只管"把 Android 环境救活"，桥接只管"消息收发"，各自重启都不影响对方。
+> **为什么不用 ping 判断断网**：WSA 的 NAT **不转发 ICMP** —— 镜像里 `/system/bin/ping` 存在、
+> IP 与默认网络都正常，但 ping 公共地址**永远 100% 丢包**，所以"ping 不通"完全不能说明断网。
+>
+> **国内网络下 `PARTIAL_CONNECTIVITY`**：WSA 里 TCP/DNS 都通、但 App 仍报"网络异常"，通常是
+> Android 的联网验证探针（默认 `connectivitycheck.gstatic.com`）在国内连不上，系统把网络标成
+> `PARTIAL_CONNECTIVITY`。可以在 WSA 里把验证探针换成可达地址（如
+> `connectivitycheck.platform.hicloud.com` 的 `generate_204`），重启治不了这个病。
 
 ## 4. AstrBot 插件配置（两端对齐）
 
@@ -545,11 +460,10 @@ python tools/wsa_net_guard.py --test
 | 7 | AstrBot WebUI | 启用插件；配置 NapCat 适配器、登录 QQ |
 | 8 | 给机器人发一条消息 | 让插件学到平台 ID |
 | 9 | 启动 | Windows 双击 `start.bat`；Linux/macOS `bash start.sh`（或 `python main.py`）。ADBKeyBoard 会先查设备上有没有，没有才用项目里的本地 APK 安装（不联网） |
-| 10 | （WSA 用户）启动网络守护 | 另开一个终端 `python tools/wsa_net_guard.py`，或注册计划任务 `--install-task` |
 
 **打包/不打包清单**：
 - 随包：全部 `.py`、`astrbot_plugin_xtc_bridge/`（插件源码）、`keyboardservice-debug.apk`、
-  `install.bat` / `install.sh`、`start.bat` / `start.sh`、`tools/wsa_guard.bat`、
+  `install.bat` / `install.sh`、`start.bat` / `start.sh`、
   `config.example.yaml`、`requirements.txt`
 - 不随包（每台机器独立）：Android 环境本身（模拟器/WSA/Waydroid）、小天才账号登录态、
   AstrBot 里的 NapCat/QQ 登录态、`config.yaml` 的值、平台 ID（运行时自动学习）
@@ -646,7 +560,7 @@ python tools/wsa_net_guard.py --test
 |---|---|
 | `adb devices` 为空 | 目标没开 ADB 调试（模拟器设置 / WSA 的 Developer mode / 真机的 USB 调试）。先跑 `python main.py --check`，它会按平台给出具体建议（含 Linux 的 udev 规则做法） |
 | `adb devices` 显示 `unauthorized` | 在目标设备/子系统窗口里点「允许 USB 调试」；真机可在手机上撤销授权后重新插拔 |
-| **WSA / WSABuilds 隔三差五断网** | 跑独立守护：`python tools/wsa_net_guard.py`（分级修复：重连 -> 网络复位 -> 重启子系统；见「WSA 网络守护」）。只想看一眼用 `--status` |
+| **WSA / WSABuilds 隔三差五断网** | 桥接会自动重连 ADB，但网络栈死了得 WSA 自己救：在 WSA 设置里点「修复」或重启子系统（见「WSA 断网怎么办」）。只想看状态可 `adb devices` / `python main.py --check` |
 | WSA 报 `10061` 端口被拒 | Hyper-V 抢占端口：`netsh int ipv4 add excludedportrange protocol=tcp startport=<端口> numberofports=1` + 重启（见「Windows」小节） |
 | **自动登录不生效** | (1) 看日志有没有 `检测到小天才未登录，触发自动登录`；(2) 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；(3) 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；(4) 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
 | **明明在登录中却提示"登录失败"** | 已修复：出现"登录中/正在验证/请稍候"等进度文案时**一律不判失败**；只有明确的账号/密码错误才算失败，网络类临时问题按"超时->稍后重试"处理。若仍误报，把该文案加进 `xiaotiancai.ui.login_progress_markers` |
@@ -657,7 +571,7 @@ python tools/wsa_net_guard.py --test
 | **已经启动了 App 还重复启动** | 已修复：`launch()` 先判断前台，已在前台直接返回，不执行任何启动命令；`/小天才 初始化` 也改成按需执行 |
 | **明明在聊天页，却提示"在消息列表找不到联系人"** | 已修复：聊天页判定不再只看 Activity 名（`endswith("chatactivity")`），改为"Activity 名含 chat 且不含 list/main/watchmsg"**或**界面出现消息气泡/输入栏；另外 `open_chat` 进来会先确认一次界面特征，已经在聊天页就直接返回，不再去列表里找联系人 |
 | **在主页确实有该联系人，却一直说找不到** | 现在：① 联系人名匹配会忽略空格差异、支持"张三(爸爸)"这类别名（取括号前部分）；② 优先按列表行的联系人名控件（`ui.contact_name_ids`）匹配，并返回**可点击的整行**；③ 找不到时会依次切换 Tab（`ui.message_tab_texts`）、在确认是消息列表时向上滑动查找；④ 失败日志会写明**当前可见的联系人**，例如`找不到联系人 '张三'：消息列表；当前可见联系人: 李四、王五`，一眼看出是名字不一致还是页面不对 |
-| **WSA 守护一直提示"无法判断子系统网络"** | 根因是 **WSA 的 NAT 不转发 ICMP**：ping 在 WSA 上永远 100% 丢包（镜像里其实有 ping），旧版把"ping 失败/输出被退出码吞掉"当成了无法判断。现在守护优先用 **`nc` TCP 连接**判断（`wsa_guard.tcp_targets`），再退回 ping / IP / `dumpsys connectivity`；**只有"没有 IP"或"系统明确说没有默认网络"才判定断网**，其余判为无法判断（只保活 adb，不误重启）。`--status` 会打印"探测证据"一行说明这次的判断依据 |
+| **WSA 上 `ping` 公共地址永远 100% 丢包** | 这是**正常现象**，不是断网：WSA 的 NAT 不转发 ICMP（镜像里其实有 ping）。判断有没有网请用 TCP 连接（如 `adb shell "nc -w 3 223.5.5.5 53"`）或看有没有 IP |
 | **有时"已经登录了却提示未登录"** | 已修复三处：① 登录态**以界面为准**（聊天页/消息列表/微聊·我的 等主界面特征 → 已登录；密码框/验证码/登录页文案 → 未登录），Activity 名只作兜底，不再因为名字里带 `login`（如 `AccountVerifyLoginActivity`）就误判；② "App 是否在前台"改看 **Activity** 而不是窗口焦点 —— 输入法一弹出就抢走 `mCurrentFocus`，旧实现会因此误判"App 不在前台/未登录"；③ 新增**三态**登录判定：读不到界面 / App 不在前台 = `unknown`，此时既不打印"未登录"、也**不会触发自动登录**（旧实现会误触发，甚至去点登录页控件） |
 | **日志反复出现 `null root node returned by UiTestAutomationBridge` 或 `mCurrentFocus=null`** | 说明 **WSA 窗口被最小化/关闭、或虚拟显示未点亮** —— 此时 Android 侧没有任何窗口获得焦点，`uiautomator` 必然失败（**与小天才 App 无关**，手动 `uiautomator dump` 同样会失败）。办法：让 WSA 窗口保持打开（可以挪到屏幕边上，但别最小化）。桥接检测到"没有焦点窗口"会**自动唤醒屏幕 + 重新拉起 App**，窗口恢复后自动继续；单条 dump 报错已压缩成一行可读信息，完整原因见 `--debug adb-info` 的 `last_dump_error` |
 | **弹窗挡住界面导致读不到消息** | 已修复：常见弹窗（权限/无响应/更新/评价/活动/网络/警告）会自动处理；**自研自定义弹窗**（如"升级提醒" `com.xtc.widget.phone.popup.activity.CustomActivity14`）也按结构识别并自动关闭（点负向按钮/返回键，绝不点"立即安装"）；状态机会报 `弹窗遮挡界面`，轮询每轮都会清它。实在认不出的弹窗，把它的跳过按钮文案加进 `xiaotiancai.ui.popup_skip_texts` 即可 |
@@ -948,18 +862,16 @@ python tools/wsa_net_guard.py --test
 - 桥接本体跨平台（Windows / Linux / macOS），但**宿主集成类能力有平台差异**：
   WSA/WSABuilds 与宿主剪贴板共享、可被自动拉起，这些只存在于 Windows；
   Linux/macOS 没有等价物（Waydroid 与宿主不共享剪贴板，因此中文输入依赖 ADBKeyBoard）。
-  **WSA 的网络守护工具同理只在 Windows 有意义**（Linux/macOS 用 systemd timer / cron 调 `--once`）。
 - 需要小天才家长账号；小天才 App 必须由使用者自行安装（仓库不含该 APK）。
 - 手表发**语音消息**无法转文字，转发为"语音"占位通知。
-- Python 3.14 下 pyyaml 若无轮子，配置可写为 JSON 格式（loader 自动降级）；不装 pyyaml 时
-  `tools/wsa_net_guard.py` 仍可工作（只解析 `wsa_guard` 段）。
+- Python 3.14 下 pyyaml 若无轮子，配置可写为 JSON 格式（loader 自动降级）。
 - 轮询间隔默认 2s，去重 LRU 200 条/120s，回声过滤 60s（文件持久化，多实例/重启共享），
   防止重复转发与自我回传。
 - 剪贴板与宿主共享的环境（如 WSA）里，桥接运行期间手动复制内容会干扰"剪贴板兜底"通道
   （ADBKeyBoard 通道不受影响）。
 - 无桌面环境（纯 SSH/容器）运行图形模拟器需要额外处理显示与 `/dev/kvm`；
   Android Studio 的 headless 模拟器（`emulator -no-window`）可用，但需自行确认 adb 能连上。
-- WSA 守护的第 3/4 级修复会重启子系统或 WSA：期间桥接短暂断连（约 30~90 秒）属预期。
+- WSA 断网时的第 2 级处理（重启子系统 / WSA）会让桥接短暂断连（约 30~90 秒）属预期。
 - **WSA 窗口被最小化/关闭时 Android 侧没有窗口焦点**（`mCurrentFocus=null`），此时任何
   界面读取都会失败（`uiautomator` 报 `null root node`，手动 dump 同样失败）——这不是桥接的问题。
   请让 WSA 窗口保持打开；桥接检测到"没有焦点窗口"会自动唤醒屏幕并重新拉起 App，日志也会给出同样的提示。
@@ -975,14 +887,13 @@ python tools/wsa_net_guard.py --test
 把整个项目编译成**机器码单文件**：目标机器**不需要装 Python**，双击/直接运行即可。
 用 [Nuitka](https://nuitka.net/) 编译（真编译成 C 再编成原生可执行文件）。
 
-产物（主程序所有平台都有；守护只在 Windows 上编）：
+产物（Windows / Linux / macOS，x86_64 与 arm64 都有）：
 
 | 产物 | 入口 | 说明 |
 |---|---|---|
 | `xtc-qq-bridge-<版本>-<系统>-<架构>[.exe]` | `main.py` | 桥接主程序（Windows / Linux / macOS） |
-| `xtc-wsa-guard-<版本>-windows-<架构>.exe` | `tools/wsa_net_guard.py` | WSA 网络守护（**仅 Windows**） |
 
-命名规范示例：`xtc-qq-bridge-1.0.0-windows-x86_64.exe`、`xtc-wsa-guard-1.0.0-windows-x86_64.exe`
+命名规范示例：`xtc-qq-bridge-1.0.0-windows-x86_64.exe`
 （版本号不带 `v` 前缀，与 tag 一致，例如 tag `1.0.0-alpha.1`）。
 
 ## 1. 本地一键编译
@@ -1042,10 +953,6 @@ xtc-qq-bridge.exe --check            # 环境自检（adb/连接/输入法/剪�
 xtc-qq-bridge.exe --install-plugin   # 把内置的 AstrBot 插件装到 ~/.astrbot/data/plugins/
 xtc-qq-bridge.exe --debug dump-ui    # 打印当前界面控件
 xtc-qq-bridge.exe                    # 启动桥接（Ctrl+C 退出）
-
-xtc-wsa-guard.exe --status           # WSA 守护：看状态
-xtc-wsa-guard.exe                    # WSA 守护：常驻
-xtc-wsa-guard.exe --test             # 守护自身逻辑自测（不需要设备）
 ```
 
 - 配置：把 `config.yaml` 放在 exe 旁边即可（也可 `--config D:\path\config.yaml`）。
@@ -1119,7 +1026,6 @@ PLATFORM=linux/arm64 bash tools/build_in_docker.sh                    # arm64（
 ```bash
 pip install .            # 或 pip install xtc-qq-bridge
 xtc-qq-bridge --check    # 与编译产物同名的命令
-xtc-wsa-guard --status
 ```
 
-`pyproject.toml` 里声明了 `xtc-qq-bridge` / `xtc-wsa-guard` 两个入口点，源码安装与编译产物用法一致。
+`pyproject.toml` 里声明了 `xtc-qq-bridge` 入口点，源码安装与编译产物用法一致。

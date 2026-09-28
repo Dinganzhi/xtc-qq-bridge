@@ -4,7 +4,7 @@ REM  Build machine-code single-file executables with Nuitka (Windows).
 REM  Pure ASCII on purpose (Chinese text breaks cmd parsing).
 REM
 REM  Usage:
-REM    build.bat                     onefile, both targets, output dist\
+REM    build.bat                     onefile, output dist\
 REM    build.bat --mode standalone   folder mode (faster startup)
 REM    build.bat --target bridge     only the bridge
 REM    build.bat --check-env         check Python/pyyaml/Nuitka/MSVC
