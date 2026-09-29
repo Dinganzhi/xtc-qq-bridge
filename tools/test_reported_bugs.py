@@ -26,7 +26,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -2159,6 +2159,51 @@ def test_text_message_never_gets_media() -> None:
         check("文字消息不会去取图（哪怕屏幕上正好有一张表情）",
               br._capture_sticker(root_el, "2") is None)
         check("图片消息仍然取图", br._capture_sticker(root_el, xtc.IMAGE_TEXT) is not None)
+    finally:
+        cleanup(root)
+
+
+def test_missing_time_label_uses_previous_message_time() -> None:
+    """消息没有时间标签时，转发抬头的时间要用**上一条已入库消息的时间**。
+
+    实测：22:04 发的"噢" 在 22:20 被补发 —— App 的时间分隔标签只画在一组消息的第一条
+    上方，那一行早就滚出屏幕，于是旧实现直接用了"当前时间"（转发时刻），
+    转发出去写成 `[09-29 22:20]`，而这条实际是 22:04 发的。
+    """
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self):
+            self.sent: list = []
+
+        def send_detail(self, t, i, m):
+            self.sent.append(m)
+            return True, ""
+
+        def send_image(self, t, i, b, caption=""):
+            self.sent.append(caption or "image")
+            return True, ""
+
+    try:
+        fwd = _Fwd()
+        br = _backlog_bridge(root, fwd, [{"text": "噢", "own_label": "", "time_label": ""}])
+        prev = datetime.now() - timedelta(minutes=3)
+        br.msgs.append("xtc", "屑猹不喝茶", "上一条", t=prev.timestamp())
+        sent_n = br._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        shown = fwd.sent[0] if fwd.sent else ""
+        check("缺时间标签时用「上一条已入库消息」的时间（不是转发时刻）",
+              sent_n == 1 and prev.strftime("%m-%d %H:%M") in shown, shown)
+
+        # 上一条已经很久（>30 分钟）-> 不敢用它的时间，退回原行为（当前时间）
+        fwd2 = _Fwd()
+        br2 = _backlog_bridge(root, fwd2, [{"text": "噢2", "own_label": "", "time_label": ""}])
+        old = datetime.now() - timedelta(hours=3)
+        br2.msgs.append("xtc", "屑猹不喝茶", "很久以前", t=old.timestamp())
+        br2._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        shown2 = fwd2.sent[0] if fwd2.sent else ""
+        check("上一条太久远时不硬套它的时间",
+              old.strftime("%m-%d %H:%M") not in shown2
+              and datetime.now().strftime("%m-%d %H:%M") in shown2, shown2)
     finally:
         cleanup(root)
 
@@ -4369,6 +4414,7 @@ def main() -> int:
                test_photo_original_pick_is_conservative,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
+               test_missing_time_label_uses_previous_message_time,
                test_live_and_backlog_share_message_identity,
                test_text_message_never_gets_media,
                test_offline_device_is_recovered_not_faked,

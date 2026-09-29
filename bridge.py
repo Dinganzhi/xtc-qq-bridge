@@ -561,7 +561,7 @@ class MessageBridge:
             else:
                 self._log("debug", "[补发] 没能重新读界面，按现有快照取图")
 
-        pending: list[tuple[str, str, dict | None]] = []
+        pending: list[tuple[str, str, dict | None, str]] = []
         for it in reversed(bubbles):                # 从最新往回走
             text = (it.get("text") or "").strip()
             if not text:
@@ -574,11 +574,16 @@ class MessageBridge:
             if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
                 continue                            # 命令文本由命令流程处理
             # 身份用**这条消息自己的时间**（`own_label`，与实时路径的 `_label_for_bubble` 同源），
-            # 显示用"它上方最近的时间标签"（`time_label`，App 的分组标签，显示更准）。
+            # 显示用"它上方最近的时间标签"（`time_label`，App 的分组标签）。
             # 两条路径的身份必须**同源同格式**，否则同一条消息会被"补发 + 实时"各发一次。
             own_lbl = (it.get("own_label") or "").strip()
             disp_lbl = (it.get("time_label") or "").strip()
             ident = self._abs_time_label(own_lbl) or own_lbl
+            if not own_lbl and not disp_lbl:
+                # 界面上没有时间标签（App 只在一组消息的第一条上方画一个，滚出屏幕就没了）：
+                # 退回用"上一条已入库消息的时间"，而不是"当前时间" —— 否则补发旧消息会写成
+                # 转发时刻（用户实测：22:04 发的"噢"在 22:20 被补发，显示成了 22:20）。
+                disp_lbl = self._estimate_time_label()
             if self._in_store(contact, text, ident):
                 break                               # 撞库 -> 停，不再往上翻
             if self.dedup.seen(("xtc", contact or "", text, ident)):
@@ -589,9 +594,8 @@ class MessageBridge:
             # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
             if it.get("sticker") or it.get("image"):
-                sticker = self._capture_sticker(root, text,
-                                                near_epoch=self._label_epoch(disp_lbl or own_lbl),
-                                                backlog=True)
+                sticker = self._capture_sticker(
+                    root, text, near_epoch=self._label_epoch(disp_lbl or own_lbl))
             pending.append((text, ident, sticker, disp_lbl))
 
         if not pending:
@@ -611,6 +615,29 @@ class MessageBridge:
             self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
             sent += 1
         return sent
+
+    def _estimate_time_label(self, max_gap: float = 1800.0) -> str:
+        """消息没有时间标签时的兜底：用**上一条已入库消息的时间**（`MM-DD HH:MM`）。
+
+        为什么需要：App 只在"一组消息的第一条"上方画时间标签，那一行滚出屏幕后，组内其余
+        消息就没有任何标签了 —— 旧实现直接退化成"当前时间"，补发旧消息时就会写成**转发
+        时刻**（实测：22:04 发的"噢"在 22:20 被补发，显示成了 22:20）。
+        消息是严格按时间顺序处理的，所以"上一条已入库消息的时间"是个很接近的下界；
+        只有当它离现在足够近（默认 30 分钟内）才敢用，桥接停了很久时宁可退回"当前时间"。
+        """
+        try:
+            recent = self.msgs.recent(1)
+        except Exception:  # noqa: BLE001 取不到就用旧行为
+            return ""
+        if not recent:
+            return ""
+        try:
+            t = float(recent[-1].get("t") or 0)
+        except (TypeError, ValueError):
+            return ""
+        if t <= 0 or abs(time.time() - t) > max_gap:
+            return ""
+        return datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
 
     def _fresh_chat_root(self):
         """在界面锁内重新读一次界面（拿不到锁就等一小会儿，超时返回 None）。
@@ -674,8 +701,8 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001
             self._log("debug", f"表情包索引预热失败: {e}")
 
-    def _capture_sticker(self, root, text: str, near_epoch: float | None = None,
-                         backlog: bool = False) -> dict | None:
+    def _capture_sticker(self, root, text: str,
+                         near_epoch: float | None = None) -> dict | None:
         """取"要发到 QQ 的那张图"（表情包 **和** 照片都走这里）。
 
         表情包：
