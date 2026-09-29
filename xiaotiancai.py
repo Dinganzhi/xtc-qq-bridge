@@ -1843,6 +1843,7 @@ class Xiaotiancai:
             self._focus_input(input_node)
             # 2) 快路径：布局与上次一致 -> 直接用缓存的发送按钮坐标
             point = self._cached_send_point(input_bounds) if self._fast_send else None
+            lost_focus = False                 # 快路径失败时可能点开了别的面板 -> 需要重新聚焦
             if point is not None and self.adb.input_text_plain(text):
                 time.sleep(0.25)
                 self.adb.tap(point[0], point[1])
@@ -1865,12 +1866,15 @@ class Xiaotiancai:
                         self._clear_chat_input(root)
                         input_node = fresh_input
                         input_bounds = self._bounds(fresh_input)
+                        lost_focus = True          # 中间动过界面 -> 稳妥流程要重新聚焦
                 except AdbError:
                     pass
             elif point is not None:
                 self.log("debug", "纯注入广播未发出，改用带校验的注入流程")
             # 3) 稳妥路径：注入并校验（这次 dump 同时用来找发送按钮），点完再确认
-            self._focus_input(input_node)
+            if lost_focus:
+                # 中间没有动过界面时**不重复聚焦**（那是一次 tap + 等待，白花 ~0.5 秒）
+                self._focus_input(input_node)
             if not self.adb.input_text(text, verify=self.input_verifier(text)):
                 # 注入失败最常见的原因是"输入框没拿到输入连接"（点一下没生效、
                 # 输入法没挂上）。这时反复发 ADBKeyBoard 广播是没用的（没人接收），
@@ -2705,11 +2709,6 @@ class Xiaotiancai:
                 time.sleep(0.4)
         return None
 
-    def _latest_own_in_chat(self, root: ET.Element) -> str:
-        """聊天页内最新一条"自己发的"消息文本（系统/垃圾已过滤）；无则 ""。"""
-        own = self._own_texts_in_chat(root)
-        return own[0][0] if own else ""
-
     def _own_texts_in_chat(self, root: ET.Element, limit: int = 8) -> list[tuple[str, str]]:
         """聊天页内最近若干条"自己发的"消息（新->旧，系统/垃圾已过滤）。
         返回 [(text, time_label)]。命令可能被送达确认等后续消息盖过（不再是
@@ -2785,51 +2784,6 @@ class Xiaotiancai:
             self.log("warning", f"读取历史消息异常: {e}")
             return oldest_first[-count:]
 
-    def _latest_from_list(self, root: ET.Element):
-        """聊天列表（主页微聊列表）：取最顶部（最新）聊天行的消息预览，返回 (contact, text, time_label)。
-
-        实测列表行结构：tv_chat_dialog_name（联系人名）+ tv_chat_dialog_last_msg_content（预览）。
-        watch_contact 配置后只取该联系人的行。时间取行内时间标签（如 "06:56" / "昨天 23:42"）。
-        """
-        preview_tail = "tv_chat_dialog_last_msg_content"
-        watch_contact = self.ui.get("watch_contact", "") or ""
-        rows = []
-        for n in root.iter("node"):
-            if self._id_tail(n) == preview_tail:
-                rows.append(n)
-        if not rows:
-            return (None, None, "")
-        if watch_contact:
-            target = None
-            for row in rows:
-                contact = self._row_contact(row, root)
-                if contact == watch_contact:
-                    target = row
-                    break
-            if target is None:
-                return (None, None, "")
-        else:
-            target = min(rows, key=lambda n: (self._bounds(n) or (0, 0, 0, 0))[1])
-        text = target.get("text", "").strip()
-        if self._is_system_msg(text):
-            return (None, None, "")  # 列表预览是桥接系统提示（送达确认等），不转发
-        contact = self._row_contact(target, root)
-        time_label = self._row_time(target, root)
-        return (contact or None, text or None, time_label)
-
-    def _row_time(self, preview_node, root: ET.Element) -> str:
-        """取预览节点所在行的日期/时间标签（如 "06:56"、"昨天 23:42"、"8月30日"）。"""
-        parent = self._parent(preview_node, root)
-        if parent is None:
-            return ""
-        for n in parent.iter("node"):
-            t = n.get("text", "").strip()
-            if not t or t == preview_node.get("text", ""):
-                continue
-            if ":" in t or "昨天" in t or "前天" in t or "日" in t or "月" in t:
-                return t
-        return ""
-
     def _is_system_msg(self, text: str) -> bool:
         """桥接系统提示消息（送达确认等）按前缀识别，防止被当成接收消息转发。
 
@@ -2838,56 +2792,12 @@ class Xiaotiancai:
         prefixes = self.ui.get("system_msg_prefixes", ["发送成功", "发送失败"])
         return any(str(p).strip() and str(text).startswith(str(p)) for p in prefixes)
 
-    def _row_contact(self, preview_node, root: ET.Element) -> str:
-        """取预览节点同行的联系人名（同父节点的 tv_chat_dialog_name）。"""
-        parent = self._parent(preview_node, root)
-        if parent is None:
-            return ""
-        for n in parent.iter("node"):
-            if self._id_tail(n) == "tv_chat_dialog_name":
-                return n.get("text", "").strip()
-        return ""
-
-    def _row_ancestor(self, node, root: ET.Element):
-        """向上找“一行”祖先：宽度接近屏宽、高度小于 300px。"""
-        width = self.adb.get_screen_size()[0]
-        cur = node
-        for _ in range(6):
-            parent = self._parent(cur, root)
-            if parent is None:
-                break
-            b = self._bounds(parent)
-            if b and b[2] - b[0] > width * 0.6 and 0 < b[3] - b[1] < 300:
-                return parent
-            cur = parent
-        return None
-
     @staticmethod
     def _parent(node, root: ET.Element):
         for p in root.iter("node"):
             if node in list(p):
                 return p
         return None
-
-    # ------------------------------------------------------------------ 未读数
-    def get_unread_count(self):
-        """尽力而为：统计小数字角标数量，返回 int 或 None。"""
-        try:
-            root = self.adb.dump_ui()
-        except AdbError:
-            return None
-        badge_ids = set(self.ui.get("badge_resource_ids", []))
-        count = 0
-        for n in root.iter("node"):
-            if badge_ids and n.get("resource-id", "") in badge_ids:
-                count += 1
-                continue
-            t = n.get("text", "").strip()
-            if re.fullmatch(r"\d{1,3}", t):
-                b = self._bounds(n)
-                if b and 0 < b[2] - b[0] <= 80:  # 角标通常是小尺寸文本
-                    count += 1
-        return count or None
 
     # ------------------------------------------------------------------ 工具
     @staticmethod

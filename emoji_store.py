@@ -37,8 +37,6 @@ from utils import imgtool
 
 # 表情包解包目录（相对 App 的外部数据根目录）
 EMOJI_SUBDIR = "files/xtcdata/telwatch/weichat/emoji"
-# 图片缓存目录（Glide 会把原图写在这两个下面，文件名是 hash + .cnt）
-CACHE_SUBDIRS = ("cache/big_image", "cache/small_image")
 
 IMAGE_KINDS = ("gif", "png", "webp", "jpeg")
 

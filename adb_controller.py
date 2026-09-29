@@ -95,7 +95,6 @@ _UNIX_ADB_CANDIDATES = [
 ]
 
 # WSA 相关（Windows 专有；WSABuilds / MagiskOnWSA 同样适用）
-WSA_PACKAGE_DEFAULT = "MicrosoftCorporationII.WindowsSubsystemForAndroid_8wekyb3d8bbwe"
 WSA_ADB_DEFAULT_PORT = 58526
 # WSA 的 ADB 端口是随机分配的；依次从注册表 / 常见端口探测
 _WSA_REG_PATHS = [
@@ -491,6 +490,9 @@ class ADBController:
         self._dump_lock = threading.Lock()
         # 心跳类日志的节流时间戳（key -> monotonic），避免"设备 offline"每 10 秒刷一次
         self._log_once_ts: dict[str, float] = {}
+        # "屏幕刚确认过亮着"的有效期：poke_awake 每 10 秒一次，这 12 秒内不再重复查电源状态
+        self._awake_until = float("-inf")
+        self._awake_ttl = 12.0
 
     # ------------------------------------------------------------------ 基础
     def _base(self) -> list[str]:
@@ -820,10 +822,6 @@ class ADBController:
                             or _is_wsa_serial(self.serial))
         return self._is_wsa
 
-    def is_waydroid(self) -> bool:
-        """是否运行在 Waydroid（Linux 上的 Android 容器）里。"""
-        return "waydroid" in self._device_blob()
-
     def runtime_tag(self) -> str:
         """运行环境标签：WSA / Waydroid / 模拟器 / 真机（仅用于日志与提示）。"""
         blob = self._device_blob()
@@ -1016,8 +1014,12 @@ class ADBController:
         if "mwakefulness=asleep" in low or "mscreenon=false" in low or "state=off" in low:
             return False
         if "mwakefulness=awake" in low or "mscreenon=true" in low:
+            self._mark_awake()          # 记住"刚确认过亮着"，短时间内不必再查（省 0.1~0.3 秒）
             return True
         return None
+
+    def _mark_awake(self) -> None:
+        self._awake_until = time.monotonic() + self._awake_ttl
 
     def wake_up(self) -> bool:
         """唤醒屏幕并解除锁屏（WSA/模拟器息屏后 dump 会一直失败）。返回是否已亮屏。"""
@@ -1027,6 +1029,7 @@ class ADBController:
             self.try_shell("wm dismiss-keyguard", timeout=15)  # 无锁屏时是 no-op
             time.sleep(0.4)
             self.invalidate_focus()
+            self._mark_awake()
         except AdbError:
             return False
         return self.screen_on() is not False
@@ -1039,7 +1042,13 @@ class ADBController:
         屏照样睡）。所以每次判断"App 是不是在前台"之前先花 ~0.3 秒问一次电源状态，
         睡着就叫醒 —— 唤醒后 App 通常立刻回到前台（它本来就是 resumed 的 Activity），
         比"重新拉起 App"（实测要 20 秒）划算得多。
+
+        提速：桥接每 10 秒就 `poke_awake()` 发一次 WAKEUP，所以"刚确认过亮着"的 12 秒内
+        直接跳过这次 `dumpsys power`（每次省 0.1~0.3 秒，而它处在**每轮轮询 + 每次发送**
+        的必经之路上）。真睡着了也不会漏：dump 失败路径依旧会唤醒。
         """
+        if time.monotonic() < self._awake_until:
+            return False
         if self.screen_on() is not False:
             return False
         self._screen_suspect = True          # 记住"这块屏会睡"，之后 dump 前主动先唤醒
@@ -1049,12 +1058,13 @@ class ADBController:
     def poke_awake(self) -> bool:
         """便宜的"别睡"心跳：直接发 WAKEUP（已经亮着时是无害空操作）。
 
-        桥接每隔 `adb.keep_awake_interval`（默认 30 秒）调一次：既把睡过去的屏叫醒，
+        桥接每隔 `adb.keep_awake_interval`（默认 10 秒）调一次：既把睡过去的屏叫醒，
         也重置"用户活动"计时，让 App 尽量一直留在前台（前台判定的坑就少一大半）。
         """
         try:
             self.shell("input keyevent 224", timeout=10)
             self.invalidate_focus()
+            self._mark_awake()
             return True
         except AdbError:
             return False
@@ -1173,9 +1183,6 @@ class ADBController:
                     return m.group(1).split("/", 1)[1]
         return ""
 
-    def _resolve_launcher_activity(self, package: str) -> str:  # 兼容旧调用名
-        return self.resolve_launcher_activity(package)
-
     def launch_app(self, package: str, activity: str = "", wait: float = 6.0,
                    attempts: int = 2) -> str:
         """启动 App 并确认其到达前台，返回最终使用的 activity（空串表示启动失败）。
@@ -1239,9 +1246,6 @@ class ADBController:
             time.sleep(interval)
         return False
 
-    def wait_for_focus(self, package: str, timeout: float = 20.0) -> bool:
-        return self.wait_for_activity(package, timeout=timeout)
-
     def screenshot(self, path: str | None = None) -> bytes:
         out, _ = self._run(["exec-out", "screencap", "-p"], timeout=60, binary=True)
         if not out:
@@ -1280,7 +1284,13 @@ class ADBController:
         return raw[start:start + need], w, h
 
     def screencap_crop_png(self, box) -> bytes:
-        """截屏并抠出 box=(x1,y1,x2,y2)，返回 PNG 字节（用于把表情包原样发出去）。"""
+        """截屏并抠出 box=(x1,y1,x2,y2)，返回 PNG 字节（用于把表情包原样发出去）。
+
+        **为什么不用 `screencap -p`（PNG 直出）**：实测整屏 PNG 传输只要 1.05 秒（88KB），
+        但纯 Python 解一张 1366x768 的 PNG（逐字节反滤波）要 5~6 秒，合计比搬 4MB 原始
+        像素（1.78 秒）**更慢**。所以这里走"原始 RGBA + 自己裁剪编码"这条路（合计 ~2.1 秒），
+        除非将来换成能快速解码的实现，否则别再改回 PNG 通道。
+        """
         rgba, w, h = self.screencap_rgba()
         return pngtool.crop_png_from_rgba(rgba, w, h, box)
 
@@ -1806,9 +1816,6 @@ class ADBController:
             return True
         return bool(re.search(r"mInputShown\s*=\s*true", out))
 
-    def _clipboard_supported(self) -> bool:
-        return self._clipboard_ok if self._clipboard_ok is not None else True
-
     def get_clipboard(self) -> str | None:
         """读取设备剪贴板文本（读不到返回 None）。"""
         out = self.try_shell("cmd clipboard get-text", timeout=15)
@@ -1827,9 +1834,6 @@ class ADBController:
                 probe = "xtc-clipboard-probe"
                 self._clipboard_ok = set_clipboard(self, probe)
         return self._clipboard_ok
-
-    def _clipboard_ready(self) -> bool:
-        return self.probe_clipboard()
 
     # ---------------------------------------------------- 自动校验
     def _default_input_verifier(self, text: str):

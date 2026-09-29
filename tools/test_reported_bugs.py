@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import struct
 import sys
@@ -1532,12 +1531,6 @@ def test_forwarder_wrapper_exposes_send_image() -> None:
         cleanup(root)
 
 
-def _png_solid(w: int, h: int, top: tuple, bottom: tuple) -> bytes:
-    """造一张"上下一半一半"的 PNG（给相似度比对当素材，不需要外部图片）。"""
-    from utils.pngtool import encode_png_rgb
-    rows = [bytes(top) * w] * (h // 2) + [bytes(bottom) * w] * (h - h // 2)
-    return encode_png_rgb(w, h, rows)
-
 
 def _fake_shot(w: int = 120, h: int = 120) -> bytes:
     """假的"气泡截图"：必须是**有内容的真 PNG** —— 空白图会被 looks_blank 判掉。"""
@@ -2983,6 +2976,8 @@ def test_screen_off_detection_and_wake() -> None:
     def make_ctl(asleep=True):
         ctl = object.__new__(ADBController)
         ctl.logger = ac._silent_logger()
+        ctl._awake_until = float('-inf')
+        ctl._awake_ttl = 12.0
         ctl.focus_ttl = 0.0
         ctl._focus_cache = (0.0, "")
         ctl._activity_cache = (0.0, "")

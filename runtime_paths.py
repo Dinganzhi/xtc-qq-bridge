@@ -151,9 +151,6 @@ def log_path(name: str) -> Path:
     return p if p.is_absolute() else APP_DIR / p
 
 
-def default_config_path() -> Path:
-    return APP_DIR / CONFIG_NAME
-
 
 def resolve_config(cli_value: str = "") -> Path:
     """配置文件路径：命令行 > APP_DIR > 当前目录 > 打包资源目录。"""

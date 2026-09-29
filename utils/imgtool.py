@@ -168,10 +168,6 @@ def content_stats(data_or_frame) -> tuple[float, float]:
     return dom, std
 
 
-def content_stats_full(data_or_frame) -> tuple[float, float, float]:
-    """(主色占比, 亮度标准差, 亮度均值) —— 需要"浅色空屏"判据时用（见 looks_blank）。"""
-    return _content_all(data_or_frame)
-
 
 def _content_all(data_or_frame) -> tuple[float, float, float]:
     frame = data_or_frame if isinstance(data_or_frame, dict) else None

@@ -208,8 +208,6 @@ def extract_message(data: dict, bridge, logger=None):
 
 if __name__ == "__main__":
     # 独立调试：python qq_webhook.py
-    import sys
-
     class _Fake:
         cfg = {"target": {"qq_private": "123"}, "webhook": {}}
 

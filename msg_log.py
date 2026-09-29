@@ -217,17 +217,6 @@ class MessageLog:
             items = self._all_locked()
             return list(items[-n:])
 
-    def recent_by_source(self, count: int = 20, source_id: str = "",
-                         kind: str = "") -> list[dict]:
-        """按来源过滤后取最近 count 条（source_id/kind 为空则不过滤）。"""
-        with self._lock:
-            items = list(self._all_locked())
-        if source_id:
-            items = [e for e in items if str(e.get("source_id") or "") == str(source_id)]
-        if kind:
-            items = [e for e in items if e.get("kind") == kind]
-        return items[-max(1, int(count)):]
-
     def sources(self) -> list[str]:
         """出现过的来源标签（按首次出现顺序）。"""
         with self._lock:

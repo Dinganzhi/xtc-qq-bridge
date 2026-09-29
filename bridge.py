@@ -539,6 +539,21 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001 补发失败不影响正常轮询
             self._log("debug", f"补发扫描失败: {e}")
             return 0
+        # 有表情/图片要做补发时：**先在界面锁内重新读一次界面**，整轮补发都用这一份新鲜快照。
+        # 为什么：补发是连着发的，每转发成功一条就会往聊天里写一条"发送成功"提示把列表往上顶；
+        # 用轮询那份（可能已经过去几秒）的坐标去抠图，抠到的是被顶走后的空白区。
+        # 一次 dump 服务整轮（而不是每条媒体各 dump 一次）—— 后者在积压多条图片时白花好几秒。
+        if any(it.get("sticker") or it.get("image") for it in bubbles):
+            fresh = self._fresh_chat_root()
+            if fresh is not None:
+                try:
+                    items = self.xtc._chat_bubbles(fresh, include_own=False)
+                    if items:
+                        bubbles, root = items, fresh
+                except Exception as e:  # noqa: BLE001 解析不出来就沿用旧的
+                    self._log("debug", f"[补发] 重读后的界面解析失败: {e}")
+            else:
+                self._log("debug", "[补发] 没能重新读界面，按现有快照取图")
 
         pending: list[tuple[str, str, dict | None]] = []
         for it in reversed(bubbles):                # 从最新往回走
@@ -562,12 +577,12 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            # 补发的表情/图片也取原图：**必须重新读一次界面**再抠图 ——
-            # 前面几条文字刚发出去，我们自己写回聊天里的"发送成功"提示会把列表往上顶，
-            # 用本轮的旧坐标去抠，抠到的就是空白区域（用户报的"图片截屏变成空白"）。
+            # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
             if it.get("sticker") or it.get("image"):
-                sticker = self._capture_media_fresh(text, raw_lbl)
+                sticker = self._capture_sticker(root, text,
+                                                near_epoch=self._label_epoch(raw_lbl),
+                                                backlog=True)
             pending.append((text, lbl, sticker))
 
         if not pending:
@@ -588,28 +603,19 @@ class MessageBridge:
             sent += 1
         return sent
 
-    def _capture_media_fresh(self, text: str, raw_label: str) -> dict | None:
-        """补发时取图：**先重新读一次界面**，再在 _op_lock 保护下抠图。
+    def _fresh_chat_root(self):
+        """在界面锁内重新读一次界面（拿不到锁就等一小会儿，超时返回 None）。
 
-        为什么不能用本轮 dump 里的坐标：补发是连着发的，而每转发成功一条，桥接就会往
-        聊天里写一条"发送成功：[时间] [昵称] …"的送达确认 —— 那条消息会把列表往上顶。
-        实测正好卡在"前面几条文字发完、轮到图片"那一刻：按旧坐标抠到的是被顶走后的
-        空白区域（用户报的"图片截屏变成空白"）。
-        顺带把发送线程挡在锁外，保证"读界面 -> 截图"这一小段界面不会被人动。
+        补发取图用它：发送线程（点输入框/打字/点发送/写"发送成功"提示）拿的是同一把锁，
+        所以"读界面 -> 抠图"这一小段界面不会被人动。
         """
         got_lock = self._op_lock.acquire(timeout=self._media_lock_timeout)
-        if not got_lock:
-            self._log("debug", "[补发] 发送线程正忙，改按旧坐标取图")
         try:
-            root = None
             try:
-                root = self.xtc.adb.dump_ui(retries=2, delay=0.3)
-            except Exception as e:  # noqa: BLE001 读不到就用调用方给的界面凑合
-                self._log("debug", f"[补发] 重新读界面失败（改用旧坐标取图）: {e}")
-            if root is None:
+                return self.xtc.adb.dump_ui(retries=2, delay=0.3)
+            except Exception as e:  # noqa: BLE001 读不到就返回 None，调用方沿用旧快照
+                self._log("debug", f"[补发] 重新读界面失败: {e}")
                 return None
-            return self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_label),
-                                         backlog=True)
         finally:
             if got_lock:
                 self._op_lock.release()

@@ -109,5 +109,3 @@ def setup_logger(level: str = "INFO", file: str | None = None,
     return logger
 
 
-def get_logger(name: str = "xtc-bridge") -> logging.Logger:
-    return logging.getLogger(name)

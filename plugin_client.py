@@ -88,12 +88,6 @@ class PluginClient:
         except Exception as e:  # noqa: BLE001
             return False, f"转发异常: {type(e).__name__}: {e}"
 
-    def send_private(self, user_id, message: str) -> bool:
-        return self.send("private", user_id, message)
-
-    def send_group(self, group_id, message: str) -> bool:
-        return self.send("group", group_id, message)
-
     def send_image(self, target_type: str, target_id, image_b64: str,
                    caption: str = "") -> tuple:
         """发一张图片（base64 PNG）给 QQ，可带一句说明文字。返回 (是否成功, 失败原因)。

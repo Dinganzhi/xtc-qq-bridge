@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """实机验证：现学现卖地把界面上那张贴纸找出来，看挑的是不是同一张。
 
 py tools/emoji_live_probe.py [表情名，默认取界面最后一条]
