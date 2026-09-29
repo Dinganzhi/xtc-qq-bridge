@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """回归测试：针对用户报告的具体问题（不需要设备，全部离线）。
 
 覆盖：
@@ -1804,6 +1804,262 @@ def test_photo_original_pick_is_conservative() -> None:
     got5 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
         near_epoch=None, aspect=136 / 180, min_px=180, allow_now=False)
     check("allow_now=False 时不拿'刚写进来'当依据", got5 is None, str(got5))
+
+
+def test_check_uses_configured_adb() -> None:
+    """`--check` 必须用 config.yaml 里配置的 `adb.path`，不能自己另找一个。
+
+    实机踩过：config 里写的是 `C:\\platform-tools\\adb.exe`，`--check` 却报
+    `C:\\leidian\\LDPlayer9\\adb.exe`（自动探测的结果）—— 两个不同版本的 adb 会抢 5037
+    端口上的 server，于是"检测结果"和"桥接实际行为"对不上，排障方向直接跑偏。
+    """
+    import yaml
+
+    import adb_controller as ac
+    import main as main_mod
+
+    tmp = tmp_root()
+    cfg_file = tmp / ".bugtest_checkcfg.yaml"
+    cfg_file.write_text("adb:\n  path: 'C:/custom/adb.exe'\n  wsa_port: 58526\n",
+                        encoding="utf-8")
+    seen: dict = {}
+
+    class _FakeCtl:
+        def __init__(self, adb_path="", **kw):
+            seen["path"] = adb_path
+            self.adb_path = adb_path or "auto-detected"
+            self.serial = "127.0.0.1:58526"
+
+        def __getattr__(self, name):          # 诊断输出会用到的其它方法一律给个桩
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return lambda *a, **k: "stub"
+
+        def is_connected(self):
+            return True
+
+        def _port_candidates(self):
+            return [58526]
+
+        def dump_diagnostics(self):
+            return "diag"
+
+        def adbkeyboard_ready(self):
+            return True
+
+        def dump_ui(self):
+            return ET.fromstring(node_xml(""))
+
+    orig = (ac.ADBController, main_mod.load_config, main_mod.runtime_paths.resolve_config)
+    try:
+        ac.ADBController = _FakeCtl
+        main_mod.load_config = lambda p: yaml.safe_load(Path(p).read_text(encoding="utf-8"))
+        main_mod.runtime_paths.resolve_config = lambda p=None: cfg_file
+        main_mod.run_check(None)
+        check("--check 用的是配置里的 adb.path", seen.get("path") == "C:/custom/adb.exe",
+              str(seen))
+    finally:
+        ac.ADBController, main_mod.load_config, main_mod.runtime_paths.resolve_config = orig
+        try:
+            cfg_file.unlink()
+        except OSError:
+            pass
+        cleanup(tmp)
+
+
+def test_offline_device_is_recovered_not_faked() -> None:
+    """ADB 设备卡成 `offline` 时要真的救回来，不能"假装重连成功"。
+
+    实机踩过（WSA `127.0.0.1:58526`）：`adb devices` 一直显示 offline，`adb connect`
+    只回一句 "already connected to ..." —— 旧实现看到 "connected" 就认为重连成功，
+    于是桥接每 10 秒"断连->重连->已重连"循环，界面一条都读不到；更糟的是 `pm list packages`
+    失败被当成"设备上没有安装 com.xtc.watch"，排障方向完全被带偏。
+    正确做法：确认 `get-state` 真的是 device；offline 就先 `disconnect` + `connect`，
+    还不行再重启 adb server。
+    """
+
+    class OfflineAdb:
+        """模拟"设备 offline，disconnect+connect 后才能恢复"的 adb。"""
+
+        def __init__(self, recover_after: str = "disconnect", kill_server_helps: bool = False):
+            self.serial = "127.0.0.1:58526"
+            self.online = False
+            self.recover_after = recover_after
+            self.kill_server_helps = kill_server_helps
+            self.calls: list[str] = []
+            self._nb = 0
+            self._kill_done = False
+
+        # --- 被测代码用到的接口 ---
+        def _run(self, args, timeout=None, binary=False, check=True):
+            cmd = " ".join(args)
+            self.calls.append(cmd)
+            if args[:1] == ["devices"]:
+                state = "device" if self.online else "offline"
+                return (f"List of devices attached\n{self.serial}\t{state}\n", "")
+            if args[:1] == ["-s"] and args[2:3] == ["get-state"]:
+                if self.online:
+                    return ("device\n", "")
+                raise AdbError("adb: device offline")
+            if args[:1] == ["disconnect"]:
+                self._nb += 1
+                if self.recover_after == "disconnect":
+                    self.online = True
+                return (f"disconnected {args[1]}\n", "")
+            if args[:1] == ["connect"]:
+                self._nb += 1
+                if self.recover_after == "connect" or self._kill_done:
+                    self.online = True
+                return (f"already connected to {args[1]}\n", "")
+            if args[:1] == ["kill-server"]:
+                self._kill_done = True
+                self.online = self.kill_server_helps
+                return ("", "")
+            if args[:1] == ["start-server"]:
+                return ("", "")
+            if args[:1] == ["get-state"]:
+                if self.online:
+                    return ("device\n", "")
+                raise AdbError("adb: device offline")
+            return ("", "")
+
+        def devices(self):
+            state = "device" if self.online else "offline"
+            return [self.serial] if self.online else []
+
+        def device_states(self):
+            return {self.serial: "device" if self.online else "offline"}
+
+        def logger(self):
+            raise NotImplementedError
+
+    class _Log:
+        def __init__(self):
+            self.msgs: list[str] = []
+
+        def _add(self, m):
+            self.msgs.append(str(m))
+
+        info = debug = warning = error = _add
+
+    def make(adb):
+        ctl = ADBController.__new__(ADBController)      # 只借用连接管理这几个方法
+        ctl.adb_path = "adb"
+        ctl.serial = adb.serial
+        ctl.port = 58526
+        ctl.wsa_port = 58526
+        ctl.extra_ports = []
+        ctl.host = "127.0.0.1"
+        ctl.timeout = 10
+        ctl.logger = _Log()
+        ctl._log_once_ts = {}
+        ctl._run = adb._run
+        ctl.devices = adb.devices
+        ctl.device_states = adb.device_states
+        return ctl
+
+    # ① offline 时 connect 只回 "already connected"：绝不能当成连上了
+    adb = OfflineAdb(recover_after="never")
+    ctl = make(adb)
+    check("offline 设备不会被当成在线（不轻信 'already connected'）",
+          ctl._adopt_serial("127.0.0.1:58526") is False, str(adb.calls[-3:]))
+
+    # ② disconnect + connect 能救回来 -> connect() 成功，且确实调用了 disconnect
+    adb2 = OfflineAdb(recover_after="disconnect")
+    ctl2 = make(adb2)
+    ok = ctl2.connect(timeout=2)
+    check("offline 时用 disconnect + connect 真的恢复", ok is True, str(adb2.calls))
+    check("恢复流程里确实先 disconnect", any(c.startswith("disconnect") for c in adb2.calls),
+          str(adb2.calls))
+    check("恢复后 is_connected() 为真", ctl2.is_connected() is True)
+
+    # ③ disconnect 也救不回来时，重启 adb server 兜底
+    adb3 = OfflineAdb(recover_after="never", kill_server_helps=True)
+    ctl3 = make(adb3)
+    ok3 = ctl3.connect(timeout=2)
+    check("disconnect 无效时重启 adb server 兜底", ok3 is True, str(adb3.calls))
+    check("兜底路径包含 kill-server", any(c == "kill-server" for c in adb3.calls), str(adb3.calls))
+
+    # ④ 读不到包列表 ≠ 没安装：strict 下抛错，调用方不会误报"没安装"
+    class ShellAdb:
+        def shell(self, cmd, timeout=None):
+            raise AdbError("adb: device offline")
+
+        def try_shell(self, cmd, timeout=None):
+            return ""
+
+    ctl4 = ADBController.__new__(ADBController)
+    ctl4.shell = ShellAdb().shell
+    ctl4.try_shell = ShellAdb().try_shell
+    try:
+        ctl4.package_installed("com.xtc.watch")
+        raised = False
+    except AdbError:
+        raised = True
+    check("ADB 读不到包列表时抛错（而不是报'没安装'）", raised is True)
+    check("纯探测模式下失败也只是 False", ctl4.package_installed("com.xtc.watch",
+                                                                 strict=False) is False)
+
+    # ⑤ 小天才 launch()：ADB 异常时给"连接问题"，不给"没安装"
+    class _Adb:
+        package = "com.xtc.watch"
+
+        def is_in_foreground(self, pkg):
+            return False
+
+        def package_installed(self, pkg):
+            raise AdbError("adb: device offline")
+
+    logs: list[str] = []
+
+    class _Xtc(Xiaotiancai):
+        def __init__(self):
+            self.adb = _Adb()
+            self.package = "com.xtc.watch"
+            self.main_activity = ".MainActivity"
+            self.logger = None
+
+        def log(self, level, msg):
+            logs.append(f"{level}: {msg}")
+
+    ok5 = _Xtc().launch()
+    check("ADB 异常时不谎报'设备上没有安装'",
+          ok5 is False and any("ADB 连接异常" in m for m in logs)
+          and not any("没有安装" in m for m in logs), str(logs))
+
+    # ⑥ 心跳重连的退避：失败后一段时间内不再尝试，避免每 10 秒刷屏
+    br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                  adb=None, xtc=None, forwarder=None, logger=None)
+    br._log = lambda *a, **k: None
+    br._hint_wsa_reconnect = lambda: None
+
+    class _BadAdb:
+        def __init__(self):
+            self.tries = 0
+
+        def ensure_connected(self, *a, **k):
+            self.tries += 1
+            raise AdbError("没有在线设备")
+
+    bad = _BadAdb()
+    br.adb = bad
+    t0 = 1000.0
+    check("重连失败 -> 本轮跳过", br._heartbeat_reconnect(t0) is False)
+    check("退避期内不再重试", br._heartbeat_reconnect(t0 + 5) is False and bad.tries == 1,
+          f"tries={bad.tries}")
+    check("退避时间到了才再试一次", br._heartbeat_reconnect(t0 + 11) is False
+          and bad.tries == 2, f"tries={bad.tries}")
+    check("连续失败会拉长退避（上限 60 秒）",
+          br._next_reconnect_ts - (t0 + 11) <= 60.0 and br._reconnect_fails == 2,
+          f"fails={br._reconnect_fails}")
+
+    class _GoodAdb:
+        def ensure_connected(self, *a, **k):
+            return True
+
+    br.adb = _GoodAdb()
+    check("恢复后立刻回到正常轮询", br._heartbeat_reconnect(t0 + 200) is True)
+    check("成功后计数清零", br._reconnect_fails == 0 and br._next_reconnect_ts == float("-inf"))
 
 
 def test_blank_bubble_shot_is_not_sent() -> None:
@@ -3844,6 +4100,8 @@ def main() -> int:
                test_image_message_is_forwarded,
                test_photo_original_pick_is_conservative,
                test_blank_bubble_shot_is_not_sent,
+               test_offline_device_is_recovered_not_faked,
+               test_check_uses_configured_adb,
                test_image_decoders_match_fixtures,
                test_time_label_is_absolute_and_stable,
                test_wake_before_relaunch, test_keep_awake_heartbeat, test_confirm_sent_rule,

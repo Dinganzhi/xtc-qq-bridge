@@ -489,6 +489,8 @@ class ADBController:
         # uiautomator 同一时间只允许一个连接：跨线程串行化 dump，
         # 避免轮询线程与发送线程同时 dump 导致 "already registered"。
         self._dump_lock = threading.Lock()
+        # 心跳类日志的节流时间戳（key -> monotonic），避免"设备 offline"每 10 秒刷一次
+        self._log_once_ts: dict[str, float] = {}
 
     # ------------------------------------------------------------------ 基础
     def _base(self) -> list[str]:
@@ -559,8 +561,16 @@ class ADBController:
         """
         if self.is_connected():
             return True
+        # 设备处于 offline（transport 卡死）时，`adb connect` 只会回一句
+        # "already connected to ..."，光靠 connect 永远救不回来 —— 先做 disconnect + connect。
+        for s, st in self._safe_states().items():
+            if st == "offline":
+                if self._recover_offline(s, timeout):
+                    return True
         if self.serial:
-            return self._connect_one(self.serial, timeout)
+            if self._connect_one(self.serial, timeout):
+                return True
+            return self._recover_offline(self.serial, timeout)
 
         last_err = ""
         for p in (ports or self._port_candidates()):
@@ -601,19 +611,88 @@ class ADBController:
         return False
 
     def _adopt_serial(self, prefer: str = "") -> bool:
-        """从在线设备里挑一个（WSA/已有设备优先），成功后写入 self.serial。"""
-        serials = self.devices()
-        if prefer and prefer in serials:
+        """从**在线**设备里挑一个（WSA/已有设备优先），成功后写入 self.serial。
+
+        注意：不能只凭 `adb connect` 回的那句 "connected" 就认账 —— 设备 offline 时它
+        也会回 "already connected to ..."，照单全收就会一直"重连成功"却什么都读不到。
+        所以最终必须以"状态是 device"为准（状态表拿不到时退回在线设备列表，再不行用
+        get-state 直接问一次）。
+        """
+        states = self._safe_states()
+        online = [s for s, st in states.items() if st == "device"]
+        if not online:
+            try:
+                online = self.devices()
+            except AdbError:
+                online = []
+        if prefer and prefer in online:
             self.serial = prefer
             return True
-        if serials:
-            self.serial = self._pick_serial(serials)
+        if online:
+            self.serial = self._pick_serial(online)
             return True
-        # 列表暂时为空（WSA 刚 connect、枚举有延迟）也接受刚连上的目标：
-        # 它在本次 `adb connect` 里已被明确报告为 connected。
-        if prefer:
+        # 列表暂时为空（刚 connect、枚举有延迟）：直接问一次 get-state
+        if prefer and self._device_online(prefer):
             self.serial = prefer
             return True
+        return False
+
+    def _safe_states(self) -> dict:
+        """`adb devices` 的全部状态；取不到就返回空字典（不抛异常）。"""
+        try:
+            return self.device_states() or {}
+        except Exception:  # noqa: BLE001 自定义/桩实现可能没有这个方法
+            return {}
+
+    def _device_online(self, serial: str, tries: int = 3) -> bool:
+        """这个 serial 现在是不是**真的在线**（device，而不是 offline/unauthorized）。"""
+        if not serial:
+            return False
+        for i in range(max(1, tries)):
+            try:
+                out, _ = self._run(["-s", serial, "get-state"], timeout=8, check=False)
+            except AdbError:
+                return False
+            state = (out or "").strip().lower()
+            if state == "device":
+                return True
+            if state and state != "unknown":
+                return False          # offline / unauthorized：不用再等
+            time.sleep(0.4)           # 状态还没出来：给它一点时间（刚 connect 时常见）
+        return False
+
+    def _recover_offline(self, target: str, timeout: float = 8.0) -> bool:
+        """设备处于 offline（transport 卡死）时的分级恢复：disconnect+connect -> 重启 adb server。
+
+        实机（WSA `127.0.0.1:58526`）踩过：`adb devices` 一直显示 offline，`adb connect`
+        只回 "already connected to ..."，桥接于是每 10 秒"重连"一次却始终连不上，
+        日志刷"ADB 断连，尝试重连... / ADB 已重连"；手动 `adb disconnect` + `connect`
+        立刻恢复。这里把这一步自动化，避免"重连了个寂寞"。
+        """
+        if not target:
+            return False
+        self.logger.warning(f"设备 {target} 处于 offline，执行 disconnect + connect ...")
+        for args in (["disconnect", target], ["connect", target]):
+            try:
+                self._run(args, timeout=timeout, check=False)
+            except AdbError:
+                pass
+        if self._device_online(target):
+            self.serial = target
+            self.logger.info(f"设备 {target} 已恢复在线（disconnect + connect）")
+            return True
+        self.logger.warning(f"设备 {target} 仍然 offline，重启本机 adb server ...")
+        for args in (["kill-server"], ["start-server"], ["connect", target]):
+            try:
+                self._run(args, timeout=25, check=False)
+            except AdbError:
+                pass
+        if self._device_online(target, tries=6):
+            self.serial = target
+            self.logger.info(f"设备 {target} 已恢复在线（重启 adb server 后）")
+            return True
+        self.logger.warning(f"设备 {target} 仍是 offline：多半是 WSA 侧网络/子系统卡住，"
+                            "可在 WSA 设置里点「修复」或重启子系统")
         return False
 
     def _pick_serial(self, serials: list[str] | None = None) -> str:
@@ -638,8 +717,11 @@ class ADBController:
                 state = out.strip().lower()
                 if state == "device":
                     return True
-                # serial 失效（WSA 重启后端口会变）：清掉重新选
-                self.logger.warning(f"设备 {self.serial} 状态为 {state or 'unknown'}，重新选择设备")
+                # serial 失效（WSA 重启后端口会变）：清掉重新选。
+                # 这条会随 10 秒心跳反复出现，所以节流成 60 秒一次，避免刷屏。
+                self._log_throttled(
+                    f"state_{self.serial}",
+                    f"设备 {self.serial} 状态为 {state or 'unknown'}，重新选择设备", interval=60)
                 self.serial = ""
             serials = self.devices()
             if serials:
@@ -648,6 +730,14 @@ class ADBController:
             return False
         except AdbError:
             return False
+
+    def _log_throttled(self, key: str, msg: str, interval: float = 60.0) -> None:
+        """同一类提示最多每 interval 秒打一次（心跳类调用会非常频繁）。"""
+        last = self._log_once_ts.get(key, float("-inf"))
+        if time.monotonic() - last < interval:
+            return
+        self._log_once_ts[key] = time.monotonic()
+        self.logger.warning(msg)
 
     def ensure_connected(self, retries: int = 3, delay: float = 2.0,
                          auto_launch_wsa: bool = False,
@@ -1028,8 +1118,21 @@ class ADBController:
             pass
 
     # --------------------------------------------------------- App 启动 / 前台确认
-    def package_installed(self, package: str) -> bool:
-        out = self.try_shell(f"pm list packages {package}", timeout=20)
+    def package_installed(self, package: str, strict: bool = True) -> bool:
+        """设备上有没有装这个包。
+
+        strict=True（默认）：**命令本身失败时抛 AdbError**（ADB 断连 / 设备 offline），
+        绝不返回 False —— 否则调用方会把"读不到"误报成"没安装"。实机踩过：WSA 的
+        transport 变成 offline 后，日志每 10 秒刷一次"设备上没有安装 com.xtc.watch"，
+        其实 App 装得好好的。
+        strict=False：纯探测，失败就当作"没有"。
+        """
+        if strict:
+            out = self.shell(f"pm list packages {package}", timeout=20)
+        else:
+            out = self.try_shell(f"pm list packages {package}", timeout=20)
+            if not out:
+                return False
         return f"package:{package}" in out
 
     def _parse_resolved_activity(self, out: str, package: str) -> str:

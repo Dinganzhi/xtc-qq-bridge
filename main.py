@@ -207,7 +207,7 @@ def main() -> None:
     if args.check:
         print(f"版本: {__version__}")
         print(runtime_paths.describe())
-        sys.exit(run_check())
+        sys.exit(run_check(args.config))
 
     # 配置文件：命令行 > exe 旁边 > 当前目录 > 打包资源目录；缺失时从模板生成一份
     cfg_path = runtime_paths.resolve_config(args.config)
@@ -342,11 +342,26 @@ def main() -> None:
         log.info("已停止")
 
 
-def run_check() -> int:
+def run_check(config_path=None) -> int:
     from adb_controller import (ADBController, AdbError, IS_WINDOWS, available_launchers,
                                 platform_tag, waydroid_present, wsa_adb_port, wsa_installed)
+    # **必须和正常运行用同一套 adb 配置**：以前这里直接 ADBController() 自动探测，于是
+    # "检测用的 adb"和"桥接真正用的 adb"可能是两个不同的可执行文件（实机踩过：config 里
+    # 写的是 platform-tools，--check 却报 LDPlayer 自带的那个），排障时会被彻底带偏。
+    adb_cfg = {}
     try:
-        adb = ADBController()
+        cfg_path = runtime_paths.resolve_config(config_path)
+        if cfg_path.exists():
+            adb_cfg = (load_config(str(cfg_path)).get("adb") or {})
+    except Exception:  # noqa: BLE001 配置有问题时退回自动探测，别让自检本身失败
+        adb_cfg = {}
+    try:
+        adb = ADBController(adb_path=adb_cfg.get("path", ""),
+                            host=adb_cfg.get("host", "127.0.0.1"),
+                            port=int(adb_cfg.get("port", 5555)),
+                            serial=adb_cfg.get("serial", ""),
+                            extra_ports=adb_cfg.get("extra_ports") or [],
+                            wsa_port=int(adb_cfg.get("wsa_port", 0) or 0))
     except AdbError as e:
         print(f"FAIL 查找 adb: {e}")
         return 1

@@ -360,7 +360,13 @@ class Xiaotiancai:
             self.log("debug", "小天才 App 已在前台，跳过启动")
             return True
         self.log("info", f"小天才 App 不在前台，启动: {self.package}")
-        if not self.adb.package_installed(self.package):
+        try:
+            installed = self.adb.package_installed(self.package)
+        except AdbError as e:
+            # 读不到包列表 ≠ 没安装（ADB offline 时命令会失败）。别说成"没装"误导排障。
+            self.log("warning", f"无法确认小天才 App 是否已安装（ADB 连接异常）: {e}")
+            return False
+        if not installed:
             self.log("error", f"设备上没有安装 {self.package}（请先在模拟器/WSA 里安装并登录小天才 App）")
             return False
         last = ""

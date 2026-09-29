@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """消息桥接调度层：轮询小天才新消息 -> 转发（当前支持 log 打印 /
 AstrBot 插件端点两种模式），并负责去重、回声过滤与 ADB 断线重连。
 
@@ -204,6 +204,10 @@ class MessageBridge:
         except (TypeError, ValueError):
             self._keep_awake_interval = 10.0
         self._last_awake_poke = float("-inf")
+        # 断连重连的退避状态：设备真的连不上（如 WSA transport 卡成 offline）时，
+        # 不要每 10 秒就"重连一次"刷屏 + 白跑 12 个候选端口；失败后指数退避到最多 60 秒。
+        self._reconnect_fails = 0
+        self._next_reconnect_ts = float("-inf")
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
@@ -350,13 +354,7 @@ class MessageBridge:
                 if now - last_heartbeat >= self._heartbeat_interval:
                     last_heartbeat = now
                     if not self.adb.is_connected():
-                        self._log("warning", "ADB 断连，尝试重连...")
-                        try:
-                            self.adb.ensure_connected()
-                            self._log("info", "ADB 已重连")
-                        except Exception as e:  # noqa: BLE001
-                            self._log("error", f"重连失败: {e}")
-                            self._hint_wsa_reconnect()
+                        if not self._heartbeat_reconnect(now):
                             time.sleep(2)
                             continue
 
@@ -743,6 +741,35 @@ class MessageBridge:
         except Exception as e:  # noqa: BLE001 截图失败不影响文字转发
             self._log("warning", f"[表情包] 取图异常（按文字转发）: {e}")
             return None
+
+    def _heartbeat_reconnect(self, now: float) -> bool:
+        """心跳发现 ADB 断连时的重连 + 退避。返回 True=本轮继续轮询，False=跳过本轮。
+
+        退避的意义（实机踩过）：WSA 的 transport 卡成 offline 时，`adb connect` 只会回
+        "already connected to ..."，重连其实**救不回来**；旧实现每 10 秒就重跑一遍
+        "12 个候选端口 × 2 个 host"的连接尝试，日志刷屏且白等。现在失败一次就退避
+        （10/20/30…最多 60 秒），并且只在第一次与每次失败时各喊一声。
+        """
+        if now < self._next_reconnect_ts:
+            self._log("debug", "ADB 仍未恢复，等退避时间到再试")
+            return False
+        if self._reconnect_fails == 0:
+            self._log("warning", "ADB 断连，尝试重连...")
+        try:
+            self.adb.ensure_connected()
+        except Exception as e:  # noqa: BLE001
+            self._reconnect_fails += 1
+            backoff = min(60.0, 10.0 * self._reconnect_fails)
+            self._next_reconnect_ts = now + backoff
+            self._log("error", f"重连失败（连续 {self._reconnect_fails} 次）: "
+                               f"{str(e).splitlines()[0][:160]}；{backoff:.0f} 秒后再试")
+            self._hint_wsa_reconnect()
+            return False
+        self._log("info", "ADB 已重连" if self._reconnect_fails == 0
+                          else f"ADB 已重连（第 {self._reconnect_fails + 1} 次尝试）")
+        self._reconnect_fails = 0
+        self._next_reconnect_ts = float("-inf")
+        return True
 
     def _hint_wsa_reconnect(self) -> None:
         """WSA/WSABuilds 反复断网时的提示（只提示一次）。"""

@@ -154,5 +154,9 @@ emoji:
 
 # ---------- WSA / WSABuilds 断网怎么办 ----------
 # 本项目**不再自带网络守护工具**。WSA 断网时手工处理即可（桥接会自动重连 ADB 继续工作）：
-#   1) 在 WSA 设置里点「修复」或直接重启子系统（任务管理器结束 WsaClient 再打开也行）；
-#   2) 或 `adb connect 127.0.0.1:58526` 手动重连一次，多数情况立刻恢复。
+#   1) `adb devices` 显示 offline 时：先 `adb disconnect 127.0.0.1:58526` 再 `adb connect 127.0.0.1:58526`
+#      （只跑 connect 没用，它只会回 "already connected"）；桥接现在也会自己这么做。
+#   2) 还不行就在 WSA 设置里点「修复」或重启子系统。
+# 另外建议：这里的 adb.path、你手动敲的命令、其它工具用的 adb 尽量是同一个 adb.exe ——
+# 不同来源的 adb 会在 5037 端口抢 server，表现就是设备一会儿在线一会儿掉线。
+# `python main.py --check` 会打印桥接实际使用的 adb 路径，排障时以它为准。

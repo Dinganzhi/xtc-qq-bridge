@@ -79,6 +79,12 @@ class FakeAdb:
         if not args:
             return "", ""
         cmd = args[0]
+        if args[:1] == ["-s"] and args[2:3] == ["get-state"]:
+            # 真机行为：`adb -s <serial> get-state` 直接问这台设备的状态
+            # （桥接用它确认"连上了"到底是不是真的在线，而不是 offline）
+            if not self.connected:
+                return "", "adb: device offline\n"
+            return "device\n", ""
         if cmd == "devices":
             # listed=False：设备尚未注册到 adb server（WSA 刚开机/重启后的真实情形）
             visible = self.connected and self.listed

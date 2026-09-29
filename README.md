@@ -409,10 +409,18 @@ WSA（含 WSABuilds / MagiskOnWSA）跑久了会"隔三差五断网"：宿主侧
 
 | 顺序 | 做法 | 说明 |
 |---|---|---|
-| 1 | WSA 设置 → 「修复」 | 最快，多数情况一次就好 |
-| 2 | 重启子系统：任务管理器结束 `WsaClient` 再打开，或 `adb reboot` | 约 30~90 秒；桥接会自动重连并重新打开聊天页 |
-| 3 | 手动重连一次：`adb connect 127.0.0.1:58526` | 只是 adb 掉线时够用 |
+| 1 | `adb disconnect 127.0.0.1:58526` 然后 `adb connect 127.0.0.1:58526` | **先看这一步**：`adb devices` 里显示 `offline` 就是 transport 卡死，这一下通常立刻恢复（桥接现在也会自己这么做） |
+| 2 | WSA 设置 → 「修复」 | 上一步无效时用，多数情况一次就好 |
+| 3 | 重启子系统：任务管理器结束 `WsaClient` 再打开，或 `adb reboot` | 约 30~90 秒；桥接会自动重连并重新打开聊天页 |
 
+> **`adb devices` 显示 `offline` 时不要只跑 `adb connect`**：它只会回一句
+> "already connected to ..."，设备其实还是 offline（旧版桥接因此每 10 秒"重连"一次却始终连不上）。
+> 正确顺序是先 `disconnect` 再 `connect`，不行再重启 adb server。
+>
+> **只用同一个 adb**：config.yaml 的 `adb.path`、你手动敲的命令、以及其它工具（模拟器自带 adb）
+> 最好都是同一个 `adb.exe`。不同来源的 adb 会在 5037 端口上抢 server，表现就是设备一会儿在线一会儿掉线。
+> `python main.py --check` 现在会打印**桥接实际使用**的那个 adb 路径，排障时以它为准。
+>
 > **为什么不用 ping 判断断网**：WSA 的 NAT **不转发 ICMP** —— 镜像里 `/system/bin/ping` 存在、
 > IP 与默认网络都正常，但 ping 公共地址**永远 100% 丢包**，所以"ping 不通"完全不能说明断网。
 >
@@ -560,7 +568,9 @@ WSA（含 WSABuilds / MagiskOnWSA）跑久了会"隔三差五断网"：宿主侧
 |---|---|
 | `adb devices` 为空 | 目标没开 ADB 调试（模拟器设置 / WSA 的 Developer mode / 真机的 USB 调试）。先跑 `python main.py --check`，它会按平台给出具体建议（含 Linux 的 udev 规则做法） |
 | `adb devices` 显示 `unauthorized` | 在目标设备/子系统窗口里点「允许 USB 调试」；真机可在手机上撤销授权后重新插拔 |
-| **WSA / WSABuilds 隔三差五断网** | 桥接会自动重连 ADB，但网络栈死了得 WSA 自己救：在 WSA 设置里点「修复」或重启子系统（见「WSA 断网怎么办」）。只想看状态可 `adb devices` / `python main.py --check` |
+| **WSA / WSABuilds 隔三差五断网** | 桥接会自动重连 ADB，但网络栈死了得 WSA 自己救：先 `adb disconnect 127.0.0.1:58526` + `adb connect 127.0.0.1:58526`，不行再在 WSA 设置里点「修复」或重启子系统（见「WSA 断网怎么办」） |
+| **日志一直刷"ADB 断连，尝试重连…/ ADB 已重连"** | 已修复：`adb devices` 里设备是 `offline` 时，`adb connect` 只会回 "already connected to ..."，而旧版把这句话当成"重连成功"，于是每 10 秒循环一次却始终读不到界面。现在会**真的确认状态**（`get-state` 必须是 device），并自动 `disconnect` + `connect`（必要时重启 adb server）；真连不上时按 10→20→…→60 秒退避，不再刷屏 |
+| **日志说"设备上没有安装 com.xtc.watch"但其实装得好好的** | 已修复：那是 ADB 读不到包列表（连接异常）被误报成"没安装"。现在读不到会明确说「无法确认…（ADB 连接异常）」，而"没安装"只在真的查不到该包时才说 |
 | WSA 报 `10061` 端口被拒 | Hyper-V 抢占端口：`netsh int ipv4 add excludedportrange protocol=tcp startport=<端口> numberofports=1` + 重启（见「Windows」小节） |
 | **自动登录不生效** | (1) 看日志有没有 `检测到小天才未登录，触发自动登录`；(2) 若提示"没有配置账密"，补 `xiaotiancai.login.phone/password`；(3) 若提示超时/安全验证，程序会按 `login_retry_interval` / `login_retry_after_risk` 自动重试，不需要重启；(4) 确认 `xiaotiancai.auto_login: true`（QQ 发 `/小天才 自动登录` 可切换，日志会打印当前状态） |
 | **明明在登录中却提示"登录失败"** | 已修复：出现"登录中/正在验证/请稍候"等进度文案时**一律不判失败**；只有明确的账号/密码错误才算失败，网络类临时问题按"超时->稍后重试"处理。若仍误报，把该文案加进 `xiaotiancai.ui.login_progress_markers` |
