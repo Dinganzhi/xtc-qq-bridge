@@ -2585,6 +2585,9 @@ class Xiaotiancai:
                 if b:
                     fail_hints.append((b[1], b[3]))
         out: list[dict] = []
+        all_bubbles = [x for x in root.iter("node")
+                       if self._id_tail(x) == "chat_msg_item_content"
+                       and self._bounds(x) is not None]
         for n in root.iter("node"):
             if self._id_tail(n) != "chat_msg_item_content":
                 continue
@@ -2631,8 +2634,12 @@ class Xiaotiancai:
                 if d_bottom <= b[1] + 5:
                     time_label = d_text
                     break
+            # 身份标签（`own_label`）：**这条消息自己的**时间，取法和实时路径
+            # （`_latest_in_chat` -> `_label_for_bubble`）完全一致。补发与实时两条路径
+            # 必须用同源同格式的身份，否则同一条消息会被各转发一次（实测踩过）。
+            own_label = self._label_for_bubble(n, dates, all_bubbles)
             out.append({"text": t, "is_own": is_own, "contact": contact,
-                        "time_label": time_label, "y_bottom": b[3],
+                        "time_label": time_label, "own_label": own_label, "y_bottom": b[3],
                         "sticker": is_sticker, "image": is_image, "bounds": b})
         out.sort(key=lambda it: it["y_bottom"])
         return out

@@ -305,7 +305,9 @@ class MessageBridge:
                     # （最长 30 秒），放在轮询线程里会把"读屏"一起拖住。
                     _, f_contact, f_text, f_label = job[:4]
                     f_sticker = job[4] if len(job) > 4 else None
-                    self._do_forward_job(f_contact, f_text, f_label, sticker=f_sticker)
+                    f_disp = job[5] if len(job) > 5 else ""
+                    self._do_forward_job(f_contact, f_text, f_label, sticker=f_sticker,
+                                         display_label=f_disp)
                 elif kind == "login":
                     _, request_id = job
                     self._do_login_job(request_id)
@@ -496,8 +498,12 @@ class MessageBridge:
                                     self._op_lock.release()
                         else:
                             sticker = None
-                        # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
-                        self._queue_forward(contact, text, time_label, sticker=sticker)
+                        # 异步转发。**身份标签用归一化后的绝对时间**（与补发路径完全一致）：
+                        # 以前这里传的是原始标签（如 "21:55"），而补发用的是绝对标签
+                        # （"09-29 21:55"）—— 两条路径算出的去重键不同，于是同一条消息
+                        # 会被"补发 + 实时"各转发一次（用户报的"2 转发了两遍"就是这么来的）。
+                        self._queue_forward(contact, text, label, sticker=sticker,
+                                            display_label=time_label)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             # 只补"剩下的"时间：一轮里 dump+转发可能已花 3~4 秒，再无条件 sleep
@@ -567,13 +573,16 @@ class MessageBridge:
                 pass
             if self._xtc_cmd_prefix and text.startswith(self._xtc_cmd_prefix):
                 continue                            # 命令文本由命令流程处理
-            # 身份与显示都用**绝对时间**（理由同 live 路径：App 的标签会随日期变化）
-            raw_lbl = (it.get("time_label") or "").strip()
-            lbl = self._abs_time_label(raw_lbl) or raw_lbl
-            if self._in_store(contact, text, lbl):
+            # 身份用**这条消息自己的时间**（`own_label`，与实时路径的 `_label_for_bubble` 同源），
+            # 显示用"它上方最近的时间标签"（`time_label`，App 的分组标签，显示更准）。
+            # 两条路径的身份必须**同源同格式**，否则同一条消息会被"补发 + 实时"各发一次。
+            own_lbl = (it.get("own_label") or "").strip()
+            disp_lbl = (it.get("time_label") or "").strip()
+            ident = self._abs_time_label(own_lbl) or own_lbl
+            if self._in_store(contact, text, ident):
                 break                               # 撞库 -> 停，不再往上翻
-            if self.dedup.seen(("xtc", contact or "", text, lbl)):
-                # 刚试过（120 秒内，多为上次转发失败）：本轮先跳过它，
+            if self.dedup.seen(("xtc", contact or "", text, ident)):
+                # 刚试过（120 秒内：正在发的、或上次转发失败的）：本轮先跳过它，
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
@@ -581,9 +590,9 @@ class MessageBridge:
             sticker = None
             if it.get("sticker") or it.get("image"):
                 sticker = self._capture_sticker(root, text,
-                                                near_epoch=self._label_epoch(raw_lbl),
+                                                near_epoch=self._label_epoch(disp_lbl or own_lbl),
                                                 backlog=True)
-            pending.append((text, lbl, sticker))
+            pending.append((text, ident, sticker, disp_lbl))
 
         if not pending:
             return 0
@@ -595,11 +604,11 @@ class MessageBridge:
         self._log("info", f"[补发] 有 {len(pending)} 条消息库里没有，按时间顺序补发")
 
         sent = 0
-        for text, label, sticker in pending:
+        for text, label, sticker, disp in pending:
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
-                              f"时间={label or '(无)'} 内容={text!r}（补发）")
+                              f"时间={disp or label or '(无)'} 内容={text!r}（补发）")
             # 异步转发：不阻塞读屏（见 _queue_forward）
-            self._queue_forward(contact, text, label, sticker=sticker)
+            self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
             sent += 1
         return sent
 
@@ -621,24 +630,31 @@ class MessageBridge:
                 self._op_lock.release()
 
     def _queue_forward(self, contact: str, text: str, label: str,
-                       sticker: dict | None = None) -> None:
+                       sticker: dict | None = None, display_label: str = "") -> None:
         """把"小天才 -> QQ"的转发丢给工作线程，立刻返回。
 
         为什么异步：插件要等 QQ 侧真实发送结果才回包（最长 30 秒），同步做的话
         轮询线程会被卡住，读屏/检测跟着变慢（转发越快，漏消息窗口也越小）。
         这里立刻 short-term 去重，避免下一轮把同一条再入队。
 
+        label：**身份标签**（归一化的绝对时间，实时与补发两条路径必须同源同格式）。
+        display_label：显示用的标签（App 的分组标签，显示更准）；留空则用 label。
         sticker：表情图（{data, kind, animated, source}）。**必须在轮询线程里取**——
         那一刻界面快照/气泡位置才准、缓存里刚写进来的文件也还在；没有它就按文字发。
         """
         self.dedup.mark(("xtc", contact or "", text, label or ""))
-        self._job_queue.put(("forward", contact, text, label or "", sticker))
+        self._job_queue.put(("forward", contact, text, label or "", sticker,
+                             display_label or label or ""))
 
     def _do_forward_job(self, contact: str, text: str, label: str,
-                        sticker: dict | None = None) -> None:
-        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。"""
+                        sticker: dict | None = None, display_label: str = "") -> None:
+        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。
+
+        label 是身份标签（去重/历史都用它），display_label 只用于给 QQ 那条消息的抬头时间。
+        """
+        disp = display_label or label
         try:
-            ok = self._forward(contact, text, label, sticker=sticker)
+            ok = self._forward(contact, text, disp, sticker=sticker)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
             ok = False
@@ -647,7 +663,7 @@ class MessageBridge:
             return
         self.history.mark("xtc", contact or "", text, label or "")
         if not self.msgs.seen(text, "xtc"):
-            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(label),
+            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
                              source=self._xtc_source(contact), source_id=contact or "")
 
     def _warm_emoji_store(self) -> None:
@@ -680,6 +696,13 @@ class MessageBridge:
         if not self._emoji_image:
             return None
         is_image = (text or "").strip() == getattr(self.xtc, "IMAGE_TEXT", "图片")
+        is_sticker = (text or "").strip().startswith("表情")
+        if not (is_image or is_sticker):
+            # 防呆：文字消息**绝不能**取图。以前实时路径对每条消息都调这里，而下面
+            # `sticker_of_latest(root, "")` 会退化成"屏幕上最新那张贴纸"—— 于是发一条
+            # "2" 时把上一条消息的表情包一起发了出去（用户报的"附带前面一条消息的表情包"）。
+            self._log("debug", f"这条不是表情/图片消息（{text[:24]!r}），不取图")
+            return None
         name = (text or "").strip()
         if name.startswith("表情"):
             name = name[len("表情"):].strip()

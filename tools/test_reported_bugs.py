@@ -2055,6 +2055,91 @@ def test_offline_device_is_recovered_not_faked() -> None:
     check("成功后计数清零", br._reconnect_fails == 0 and br._next_reconnect_ts == float("-inf"))
 
 
+def test_live_and_backlog_share_message_identity() -> None:
+    """同一条消息不能被"实时 + 补发"各转发一次。
+
+    实测（用户报的"2 转发了两遍，而且第二遍还带着上一条的表情包"，日志 21:58:32）：
+    实时路径拿 App 的**原始标签**（"21:55"、甚至为空）当身份，补发路径拿**绝对标签**当身份，
+    两边算出的去重键不同 -> 同一条消息被两次入队；而且两条路径对"这条消息自己的时间"
+    的取法也不同（`_chat_bubbles` 取"上方最近的标签"，`_latest_in_chat` 取"真正属于自己的标签"）。
+    现在两条路径统一用 `own_label`（归一化成绝对时间）当身份。
+    """
+    root = tmp_root()
+    xml = node_xml(
+        n(cls="android.widget.TextView", text="19:52",
+          rid="com.xtc.watch:id/tv_chat_msg_item_date", bounds="[542,340][600,370]")
+        + n(cls="android.widget.TextView", text="2", desc="屑猹不喝茶发的消息,2",
+            rid="com.xtc.watch:id/chat_msg_item_content", bounds="[542,380][600,428]"))
+    try:
+        xtc, _adb = make_xtc(xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        root_el = ET.fromstring(xml)
+        it = xtc._chat_bubbles(root_el)[0]
+        live_label = xtc._latest_in_chat(root_el)[2]
+        check("两条路径对「这条消息自己的时间」取法一致",
+              it.get("own_label") == live_label, f"{it.get('own_label')!r} vs {live_label!r}")
+
+        class _Fwd:
+            def __init__(self):
+                self.sent: list = []
+
+            def send_detail(self, t, i, m):
+                self.sent.append(m)
+                return True, ""
+
+            def send_image(self, t, i, b, caption=""):
+                self.sent.append(caption or "image")
+                return True, ""
+
+        fwd = _Fwd()
+        br = _backlog_bridge(root, fwd, [dict(it)])
+        # 模拟"实时路径刚把这条入队"：它现在用的是同一个绝对身份打去重标记
+        label = br._abs_time_label(it.get("own_label") or "") or ""
+        br.dedup.mark(("xtc", "屑猹不喝茶", "2", label))
+        sent_n = br._forward_backlog(ET.fromstring(xml), "屑猹不喝茶")
+        check("补发不会把实时已入队的同一条再发一遍", sent_n == 0 and not fwd.sent,
+              f"n={sent_n} sent={fwd.sent}")
+    finally:
+        cleanup(root)
+
+
+def test_text_message_never_gets_media() -> None:
+    """文字消息**绝不能**附带表情/图片。
+
+    实测（同一条日志）：发一条文本 "2"，转发时却带上了**上一条消息的表情包** ——
+    因为 `_capture_sticker` 对任何消息都会退化成"屏幕上最新那张贴纸"
+    （`sticker_of_latest(root, "")`）。现在入口处就挡住"非表情/非图片"的消息。
+    """
+    root = tmp_root()
+    chat = node_xml(
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]")
+        + n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,图片消息，双击查看",
+            rid="com.xtc.watch:id/chat_msg_item_content", bounds="[500,420][640,600]")
+        + n(cls="android.widget.TextView", text="2", desc="屑猹不喝茶发的消息,2",
+            rid="com.xtc.watch:id/chat_msg_item_content", bounds="[542,640][600,688]"))
+    try:
+        xtc, adb = make_xtc(chat, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+        adb.screencap_crop_png = lambda box: _fake_shot()
+        cfg = {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+               "xiaotiancai": {"ui": {}}, "webhook": {}, "emoji": {"forward_image": True}}
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=None, logger=None)
+        br.xtc = xtc
+        br._emoji_from_data = True
+        br._emoji_store = type("S", (), {
+            "find": lambda self, *a, **k: {"data": b"GIF89a" + b"x" * 400, "kind": "gif",
+                                           "w": 90, "h": 90, "animated": True,
+                                           "path": "/x.cnt", "source": "cache", "score": 0.99},
+            "find_photo": lambda self, **k: None,
+            "index_ready": lambda self: True,
+            "name_is_unique": lambda self, name: False})()
+        root_el = ET.fromstring(chat)
+        check("文字消息不会去取图（哪怕屏幕上正好有一张表情）",
+              br._capture_sticker(root_el, "2") is None)
+        check("图片消息仍然取图", br._capture_sticker(root_el, xtc.IMAGE_TEXT) is not None)
+    finally:
+        cleanup(root)
+
+
 def test_backlog_media_uses_fresh_dump() -> None:
     """补发取图必须**重新读一次界面**，并且把发送线程挡在外面。
 
@@ -2136,8 +2221,8 @@ def test_backlog_media_uses_fresh_dump() -> None:
         adb.bridge = br
         br._emoji_from_data = True
         # 测试里没有工作线程：入队改成同步执行（与 _backlog_bridge 一致）
-        br._queue_forward = lambda c, t, l, sticker=None: br._do_forward_job(
-            c, t, l, sticker=sticker)
+        br._queue_forward = lambda c, t, l, sticker=None, display_label="": br._do_forward_job(
+            c, t, l, sticker=sticker, display_label=display_label)
         br._emoji_store = type("S", (), {
             "find_photo": lambda self, **k: None,
             "find": lambda self, *a, **k: None,
@@ -2163,8 +2248,8 @@ def test_backlog_media_uses_fresh_dump() -> None:
         br2._cmd_done_file = str(root / f"{prefix}cmd_done2.json")
         adb2.bridge = br2
         br2._emoji_from_data = True
-        br2._queue_forward = lambda c, t, l, sticker=None: br2._do_forward_job(
-            c, t, l, sticker=sticker)
+        br2._queue_forward = lambda c, t, l, sticker=None, display_label="": br2._do_forward_job(
+            c, t, l, sticker=sticker, display_label=display_label)
         real_shot = _png_pattern(136, 180, (235, 235, 235), (20, 20, 100, 100), (40, 30, 200))
         adb2.screencap_crop_png = lambda box: real_shot
         br2._emoji_store = type("S", (), {
@@ -4082,8 +4167,8 @@ def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
     br._catchup_max = catchup_max
     # 线上是"入队 + 工作线程异步转发"；测试里没有工作线程，
     # 这里把入队替换成同步执行，逻辑（撞库判定/入库/顺序）保持一致。
-    br._queue_forward = lambda c, t, l, sticker=None: br._do_forward_job(
-        c, t, l, sticker=sticker)
+    br._queue_forward = lambda c, t, l, sticker=None, display_label="": br._do_forward_job(
+        c, t, l, sticker=sticker, display_label=display_label)
     for t in (known or []):
         br.msgs.append("xtc", "屑猹不喝茶", t)
     return br
@@ -4111,7 +4196,8 @@ def test_backlog_walk_until_known() -> None:
             return self.ok, ""
 
     def bubbles(*texts):
-        return [{"text": t, "time_label": "19:52"} for t in texts]
+        # own_label = 这条消息自己的时间（身份用）；time_label = App 分组标签（显示用）
+        return [{"text": t, "time_label": "19:52", "own_label": "19:52"} for t in texts]
 
     try:
         fwd = _Fwd()
@@ -4260,6 +4346,8 @@ def main() -> int:
                test_photo_original_pick_is_conservative,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
+               test_live_and_backlog_share_message_identity,
+               test_text_message_never_gets_media,
                test_offline_device_is_recovered_not_faked,
                test_check_uses_configured_adb,
                test_image_decoders_match_fixtures,
