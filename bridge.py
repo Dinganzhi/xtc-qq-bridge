@@ -762,9 +762,11 @@ class MessageBridge:
                 try:
                     bw = item["bounds"][2] - item["bounds"][0] if item else 0
                     bh = item["bounds"][3] - item["bounds"][1] if item else 0
+                    # allow_now=True（补发也一样）：App 显示图片时会把原图重新写进缓存，
+                    # 所以"正在看的那张"必定刚写过；补发往往只是轮询晚了几秒而已。
+                    # 真老的照片没有新鲜文件，自然落到"发气泡截图"兜底。
                     got = self._emoji_store.find_photo(near_epoch=near_epoch, aspect=aspect,
-                                                       min_px=max(bw, bh),
-                                                       allow_now=not backlog)
+                                                       min_px=max(bw, bh))
                 except Exception as e:  # noqa: BLE001 取不到就退回截图
                     self._log("debug", f"找照片原图失败（改用截图）: {e}")
                     got = None

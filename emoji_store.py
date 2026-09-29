@@ -56,7 +56,7 @@ class EmojiStore:
                  strict_secs: float = 120.0, match_stop: float = 0.90,
                  head_bytes: int = 64 * 1024, photo_min_bytes: int = 60 * 1024,
                  photo_max_bytes: int = 16 * 1024 * 1024,
-                 photo_window: float = 90.0, photo_tie_secs: float = 15.0):
+                 photo_window: float = 600.0):
         self.adb = adb
         self.package = package
         self.logger = logger
@@ -80,7 +80,6 @@ class EmojiStore:
         self.photo_min_bytes = max(1024, int(photo_min_bytes))
         self.photo_max_bytes = max(self.photo_min_bytes, int(photo_max_bytes))
         self.photo_window = max(10.0, float(photo_window))
-        self.photo_tie_secs = max(0.0, float(photo_tie_secs))
         self._index: dict[str, list[str]] = {}            # desc 名字 -> [big/<code> ...]
         self._index_ts = float("-inf")
         # path -> (mtime, info, [网格...])：核对过的候选不必重复解码
@@ -220,32 +219,42 @@ class EmojiStore:
 
     def find_photo(self, near_epoch: float | None = None, aspect: float | None = None,
                    min_px: int = 0, window: float | None = None,
-                   min_bytes: int | None = None, allow_now: bool = True) -> dict | None:
+                   min_bytes: int | None = None,
+                   allow_now: bool = True) -> dict | None:
         """找这张**照片**的原图（缓存里的大图）。没有可信候选返回 None。
 
-        为什么不能像贴纸那样比像素：照片动辄 2000x3000，纯 Python "只解 DC" 一张
-        2MB 的 JPEG 实测要 **37 秒**（79k 个块），根本来不及。所以这条路改用三条硬条件：
-        ① 比气泡更大（气泡是屏幕上的缩略渲染）；② 形状与气泡一致（App 按图片比例画气泡）；
-        ③ 写入时间就在**消息时间**附近（文件是消息显示时下载进来的）。
-        而且只接受**唯一**候选：有第二张同样符合条件的就返回 None —— 调用方退回
-        发气泡截图（一定是对的，只是清晰度低），**绝不赌**。
+        为什么不逐张比像素：照片动辄 2000x3000，纯 Python "只解 DC" 一张 2MB 的 JPEG
+        实测要 **37 秒**（79k 个块）；试过"只解上段"（前 24 行 MCU，约 5 秒/张）也不划算 ——
+        实测正确那张只有 0.70 相似度（界面气泡与照片本体的取景/圆角差异），与其他照片
+        0.51~0.63 分不开，还会把一次取图拖到 47 秒。所以这里用**时间信号**，它足够决定性：
 
-        allow_now：消息没有时间标签时是否允许拿"刚刚写进缓存"当依据。实时读到的新消息
-        可以（文件就是刚下载的）；**补发老消息**时必须 False —— 那时"刚写进来"的图可能
-        只是界面重新渲染的**别的**照片。
+        实测（2026-09-29 22:02 那条照片）各候选的"水位"（= 现在 - 文件 mtime）：
+            正确那张 9 秒，其余分别是 86616 / 93982 / 523202 秒（1~6 天）。
+        原因：App 显示图片时会把原图重新写进缓存，所以**正在看的那张必然刚写过**。
+
+        判定规则（宁可不发，也不发错）：
+          ① 比气泡更大（气泡是屏幕上的缩略渲染）+ 形状与气泡一致（±12%）；
+          ② 文件 mtime 要跟**这条消息自己的时间**或**设备当前时间**对得上（±`photo_window`，
+             默认 10 分钟）—— 前者覆盖"收到时写进缓存"，后者覆盖"App 重新渲染时重写了缓存"；
+          ③ 符合的候选**只能有一张**：有两张以上就判定歧义，退回发气泡截图。
+
+        allow_now：消息没有时间标签时，是否允许拿"刚刚写过"当依据。实时与补发都该允许 ——
+        补发常常只是"轮询晚了几秒"（实测那条 22:02 的照片就是走补发路径发出的），
+        文件同样刚写过；真老的照片本来就没有新鲜文件，自然落到截图兜底。
         """
-        if near_epoch:
-            target = float(near_epoch)
-        elif allow_now:
-            target = time.time()
-        else:
-            return None
         win = float(window if window is not None else self.photo_window)
-        rows, _now = self._cache_listing(max_bytes=self.photo_max_bytes,
-                                         min_bytes=int(min_bytes or self.photo_min_bytes))
+        rows, dev_now = self._cache_listing(max_bytes=self.photo_max_bytes,
+                                            min_bytes=int(min_bytes or self.photo_min_bytes))
+        # 参照时刻：① 这条消息自己的时间（文件可能在"收到时"写进缓存）；
+        # ② **设备当前时间**（App 重新渲染时会重写缓存文件）。两个都算"对得上"。
+        targets = [float(near_epoch)] if near_epoch else []
+        if allow_now:
+            targets.append(dev_now)
+        if not targets:
+            return None
         cands: list[tuple] = []
         for mtime, size, path in rows:
-            d = abs(mtime - target)
+            d = min(abs(mtime - t) for t in targets)
             if d > win:
                 continue
             info = self.sniff(self._read_head(path))
@@ -261,8 +270,10 @@ class EmojiStore:
         if not cands:
             return None
         cands.sort()
-        if len(cands) > 1 and cands[1][0] - cands[0][0] <= self.photo_tie_secs:
-            self._log("info", "[图片] 缓存里有不止一张时间相近的大图，不猜，改用气泡截图")
+        if len(cands) > 1:
+            # 窗内不止一张 -> 分不清是哪张（例如刚翻过好几张照片），不猜
+            self._log("info", f"[图片] 缓存里有 {len(cands)} 张'刚写过'的大图，分不清是哪张，"
+                              "改用气泡截图")
             return None
         d, _neg, mtime, size, path, info = cands[0]
         data = self._read(path)

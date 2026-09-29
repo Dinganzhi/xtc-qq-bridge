@@ -1662,7 +1662,7 @@ def test_image_message_is_forwarded() -> None:
             def __init__(self, photo):
                 self.photo = photo
 
-            def find_photo(self, near_epoch=None, aspect=None, min_px=0, allow_now=True):
+            def find_photo(self, near_epoch=None, aspect=None, min_px=0, allow_now=True, reference=None):
                 return self.photo
 
         big = {"data": b"\xff\xd8\xff" + b"p" * 4000, "kind": "jpeg", "w": 1944, "h": 2592,
@@ -1700,7 +1700,7 @@ def test_image_message_is_forwarded() -> None:
               bool(got3) and got3["source"] == "screenshot" and got3.get("label") == "图片"
               and shot["n"] - before3 == 1,
               str(got3 and {k: v for k, v in got3.items() if k != "data"}))
-        # 补发老消息：不允许拿"刚写进缓存的大图"当依据（那时它可能是别的照片）
+        # 照片原图允许拿"刚写进缓存的大图"当依据（App 显示图片时会重写缓存文件）
         seen_allow: list = []
 
         class _Store2(_Store):
@@ -1710,9 +1710,10 @@ def test_image_message_is_forwarded() -> None:
 
         br._emoji_photo = True
         br._emoji_store = _Store2(None)
-        br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT, backlog=True)
-        check("补发时不允许'拿刚写进来的图猜'（allow_now=False）",
-              seen_allow == [False], str(seen_allow))
+        br._capture_sticker(ET.fromstring(img_xml), xtc.IMAGE_TEXT)
+        # 实测（22:02 那条照片）就是走补发路径发出的；此前因为补发传 allow_now=False
+        # 直接放弃，才退化成 136x180 的气泡截图
+        check("取照片原图时允许用'刚写进缓存'作为依据", seen_allow == [True], str(seen_allow))
 
         # ④ 关掉表情图总开关 -> 一个图都不取
         cfg4 = dict(cfg)
@@ -1788,15 +1789,37 @@ def test_photo_original_pick_is_conservative() -> None:
         near_epoch=now - 5, aspect=1.0, min_px=180)
     check("形状对不上就不取", got3 is None, str(got3))
 
-    # 时间对不上 -> 不取
+    # 消息时间对不上（1 小时前），但缓存里那张**刚被 App 重写过**且是唯一候选 -> 仍然采用：
+    # App 重新渲染图片时会重写缓存文件，mtime 并不等于消息时间（实测 22:02 的照片就是这样）
     got4 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
         near_epoch=now - 3600, aspect=136 / 180, min_px=180)
-    check("时间对不上就不取", got4 is None, str(got4))
+    check("消息时间对不上、但那张刚被重写过（唯一）-> 采用",
+          bool(got4) and got4["path"] == photo_p, str(got4 and got4.get("path")))
+    # 缓存里没有任何"刚写过"的候选（消息时间也对不上）-> 不取
+    listing_old = f"{now - 7200} {len(photo)} {photo_p}\n{now - 8000} {len(sticker)} {sticker_p}"
+    got4b = EmojiStore(FakeAdb(listing_old), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=now - 3600, aspect=136 / 180, min_px=180)
+    check("时间都对不上就不取", got4b is None, str(got4b and got4b.get("path")))
 
-    # 补发老消息、又没有时间标签 -> 连"刚写进来的"也不许用
+    # 补发老消息、又没有时间标签 -> 连"刚写进来的"也不许用（显式关掉时）
     got5 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
         near_epoch=None, aspect=136 / 180, min_px=180, allow_now=False)
     check("allow_now=False 时不拿'刚写进来'当依据", got5 is None, str(got5))
+
+    # ★ 默认（allow_now=True、消息没有时间标签）：窗内只有一张"刚写过"的大图 -> 就用它。
+    #   实测 2026-09-29 22:02 那条照片：正确那张水位 9 秒，其余是 1~6 天前，
+    #   此前因为补发传了 allow_now=False，才白白退化成了 136x180 的气泡截图。
+    got6 = EmojiStore(FakeAdb(listing), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=None, aspect=136 / 180, min_px=180)
+    check("没有时间标签时，窗内唯一的那张'刚写过'的大图会被采用",
+          bool(got6) and got6["path"] == photo_p and got6["source"] == "cache-photo",
+          str({k: v for k, v in (got6 or {}).items() if k != "data"}))
+    # 窗内有两张"刚写过"的大图 -> 分不清，宁可发截图
+    listing_fresh2 = (f"{now - 9} {len(photo)} {photo_p}\n"
+                      f"{now - 20} {len(other)} {other_p}")
+    got7 = EmojiStore(FakeAdb(listing_fresh2), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=None, aspect=136 / 180, min_px=180)
+    check("窗内有两张'刚写过'的大图时不猜（退回截图）", got7 is None, str(got7))
 
 
 def test_check_uses_configured_adb() -> None:
