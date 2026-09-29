@@ -108,7 +108,8 @@ class EmojiStore:
         return bool(self._index) and (time.monotonic() - self._index_ts) < self.index_ttl
 
     def find(self, name: str = "", near_epoch: float | None = None,
-             aspect: float | None = None, reference: bytes | None = None) -> dict | None:
+             aspect: float | None = None, reference: bytes | None = None,
+             verified_only: bool = False) -> dict | None:
         """找这张表情的原图，返回 {data, kind, w, h, animated, path, source, score}。
 
         name：界面 content-desc 里的表情名（如 '流汗'）。
@@ -116,6 +117,9 @@ class EmojiStore:
         aspect：屏幕上那个表情气泡的宽高比（没有基准图时用来排除照片）。
         reference：**界面上那张气泡的截图**（PNG 字节）。给了它就逐个候选比像素，
         只有真的像才敢发 —— 这是"货不对板"（小猫发成乌龟）的根治办法。
+        verified_only：**只接受能被证明的候选**（表情包名字唯一命中，或像素比对通过）。
+        调用方"明明看得到气泡、却没抠到可用的截图"时传 True —— 那时按时间猜缓存
+        很可能猜错（实测错过一次），宁可退化成发文字。
 
         拿不到可信的原图时返回 None，调用方退回"就发这张气泡截图"。
         """
@@ -156,6 +160,11 @@ class EmojiStore:
         if hits and best is not None:
             self._log("info", f"表情 {name!r} 在表情包里找到的原图都不像界面上的那张"
                               f"（最像的 {best['score']:.2f} < {self.match_ok:.2f}），改去缓存里找")
+        if verified_only and ref_grid is None:
+            # 调用方看得到气泡、但没拿到可用的基准截图：这时按时间猜缓存**很可能猜错**，
+            # 宁可不发图（返回 None，上层按"表情X"文字转发）。
+            self._log("info", "[表情包] 没有可用的比对基准，不去缓存里猜（避免发错图）")
+            return None
         got = self._from_cache(near_epoch, aspect, ref_grid)
         if got:
             return got

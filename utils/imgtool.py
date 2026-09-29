@@ -164,12 +164,22 @@ def content_stats(data_or_frame) -> tuple[float, float]:
     所以"亮度标准差很小"是最靠谱的空白判据（纯色底 + 一点点内容时主色占比也会很高，
     但标准差不会这么低）。
     """
+    dom, std, _mean = _content_all(data_or_frame)
+    return dom, std
+
+
+def content_stats_full(data_or_frame) -> tuple[float, float, float]:
+    """(主色占比, 亮度标准差, 亮度均值) —— 需要"浅色空屏"判据时用（见 looks_blank）。"""
+    return _content_all(data_or_frame)
+
+
+def _content_all(data_or_frame) -> tuple[float, float, float]:
     frame = data_or_frame if isinstance(data_or_frame, dict) else None
     if frame is None:
         frames = decode_frames(data_or_frame, max_frames=1)
         frame = frames[0] if frames else None
     if not frame:
-        return 1.0, 0.0
+        return 1.0, 0.0, 255.0
     w, h, rgb = frame["w"], frame["h"], frame["rgb"]
     n = max(1, w * h)
     bins: dict = {}
@@ -187,21 +197,26 @@ def content_stats(data_or_frame) -> tuple[float, float]:
         s2 += lum * lum
         cnt += 1
     if not cnt:
-        return 1.0, 0.0
+        return 1.0, 0.0, 255.0
     dom = max(bins.values()) / cnt
     mean = s / cnt
     var = max(0.0, s2 / cnt - mean * mean)
-    return dom, var ** 0.5
+    return dom, var ** 0.5, mean
 
 
 def looks_blank(data_or_frame, min_std: float = 18.0, max_dom: float = 0.97) -> bool:
-    """这张图是不是"空白/占位图"（抠错位置、贴纸没加载出来）。
+    """这张图是不是"空白/占位图"（抠错位置、贴纸没加载出来、聊天区空屏）。
 
-    实测：占位图亮度标准差 9.0，真贴纸 81.5 —— 门槛取 18 很宽松；
-    纯色大底（主色占比 ≥0.97）也算空白。判为空白时**宁可不发图**（改发文字），
-    也不要往 QQ 发一张灰底问号。
+    判据两条（命中任一即认为不能发）：
+      ① 亮度标准差 < 18（实机占位图 9.0，真贴纸 81.5）；
+      ② 主色占比 ≥ 0.97（纯色块）。
+
+    **刻意不做"又亮又平就判空白"这种启发式**：浅色的贴纸（白底 + 细线稿）本身就很亮，
+    误判会让一条本来能发图的消息退化成文字、甚至引发"没有基准图 -> 去缓存里猜"的连锁反应。
+    "抠到被顶走的空白区"这种问题改由**流程**解决（补发前重新读界面 + 界面锁挡住发送线程，
+    见 `MessageBridge._capture_media_fresh`），而不是靠猜图像内容。
     """
-    dom, std = content_stats(data_or_frame)
+    dom, std, _mean = _content_all(data_or_frame)
     return std < min_std or dom >= max_dom
 
 

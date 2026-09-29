@@ -208,6 +208,9 @@ class MessageBridge:
         # 不要每 10 秒就"重连一次"刷屏 + 白跑 12 个候选端口；失败后指数退避到最多 60 秒。
         self._reconnect_fails = 0
         self._next_reconnect_ts = float("-inf")
+        # 取图时等发送线程让出界面锁的最长时间（秒）：超过就先按旧坐标试，
+        # 宁可少一张图，也不要让补发流程卡在发送线程手里。
+        self._media_lock_timeout = float((cfg.get("emoji") or {}).get("lock_timeout", 8) or 8)
         self._login_thread: threading.Thread | None = None
         # 登录待恢复标记：触发安全验证/登录失败后置位；
         # 轮询检测到重新登录时自动确认并 QQ 通知（无需重启）
@@ -478,12 +481,21 @@ class MessageBridge:
                     if not dup:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
-                        # 表情包：**必须在轮询线程里取**（此刻快照/气泡位置才准、
-                        # 缓存里刚写进来的原文件也还在）。
+                        # 表情包/图片：**必须在轮询线程里取**（此刻快照/气泡位置才准、
+                        # 缓存里刚写进来的原文件也还在），而且要**挡住发送线程**——
+                        # 发送会点输入框/打字/写"发送成功"提示，界面一动坐标就废了。
                         # 传消息自己的时间：检测可能滞后几分钟（刚重启/刚唤醒时），
                         # 缓存文件是"消息显示时"写进去的，只有按消息时间才找得回原图。
-                        sticker = self._capture_sticker(
-                            root, text, near_epoch=self._label_epoch(time_label or ""))
+                        if text == getattr(self.xtc, "IMAGE_TEXT", "图片") or text.startswith("表情"):
+                            got_lock = self._op_lock.acquire(timeout=self._media_lock_timeout)
+                            try:
+                                sticker = self._capture_sticker(
+                                    root, text, near_epoch=self._label_epoch(time_label or ""))
+                            finally:
+                                if got_lock:
+                                    self._op_lock.release()
+                        else:
+                            sticker = None
                         # 异步转发；成功后才写入长期历史与消息库（见 _do_forward_job）
                         self._queue_forward(contact, text, time_label, sticker=sticker)
             except Exception as e:  # noqa: BLE001 单轮异常不致命
@@ -550,11 +562,12 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            # 补发的表情包也取原图（此刻 root 里就有它的气泡位置，晚了就滚走了）；
-            # 传消息自己的时间，让缓存查找能找到"当时写进来的那张"（保住动图/原图）
-            sticker = (self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_lbl),
-                                             backlog=True)
-                       if (it.get("sticker") or it.get("image")) else None)
+            # 补发的表情/图片也取原图：**必须重新读一次界面**再抠图 ——
+            # 前面几条文字刚发出去，我们自己写回聊天里的"发送成功"提示会把列表往上顶，
+            # 用本轮的旧坐标去抠，抠到的就是空白区域（用户报的"图片截屏变成空白"）。
+            sticker = None
+            if it.get("sticker") or it.get("image"):
+                sticker = self._capture_media_fresh(text, raw_lbl)
             pending.append((text, lbl, sticker))
 
         if not pending:
@@ -574,6 +587,32 @@ class MessageBridge:
             self._queue_forward(contact, text, label, sticker=sticker)
             sent += 1
         return sent
+
+    def _capture_media_fresh(self, text: str, raw_label: str) -> dict | None:
+        """补发时取图：**先重新读一次界面**，再在 _op_lock 保护下抠图。
+
+        为什么不能用本轮 dump 里的坐标：补发是连着发的，而每转发成功一条，桥接就会往
+        聊天里写一条"发送成功：[时间] [昵称] …"的送达确认 —— 那条消息会把列表往上顶。
+        实测正好卡在"前面几条文字发完、轮到图片"那一刻：按旧坐标抠到的是被顶走后的
+        空白区域（用户报的"图片截屏变成空白"）。
+        顺带把发送线程挡在锁外，保证"读界面 -> 截图"这一小段界面不会被人动。
+        """
+        got_lock = self._op_lock.acquire(timeout=self._media_lock_timeout)
+        if not got_lock:
+            self._log("debug", "[补发] 发送线程正忙，改按旧坐标取图")
+        try:
+            root = None
+            try:
+                root = self.xtc.adb.dump_ui(retries=2, delay=0.3)
+            except Exception as e:  # noqa: BLE001 读不到就用调用方给的界面凑合
+                self._log("debug", f"[补发] 重新读界面失败（改用旧坐标取图）: {e}")
+            if root is None:
+                return None
+            return self._capture_sticker(root, text, near_epoch=self._label_epoch(raw_label),
+                                         backlog=True)
+        finally:
+            if got_lock:
+                self._op_lock.release()
 
     def _queue_forward(self, contact: str, text: str, label: str,
                        sticker: dict | None = None) -> None:
@@ -675,10 +714,19 @@ class MessageBridge:
                     self._log("debug", f"抠气泡截图失败: {e}")
                     ref = None
                 if ref and imgtool.looks_blank(ref):
-                    dom, std = imgtool.content_stats(ref)
-                    self._log("info", f"[图片] 抠到的气泡像是空白/占位图（主色占比 {dom:.2f}、"
-                                      f"亮度标准差 {std:.0f}），不用它当依据/兜底")
-                    ref = None
+                    # 抠到空白/占位图：先重试一次（界面可能正在重绘）
+                    retry = None
+                    try:
+                        retry = self.xtc.capture_sticker(item.get("bounds"))
+                    except Exception as e:  # noqa: BLE001
+                        self._log("debug", f"重抠气泡截图失败: {e}")
+                    if retry and not imgtool.looks_blank(retry):
+                        ref = retry
+                    else:
+                        dom, std = imgtool.content_stats(ref)
+                        self._log("info", f"[表情包] 抠到的气泡像是空白/占位图（主色占比 {dom:.2f}、"
+                                          f"亮度标准差 {std:.0f}）")
+                        ref = None
         # ---------------- 照片（图片消息） ----------------
         if is_image:
             if self._emoji_photo and self._emoji_store is not None:
@@ -710,7 +758,9 @@ class MessageBridge:
         if self._emoji_from_data and self._emoji_store is not None:
             try:
                 got = self._emoji_store.find(name, near_epoch=near_epoch,
-                                             aspect=aspect, reference=ref)
+                                             aspect=aspect, reference=ref,
+                                             # 看得到气泡却没抠到可用截图 -> 只认能被证明的候选
+                                             verified_only=bool(item) and ref is None)
             except Exception as e:  # noqa: BLE001 读原文件失败就走截图
                 self._log("debug", f"读表情原文件失败（改用截图）: {e}")
                 got = None

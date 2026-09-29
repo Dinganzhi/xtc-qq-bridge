@@ -1053,7 +1053,7 @@ def test_sticker_forward_one_way() -> None:
                                               _fake_shot())[1]
 
         class _Store:
-            def find(self, name, near_epoch=None, aspect=None, reference=None):
+            def find(self, name, near_epoch=None, aspect=None, reference=None, verified_only=False):
                 return {"data": b"GIF89a" + b"z" * 500, "kind": "gif", "w": 90, "h": 90,
                         "animated": True, "path": "/x/y.cnt", "source": "cache",
                         "score": 0.97}
@@ -1082,7 +1082,7 @@ def test_sticker_forward_one_way() -> None:
 
         # ② 原文件取不到 -> 退回截图（静态一帧）
         br._emoji_store = type("S", (), {
-            "find": lambda self, name, near_epoch=None, aspect=None, reference=None: None,
+            "find": lambda self, name, near_epoch=None, aspect=None, reference=None, verified_only=False: None,
             "index_ready": lambda self: True,
             "name_is_unique": lambda self, name: False})()
         got2 = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
@@ -2062,6 +2062,130 @@ def test_offline_device_is_recovered_not_faked() -> None:
     check("成功后计数清零", br._reconnect_fails == 0 and br._next_reconnect_ts == float("-inf"))
 
 
+def test_backlog_media_uses_fresh_dump() -> None:
+    """补发取图必须**重新读一次界面**，并且把发送线程挡在外面。
+
+    用户报的现象：启动后积压消息按顺序补发，前面几条普通消息一发出去，桥接就会往聊天里
+    写"发送成功：[时间] [昵称] …"的送达确认，那条消息把列表往上顶 —— 等到轮到图片时，
+    用上一轮 dump 的旧坐标去截图，抠到的已经是被顶走后的**空白区域**。
+    """
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self):
+            self.texts, self.images = [], []
+
+        def send_detail(self, t, i, m):
+            self.texts.append(m)
+            return True, ""
+
+        def send_image(self, t, i, image_b64, caption=""):
+            self.images.append(caption or image_b64)
+            return True, ""
+
+    class _Adb:
+        """假 adb：第 1 次 dump 还能看到图片气泡，之后（被"发送成功"顶上去了）就看不到了。"""
+
+        def __init__(self, keep_visible: bool = False):
+            self.dumps = 0
+            self.keep_visible = keep_visible
+            self.locked_during_dump: list[bool] = []
+            self.bridge = None
+            # 默认给一张"聊天空屏"（浅灰 + 一点点别的气泡）：真按旧坐标抠就是它
+            self.shot = _png_pattern(136, 180, (242, 242, 242), (0, 0, 136, 10), (250, 250, 250))
+
+        def screencap_crop_png(self, box):
+            return self.shot
+
+        def dump_ui(self, retries=2, delay=0.3):
+            self.dumps += 1
+            if self.bridge is not None:
+                self.locked_during_dump.append(self.bridge._op_lock.locked())
+            return ET.fromstring(node_xml(""))
+
+    bubble = {"text": "图片", "is_own": False, "contact": "屑猹不喝茶", "time_label": "",
+              "y_bottom": 500, "sticker": False, "image": True, "bounds": (470, 300, 610, 500)}
+
+    class _Xtc:
+        STATE_CHAT = "chat"
+        IMAGE_TEXT = "图片"
+
+        def __init__(self, adb):
+            self.adb = adb
+            self.bubbles = [dict(bubble)]
+
+        def _chat_bubbles(self, root, include_own=False):
+            return [dict(bubble)]
+
+        def _is_system_msg(self, text):
+            return text.startswith("发送成功")
+
+        def image_of_latest(self, root, text=""):
+            # 第一次 dump 时气泡还在；重新 dump 之后它已被顶走 -> 返回 None
+            return dict(bubble) if (self.adb.keep_visible or self.adb.dumps <= 1) else None
+
+        def capture_sticker(self, bounds):
+            return self.adb.screencap_crop_png(bounds)
+
+    try:
+        # ① 气泡被顶走了：应该**不发图**（退回文字），而不是发一张空白截图
+        adb = _Adb(keep_visible=False)
+        fwd = _Fwd()
+        br = bridge_mod.MessageBridge(
+            {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+             "xiaotiancai": {}, "webhook": {}}, adb=None, xtc=_Xtc(adb), forwarder=fwd,
+            logger=None)
+        prefix = f".bugtest{_SEQ['n']}_"
+        br.msgs = MessageLog(path=str(root / f"{prefix}msg_log.json"))
+        br.history = bridge_mod.HistoryFilter(store_path=str(root / f"{prefix}history.json"))
+        br.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo.json"))
+        br._cmd_done_file = str(root / f"{prefix}cmd_done.json")
+        adb.bridge = br
+        br._emoji_from_data = True
+        # 测试里没有工作线程：入队改成同步执行（与 _backlog_bridge 一致）
+        br._queue_forward = lambda c, t, l, sticker=None: br._do_forward_job(
+            c, t, l, sticker=sticker)
+        br._emoji_store = type("S", (), {
+            "find_photo": lambda self, **k: None,
+            "find": lambda self, *a, **k: None,
+            "index_ready": lambda self: True,
+            "name_is_unique": lambda self, name: False})()
+        n = br._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        check("补发时确实重新读了一次界面", adb.dumps >= 1, f"dumps={adb.dumps}")
+        check("读界面时占着界面锁（发送线程动不了界面）",
+              adb.locked_during_dump and all(adb.locked_during_dump), str(adb.locked_during_dump))
+        check("气泡被顶走后不发空白图，退回文字", n == 1 and not fwd.images
+              and any("图片" in m for m in fwd.texts), f"texts={fwd.texts} images={fwd.images}")
+
+        # ② 对照组：重新 dump 里气泡还在 -> 正常取到图
+        adb2 = _Adb(keep_visible=True)
+        fwd2 = _Fwd()
+        br2 = bridge_mod.MessageBridge(
+            {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+             "xiaotiancai": {}, "webhook": {}}, adb=None, xtc=_Xtc(adb2), forwarder=fwd2,
+            logger=None)
+        br2.msgs = MessageLog(path=str(root / f"{prefix}msg2.json"))
+        br2.history = bridge_mod.HistoryFilter(store_path=str(root / f"{prefix}history2.json"))
+        br2.echo = bridge_mod.EchoFilter(store_path=str(root / f"{prefix}echo2.json"))
+        br2._cmd_done_file = str(root / f"{prefix}cmd_done2.json")
+        adb2.bridge = br2
+        br2._emoji_from_data = True
+        br2._queue_forward = lambda c, t, l, sticker=None: br2._do_forward_job(
+            c, t, l, sticker=sticker)
+        real_shot = _png_pattern(136, 180, (235, 235, 235), (20, 20, 100, 100), (40, 30, 200))
+        adb2.screencap_crop_png = lambda box: real_shot
+        br2._emoji_store = type("S", (), {
+            "find_photo": lambda self, **k: None,
+            "find": lambda self, *a, **k: None,
+            "index_ready": lambda self: True,
+            "name_is_unique": lambda self, name: False})()
+        n2 = br2._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        check("气泡还在时正常取到图并发出去", n2 == 1 and len(fwd2.images) == 1,
+              f"texts={fwd2.texts} images={len(fwd2.images)}")
+    finally:
+        cleanup(root)
+
+
 def test_blank_bubble_shot_is_not_sent() -> None:
     """抠错位置 / 贴纸还没加载出来时的**空白占位图**绝不能发给 QQ。
 
@@ -2081,6 +2205,20 @@ def test_blank_bubble_shot_is_not_sent() -> None:
           f"主色占比={dom_r:.2f} 标准差={std_r:.1f}")
     check("解不出来的字节按空白处理", imgtool.looks_blank(b"not an image") is True)
 
+    # "被顶走的聊天空白区"这类问题**故意不用图像启发式解决**：浅色贴纸也"又亮又平"，
+    # 误判会让本来能发的图退化成文字、还会引发"没有基准图 -> 去缓存里猜"的连锁反应（实测踩过）。
+    # 它改由**流程**解决（补发前重新读界面 + 界面锁挡住发送线程），见
+    # test_backlog_media_uses_fresh_dump。这里只钉住"纯色/极平"这类确定性空白：
+    def _px_flat(x, y):
+        return (242, 242, 242) if y < 100 else (246, 246, 246)
+
+    flat_rows = [bytes(b"".join(bytes(_px_flat(x, y)) for x in range(120))) for y in range(120)]
+    from utils.pngtool import encode_png_rgb
+    flat = encode_png_rgb(120, 120, flat_rows)
+    dom_m, std_m = imgtool.content_stats(flat)
+    check("纯聊天背景（极平/纯色）判为空白",
+          imgtool.looks_blank(flat) is True, f"主色占比={dom_m:.2f} 标准差={std_m:.1f}")
+
     # 桥接侧：原图取不到 + 抠到的是空白 -> 不发图（返回 None，走文字）
     root = tmp_root()
     sticker_xml = node_xml(
@@ -2095,11 +2233,33 @@ def test_blank_bubble_shot_is_not_sent() -> None:
         br.xtc = xtc
         br._emoji_from_data = True
         br._emoji_store = type("S", (), {
-            "find": lambda self, name, near_epoch=None, aspect=None, reference=None: None,
+            "find": lambda self, name, near_epoch=None, aspect=None, reference=None, verified_only=False: None,
             "index_ready": lambda self: True,
             "name_is_unique": lambda self, name: False})()
         check("抠到空白占位图时不发图（退回文字）",
               br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊") is None)
+
+        # 抠到空白图时必须明确告诉取图层"只认能被证明的候选"：既不能拿这张空白图当像素
+        # 比对基准（会误判掉正确的原图），也不能让它退回"按时间猜缓存"（实机那样发错过图）
+        seen: dict = {}
+
+        class _Store:
+            def find(self, name, near_epoch=None, aspect=None, reference=None,
+                     verified_only=False):
+                seen.update({"verified_only": verified_only, "reference": reference})
+                return None
+
+            def index_ready(self):
+                return True
+
+            def name_is_unique(self, name):
+                return False
+
+        br._emoji_store = _Store()
+        gone = br._capture_sticker(ET.fromstring(sticker_xml), "表情啊啊啊")
+        check("空白截图不当基准，且要求「只认能被证明的候选」",
+              gone is None and seen.get("reference") is None
+              and seen.get("verified_only") is True, str(seen))
     finally:
         cleanup(root)
 
@@ -2212,6 +2372,10 @@ def test_cache_pick_verifies_pixels_against_screen() -> None:
         "流汗", near_epoch=now - 20)
     check("没有基准图时只信'刚写进来'的候选（老行为兜底）",
           bool(got_fresh) and got_fresh["path"] == turtle_path, str(got_fresh and got_fresh["path"]))
+    # 但"看得到气泡却抠不到可用截图"时（verified_only=True）不许猜：按时间猜很可能猜错
+    check("verified_only=True 时不按时间猜缓存",
+          EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find(
+              "流汗", near_epoch=now - 20, aspect=1.0, verified_only=True) is None)
     listing = f"{now - 3000} {len(turtle_gif)} {turtle_path}"
     check("没有基准图又不新鲜 -> 不乱取",
           EmojiStore(OnlyTurtle(), package="com.xtc.watch", logger=None).find("流汗") is None)
@@ -4100,6 +4264,7 @@ def main() -> int:
                test_image_message_is_forwarded,
                test_photo_original_pick_is_conservative,
                test_blank_bubble_shot_is_not_sent,
+               test_backlog_media_uses_fresh_dump,
                test_offline_device_is_recovered_not_faked,
                test_check_uses_configured_adb,
                test_image_decoders_match_fixtures,
