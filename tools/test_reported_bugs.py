@@ -863,6 +863,65 @@ def test_send_jumps_ahead_of_other_jobs() -> None:
         cleanup(root)
 
 
+def test_forward_retry_thread_only_retries_failed_targets() -> None:
+    """补投线程端到端：只补失败的目标、到上限放弃、且**不碰**已经成功的私聊。
+
+    用户报告："只有一个群没转发出去，会连着别的群和私信一起一直转发"。
+    """
+    import threading
+
+    root = tmp_root()
+    try:
+        class _Fwd:
+            def __init__(self):
+                self.private = 0
+                self.group_ok = False
+                self.group = 0
+                self.group_sends: list = []
+
+            def send(self, t, i, m):
+                return self.send_detail(t, i, m)[0]
+
+            def send_detail(self, t, i, m):
+                if t == "group":
+                    self.group += 1
+                    self.group_sends.append(i)
+                    return self.group_ok, "" if self.group_ok else "群超时"
+                self.private += 1
+                return True, ""
+
+        cfg = {"target": {"xtc_contact": "张三", "qq_private": "2218631043",
+                          "qq_group": ["472805002", "111222333"]},
+               "xiaotiancai": {}, "webhook": {}}
+        fwd = _Fwd()
+        br = bridge_mod.MessageBridge(cfg, adb=None, xtc=None, forwarder=fwd, logger=None)
+        _p = f".bugtest{_SEQ['n']}_retryth"
+        br.msgs = MessageLog(path=str(root / f"{_p}_msg.json"))
+        br._cmd_done_file = str(root / f"{_p}_done.json")
+        br._forward_retry_backoff = 0.05          # 测试里缩短退避
+        br._forward_max_tries = 2
+        br.running = True
+        th = threading.Thread(target=br._forward_retry_loop, daemon=True)
+        th.start()
+        try:
+            br._do_forward_job("屑猹不喝茶", "群刷屏测试", "13:00")
+            deadline = time.time() + 3          # 等"放弃"那一刻（计划被清掉）
+            while br._fwd_plan and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            br.running = False
+            th.join(2)
+        check("私聊只发一次（补投 2 轮都不重发私聊）", fwd.private == 1, f"p={fwd.private}")
+        check("补投只打两个群、到上限就停（1 次首投 + 2 次补投）",
+              fwd.group == 2 * (2 + 1) and set(fwd.group_sends) == {"472805002", "111222333"},
+              f"g={fwd.group} sends={fwd.group_sends}")
+        check("放弃后计划清空、消息入库（轮询不再重转）",
+              not br._fwd_plan and br.msgs.seen("群刷屏测试", "xtc") is True,
+              f"plan={br._fwd_plan}")
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -4374,30 +4433,29 @@ def test_backlog_walk_until_known() -> None:
         check("命令与系统提示被跳过且不算边界",
               n4 == 1 and "新消息" in fwd3.sent[0], f"n={n4} sent={fwd3.sent}")
 
-        # 转发失败：不入库（所以之后还会被当成"库里没有"重试），但按**退避**重试 ——
+        # 转发失败：**不再靠轮询重试**，而是登记"补投计划"（只补失败的目标）；
         # 旧实现是"每轮轮询都重发"，一条群发失败的消息会把私聊刷成几十条（用户实测）。
         fwd4 = _Fwd(ok=False)
         br4 = _backlog_bridge(root, fwd4, bubbles("会失败的"))
-        check("转发失败时不入库",
-              br4._forward_backlog(None, "屑猹不喝茶") == 1
-              and br4.msgs.seen("会失败的", "xtc") is False)
-        check("失败的消息没进消息库（之后还会重试）",
-              br4.msgs.seen("会失败的", "xtc") is False)
+        check("转发失败时进补投计划（第一次仍然照发）",
+              br4._forward_backlog(None, "屑猹不喝茶") == 1 and len(br4._fwd_plan) == 1,
+              f"plan={br4._fwd_plan}")
         br4.dedup = bridge_mod.Deduplicator()      # 模拟 120 秒节流窗口过去
         fwd4.sent.clear()
-        check("退避窗口内不重发（不会每轮刷屏重转）",
+        check("有补投计划时轮询不再重复转发（不会每轮刷屏重转）",
               br4._forward_backlog(None, "屑猹不喝茶") == 0 and not fwd4.sent,
               f"sent={fwd4.sent}")
-        # 模拟退避时间过去 -> 允许再试一次，且这次成功就入库
-        for st in br4._forward_state.values():
-            st["next_ts"] = 0.0
-        fwd4.ok = True
-        n5 = br4._forward_backlog(None, "屑猹不喝茶")
-        check("退避窗口过后会重试", n5 == 1, f"n={n5}")
-        check("重试成功后入库（之后不再重发）",
-              br4.msgs.seen("会失败的", "xtc") is True)
 
-        # 部分成功：私聊已成功、群失败 -> 只重试群，绝不把私聊再发一遍
+        # 补投：到点后只补失败的目标，成功就入库
+        fwd4.ok = True
+        for plan in br4._fwd_plan.values():
+            plan["next_ts"] = 0.0
+        br4._retry_failed_targets(next(iter(list(br4._fwd_plan))))
+        check("补投成功后入库（之后不再重发）",
+              br4.msgs.seen("会失败的", "xtc") is True and not br4._fwd_plan,
+              f"plan={br4._fwd_plan}")
+
+        # 部分成功：私聊已成功、群失败 -> 立刻入库（轮询不再重转），补投**只打群**
         class _FwdPartial(_Fwd):
             def __init__(self):
                 super().__init__(ok=True)
@@ -4424,18 +4482,45 @@ def test_backlog_walk_until_known() -> None:
         br7.msgs = MessageLog(path=str(root / f"{_p}_msg.json"))
         br7._cmd_done_file = str(root / f"{_p}_done.json")
         br7._do_forward_job("屑猹不喝茶", "只成功一半", "13:00")
-        check("私聊成功、群失败 -> 整条按失败上报（不入库）",
+        check("私聊成功、群失败 -> 立刻入库（轮询不会再整条重发）",
               fwd7.private_sends == 1 and fwd7.group_sends == 1
-              and br7.msgs.seen("只成功一半", "xtc") is False,
+              and br7.msgs.seen("只成功一半", "xtc") is True,
               f"p={fwd7.private_sends} g={fwd7.group_sends}")
-        for st in br7._forward_state.values():
-            st["next_ts"] = 0.0
+        check("补投计划里只有失败的那个群",
+              [p["failed"] for p in br7._fwd_plan.values()] == [[("group", "472805002")]],
+              f"plan={br7._fwd_plan}")
+        # 标签跳变（同一条消息这次读不到时间标签）也不能骗过内容护栏去重发
+        fwd7.sent.clear()
+        br7._do_forward_job("屑猹不喝茶", "只成功一半", "")
+        check("时间标签跳变也不会把私聊再发一遍",
+              fwd7.private_sends == 1 and fwd7.group_sends == 1
+              and not fwd7.sent, f"p={fwd7.private_sends} g={fwd7.group_sends}")
         fwd7.group_ok = True
-        br7._do_forward_job("屑猹不喝茶", "只成功一半", "13:00")
-        check("重试只补失败的目标（私聊不再发第二遍）",
+        br7._retry_failed_targets(next(iter(list(br7._fwd_plan))))
+        check("补投只补失败的目标（私聊不再发第二遍）",
               fwd7.private_sends == 1 and fwd7.group_sends == 2,
               f"p={fwd7.private_sends} g={fwd7.group_sends}")
-        check("补成功后入库", br7.msgs.seen("只成功一半", "xtc") is True)
+        check("补投成功后入库并清掉计划",
+              br7.msgs.seen("只成功一半", "xtc") is True and not br7._fwd_plan,
+              f"plan={br7._fwd_plan}")
+
+        # 一直失败：到上限就放弃（记历史 + 报一次错），不再无限刷屏
+        fwd8 = _FwdPartial()
+        fwd8.group_sends = 0
+        br8 = bridge_mod.MessageBridge(cfg2, adb=None, xtc=None, forwarder=fwd8, logger=None)
+        _p8 = f".bugtest{_SEQ['n']}_giveup"
+        br8.msgs = MessageLog(path=str(root / f"{_p8}_msg.json"))
+        br8._cmd_done_file = str(root / f"{_p8}_done.json")
+        br8._do_forward_job("屑猹不喝茶", "群一直失败", "13:00")
+        for _ in range(br8._forward_max_tries + 1):
+            items = list(br8._fwd_plan.items())
+            if not items:
+                break
+            br8._retry_failed_targets(items[0][0])
+        check("到上限后放弃补投（计划清空、消息入库、不再重试）",
+              not br8._fwd_plan and br8.msgs.seen("群一直失败", "xtc") is True
+              and fwd8.group_sends == br8._forward_max_tries + 1,
+              f"g={fwd8.group_sends} plan={br8._fwd_plan}")
 
         # 上限：只补最早的一批，剩下的下一轮继续
         fwd5 = _Fwd()
@@ -4530,6 +4615,7 @@ def main() -> int:
                test_ime_check_is_cached, test_launch_app_skips_hard_failures_fast,
                test_poll_loop_yields_to_pending_send,
               test_send_jumps_ahead_of_other_jobs,
+              test_forward_retry_thread_only_retries_failed_targets,
                test_png_encoder_and_crop, test_screencap_header_parsing,
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,

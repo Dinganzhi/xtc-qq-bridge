@@ -240,21 +240,34 @@ class MessageBridge:
         # 为了给发送让路而"先取出来、稍后再做"的普通任务（保持原有先后顺序）
         self._held_jobs: collections.deque = collections.deque()
         self._job_thread: threading.Thread | None = None
-        # 单条消息的转发重试状态：key -> {"tries", "sent", "next_ts"}。
-        # 为什么需要：QQ 侧某个目标一直失败（例如群被限流）时，旧实现因为"没成功就不记历史"
-        # 而每轮轮询都重发一次 —— 已成功的目标（私聊）被反复重发（用户被刷屏），
-        # 界面被持续占用，QQ->小天才 的发送排队几十秒。现在改成：只重试**没成功的目标**，
-        # 且按退避节奏重试，绝不无限重发。
-        self._forward_state: dict[tuple, dict] = {}
+        # ---- 转发"补投计划"：只补没发出去的目标，绝不因为"有个群失败"就把私聊/别的群再发一遍 ----
+        # 为什么要独立计划 + 独立线程（用户实测过的坑）：
+        #   * 旧实现靠"轮询重新读屏"来重试，于是**退避节奏完全失控**（每 5 秒重发一次）；
+        #   * 重试时它会把**所有目标**再发一遍（私聊被刷屏几十分钟）；
+        #   * 消息身份在"标签读到了/没读到"之间会跳变，靠身份去重也挡不住这种重发。
+        # 现在：第一次尝试就把"这条已经处理过"记进历史，失败的目标写进补投计划，
+        # 由专门的线程按退避节奏**只补那些目标**；到达上限后放弃并明确报错。
+        self._fwd_plan: dict[tuple, dict] = {}
+        self._fwd_plan_lock = threading.Lock()
+        self._fwd_retry_thread: threading.Thread | None = None
+        # 内容级"刚转发过"护栏：同一联系人 + 同一文本，N 秒内不再重复转发
+        # （App 的时间标签会时有时无，光靠"文本+标签"当身份挡不住重复；用户报告的就是这个）
+        self._recent_fwd: dict[tuple, float] = {}
         _fwd = cfg.get("forward") or {}
         try:
-            self._forward_max_tries = int(_fwd.get("max_tries", 3) or 3)
+            # 0 = 失败就放弃（不补投）；默认 3 次
+            self._forward_max_tries = max(0, int(_fwd.get("retry_max_tries", 3) or 0))
         except (TypeError, ValueError):
             self._forward_max_tries = 3
         try:
-            self._forward_retry_backoff = float(_fwd.get("retry_backoff", 60) or 60)
+            self._forward_retry_backoff = max(5.0, float(_fwd.get("retry_backoff", 60) or 60))
         except (TypeError, ValueError):
             self._forward_retry_backoff = 60.0
+        try:
+            self._forward_content_guard = max(
+                0.0, float(_fwd.get("content_dedup_secs", 300) or 0))
+        except (TypeError, ValueError):
+            self._forward_content_guard = 300.0
         self._last_chat_open = float("-inf")  # 聊天窗口重开冷却（初值 -inf：见上）
         # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
         self._auto_login_enabled = bool(
@@ -290,6 +303,10 @@ class MessageBridge:
         self._login_thread.start()
         self._job_thread = threading.Thread(target=self._job_worker, name="xtc-jobs", daemon=True)
         self._job_thread.start()
+        # 补投线程：只补"没发出去的目标"（不碰界面，所以不会和发送抢界面锁）
+        self._fwd_retry_thread = threading.Thread(target=self._forward_retry_loop,
+                                                  name="xtc-fwd-retry", daemon=True)
+        self._fwd_retry_thread.start()
         self._log("info", f"小天才消息轮询已启动（间隔 {self._poll_interval}s）")
         # 启动即自动初始化（等价于 QQ 命令 /小天才 初始化，以前只有手动发命令才会做）：
         # 清弹窗 -> 确认前台 -> 按需登录 -> 进入聊天页 -> 清空输入框残留。
@@ -309,6 +326,8 @@ class MessageBridge:
             self._login_thread.join(timeout=5)
         if self._job_thread:
             self._job_thread.join(timeout=5)
+        if self._fwd_retry_thread:
+            self._fwd_retry_thread.join(timeout=5)
 
     # ------------------------------------------------------------------ 任务队列（FIFO，保证顺序）
     def _next_job(self):
@@ -529,7 +548,7 @@ class MessageBridge:
                     key = ("xtc", contact or "", text, label)
                     dup = (self.history.seen(*key) or self.dedup.seen(key)
                            or self.echo.is_echo(text)
-                           or self._forward_backing_off(key))
+                           or self._forward_suppressed(contact, text, label))
                     if not dup and not label:
                         # 读不到时间标签时只能按文本保守判定：宁可不重发，也不要反复刷同一条
                         dup = self.msgs.seen(text, "xtc")
@@ -644,10 +663,11 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
-            if self._forward_backing_off(self._fwd_key(contact, text, ident)):
-                # 上次转发失败、正在退避：**不当作边界**（库里仍没有它），但这一轮不重发。
-                # 旧实现没有这层，于是"群发失败"会让同一条消息每 5 秒被重转一次，刷屏 + 拖慢发送。
-                self._log("debug", f"[补发] 这条在失败退避中，先跳过: {text[:24]!r}")
+            if self._forward_suppressed(contact, text, ident):
+                # 正在补投 / 刚转发过同一内容（标签跳变也算同一条）：**不当作边界**（库里
+                # 仍没有它），但这一轮不重发。旧实现没有这层，于是一个群失败会让同一条消息
+                # 每 5 秒被重转一次，还连已经成功的私聊一起重发（用户实测的刷屏）。
+                self._log("debug", f"[补发] 这条在补投/内容护栏内，先跳过: {text[:24]!r}")
                 continue
             # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
@@ -728,6 +748,8 @@ class MessageBridge:
         那一刻界面快照/气泡位置才准、缓存里刚写进来的文件也还在；没有它就按文字发。
         """
         self.dedup.mark(("xtc", contact or "", text, label or ""))
+        # 注意：内容级护栏（_recent_fwd_seen）**不在这里**打点 —— 打点必须发生在
+        # "真的要发出去"那一刻（见 _do_forward_job），否则刚入队的这条会被自己挡掉。
         self._job_queue.put(("forward", contact, text, label or "", sticker,
                              display_label or label or ""))
 
@@ -735,23 +757,154 @@ class MessageBridge:
         """转发身份键（与实时/补发两条路径共用，必须同源）。"""
         return ("xtc", contact or "", text, label or "")
 
-    def _fwd_state(self, key: tuple) -> dict:
-        """取（或建）某条消息的转发重试状态。只保留最近 50 条，避免无限增长。"""
-        st = self._forward_state.get(key)
-        if st is not None:
-            return st
-        while len(self._forward_state) >= 50:
-            self._forward_state.pop(next(iter(self._forward_state)), None)
-        st = {"tries": 0, "sent": set(), "next_ts": 0.0}
-        self._forward_state[key] = st
-        return st
+    # ---- 内容级护栏 + 补投计划（"只有一个群失败"时绝不重发私聊/别的群） ----
+    def _recent_fwd_seen(self, contact, text: str) -> bool:
+        """同一联系人 + 同一文本，最近是否已经转发过（默认 300 秒内不再重复转发）。
 
-    def _forward_backing_off(self, key: tuple) -> bool:
-        """这条消息是否处于"失败退避"中（退避期间两条路径都不再重复转发）。"""
-        st = self._forward_state.get(key)
-        if not st:
+        为什么不能只靠"文本 + 时间标签"当身份：App 的分组时间标签**时有时无**
+        （同一屏里同一条消息一会儿读得到 "14:49"、一会儿读不到），标签一变身份就变，
+        于是一条失败消息会被当成"新消息"反复转发 —— 用户报的"只有一个群没发出去，
+        却连着别的群和私信一起一直转发"就是这个。
+        """
+        if self._forward_content_guard <= 0:
             return False
-        return time.monotonic() < float(st.get("next_ts") or 0.0)
+        key = ("xtc", contact or "", text or "")
+        now = time.monotonic()
+        ts = self._recent_fwd.get(key)
+        if ts is None:
+            return False
+        if now - ts > self._forward_content_guard:
+            self._recent_fwd.pop(key, None)
+            return False
+        return True
+
+    def _mark_recent_fwd(self, contact, text: str) -> None:
+        if self._forward_content_guard <= 0:
+            return
+        now = time.monotonic()
+        # 顺手清掉过期项，避免字典无限增长
+        for k, ts in list(self._recent_fwd.items()):
+            if now - ts > self._forward_content_guard:
+                self._recent_fwd.pop(k, None)
+        self._recent_fwd[("xtc", contact or "", text or "")] = now
+
+    def _has_active_plan(self, contact, text: str) -> bool:
+        """是否已有"同一联系人 + 同一文本"的补投计划在跑（有就别再发一遍整条）。"""
+        with self._fwd_plan_lock:
+            for key, plan in self._fwd_plan.items():
+                if key[1] == (contact or "") and key[2] == (text or ""):
+                    return True
+        return False
+
+    def _forward_suppressed(self, contact, text: str, label: str) -> bool:
+        """这条消息现在要不要跳过：正在补投 / 刚转发过同一内容。"""
+        if self._has_active_plan(contact, text):
+            return True
+        return self._recent_fwd_seen(contact, text)
+
+    def _plan_key(self, contact, text: str, label: str) -> tuple:
+        """补投计划的身份（**不含标签**）：标签会跳变，补投只认"谁 + 什么内容"。
+
+        计划里单独记着这条消息的显示标签，所以补投出去的时间抬头依然是对的。
+        """
+        return ("xtc", contact or "", text or "")
+
+    def _mark_forwarded(self, contact, text: str, label: str, disp: str) -> None:
+        """记入长期历史 + 本地消息库（此后轮询不会再把它当成"库里没有"的消息）。"""
+        self.history.mark("xtc", contact or "", text, label or "")
+        if not self.msgs.seen(text, "xtc"):
+            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
+                             source=self._xtc_source(contact), source_id=contact or "")
+
+    def _schedule_fwd_plan(self, contact, text: str, label: str, disp: str,
+                           sticker: dict | None, failed: list) -> None:
+        """登记/更新补投计划：**只记没发出去的目标**。"""
+        if not failed:
+            return
+        if self._forward_max_tries <= 0:
+            self._log("error", f"[转发] 有 {len(failed)} 个目标没发出去"
+                               f"（{'、'.join(f'{t}:{i}' for t, i in failed)}）：{text[:24]!r}；"
+                               "forward.retry_max_tries=0 -> 不补投（只报这一次）")
+            return
+        key = self._plan_key(contact, text, label)
+        gap = self._forward_retry_backoff
+        with self._fwd_plan_lock:
+            plan = self._fwd_plan.get(key)
+            if plan is None:
+                plan = {"contact": contact, "text": text, "label": label, "disp": disp,
+                        "sticker": sticker, "failed": list(failed), "tries": 0,
+                        "next_ts": time.monotonic() + gap}
+                self._fwd_plan[key] = plan
+            else:
+                plan["failed"] = list(failed)
+                plan["sticker"] = sticker or plan.get("sticker")
+                plan["tries"] = 0
+                plan["next_ts"] = time.monotonic() + gap
+        self._log("warning", f"[转发] 有 {len(failed)} 个目标没发出去"
+                             f"（{'、'.join(f'{t}:{i}' for t, i in failed)}）：{text[:24]!r}；"
+                             f"{int(gap)} 秒后**只重试这些目标**（最多 {self._forward_max_tries} 次，"
+                             "已经成功的私聊/群不会重发）")
+
+    def _forward_retry_loop(self) -> None:
+        """补投线程：按退避节奏只重试失败的目标，到上限就放弃并明确报错。
+
+        为什么单独一个线程：补投是一次 HTTP（QQ 侧超时可能 30 秒），放在工作线程里会把
+        用户新发的 QQ 消息一起堵住；补投**不碰界面**，所以它不需要界面锁。
+        """
+        while self.running:
+            time.sleep(0.5)
+            now = time.monotonic()
+            with self._fwd_plan_lock:
+                due = [k for k, p in self._fwd_plan.items()
+                       if now >= float(p.get("next_ts") or 0.0)]
+            for key in due:
+                try:
+                    self._retry_failed_targets(key)
+                except Exception as e:  # noqa: BLE001 补投异常不能让线程退出
+                    self._log("warning", f"[转发] 补投异常: {e}")
+
+    def _retry_failed_targets(self, key: tuple) -> None:
+        """补投一次：**只发上次失败的目标**；到上限就放弃（记历史，不再重试）。"""
+        with self._fwd_plan_lock:
+            plan = self._fwd_plan.get(key)
+            if plan is None:
+                return
+            plan["tries"] = int(plan.get("tries") or 0) + 1
+            # 先占位（成功会删掉、失败会重排），避免同一轮被取两次
+            plan["next_ts"] = time.monotonic() + self._forward_retry_backoff * 4
+            snapshot = dict(plan)
+        text = snapshot.get("text") or ""
+        failed = list(snapshot.get("failed") or [])
+        tries = int(snapshot.get("tries") or 0)
+        if tries > self._forward_max_tries:
+            with self._fwd_plan_lock:
+                self._fwd_plan.pop(key, None)
+            # 放弃：记入历史，轮询不会再拿它重转（失败的目标不再尝试）
+            self._mark_forwarded(snapshot.get("contact", ""), text, snapshot.get("label", ""),
+                                 snapshot.get("disp", ""))
+            self._log("error", f"[转发] 放弃补投（已试 {tries - 1} 次）: {text[:24]!r}；"
+                               f"失败目标 {'、'.join(f'{t}:{i}' for t, i in failed)} 仍未发出，"
+                               "已停止重试（不会再刷屏）")
+            return
+        ok, _sent, still_failed = self._forward(
+            snapshot.get("contact", ""), text,
+            snapshot.get("disp", "") or snapshot.get("label", ""),
+            sticker=snapshot.get("sticker"), only=failed)
+        if ok:
+            with self._fwd_plan_lock:
+                self._fwd_plan.pop(key, None)
+            self._mark_forwarded(snapshot.get("contact", ""), text, snapshot.get("label", ""),
+                                 snapshot.get("disp", ""))
+            self._log("info", f"[转发] 补投成功（第 {tries} 次）: {text[:24]!r}")
+            return
+        with self._fwd_plan_lock:
+            cur = self._fwd_plan.get(key)
+            if cur is not None and still_failed:
+                cur["failed"] = list(still_failed)
+        self._log("warning", f"[转发] 补投仍失败（第 {tries}/{self._forward_max_tries} 次）: "
+                             f"{text[:24]!r}；"
+                             + (f"失败目标 {'、'.join(f'{t}:{i}' for t, i in still_failed)}"
+                                if still_failed else "没有可重试的目标"))
 
     def _queue_confirm_xtc(self, message: str) -> None:
         """小天才聊天里的"发送成功：…"回执 -> 入**普通队列**（低优先级）。
@@ -763,47 +916,33 @@ class MessageBridge:
 
     def _do_forward_job(self, contact: str, text: str, label: str,
                         sticker: dict | None = None, display_label: str = "") -> None:
-        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败按退避重试）。
+        """小天才 -> QQ 的**第一次**尝试（之后由补投线程只补失败的目标）。
 
         label 是身份标签（去重/历史都用它），display_label 只用于给 QQ 那条消息的抬头时间。
-        失败重试的三条纪律（用户实测过的坑）：
-          * **只重试没成功的目标**：私聊成功、群失败时，绝不把私聊再发一遍；
-          * **退避重试**：不再"每轮轮询都重发"（旧实现会 5 秒一轮刷到天荒地老）；
-          * 超过 max_tries 后降到分钟级间隔继续试，消息不会丢，也不会刷屏。
+        三条纪律（用户实测过的坑）：
+          * 已有补投计划 / 刚转发过同一内容 -> 直接跳过（标签跳变也不能骗过它）；
+          * 有目标成功就立刻记历史：轮询不会再拿这条消息重转（私聊不会被刷屏）；
+          * 失败的目标进补投计划：只补它们，退避 + 有上限，不再"每 5 秒一轮"。
         """
         disp = display_label or label
-        key = self._fwd_key(contact, text, label)
-        st = self._fwd_state(key)
-        now = time.monotonic()
-        if now < float(st.get("next_ts") or 0.0):
-            return                              # 退避中：本轮不试
-        st["tries"] = int(st.get("tries") or 0) + 1
+        if self._forward_suppressed(contact, text, label):
+            self._log("debug", f"[转发] 这条正在补投或刚转发过，跳过: {text[:24]!r}")
+            return
+        # 打点必须在这里（"真的要发一次"那一刻）：轮询之后每 2~4 秒就会重新读到这条消息，
+        # 靠它挡住"标签跳变 -> 被当成新消息 -> 整条重发"。
+        self._mark_recent_fwd(contact, text)
         try:
-            ok, sent, failed = self._forward(contact, text, disp, sticker=sticker,
-                                             skip=set(st.get("sent") or ()))
+            ok, sent, failed = self._forward(contact, text, disp, sticker=sticker)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
             ok, sent, failed = False, [], []
-        st["sent"] = set(st.get("sent") or ()) | set(sent)
         if ok:
-            self._forward_state.pop(key, None)
-            self.history.mark("xtc", contact or "", text, label or "")
-            if not self.msgs.seen(text, "xtc"):
-                self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
-                                 source=self._xtc_source(contact), source_id=contact or "")
+            self._mark_forwarded(contact, text, label, disp)
             return
-        tries = int(st["tries"])
-        # 退避：前两次按 retry_backoff，之后按 4 倍（分钟级）——重试仍然发生，但不再刷屏
-        gap = self._forward_retry_backoff * (1.0 if tries < 2 else 4.0)
-        st["next_ts"] = now + gap
-        if not failed:
-            # 所有目标都在"上次已成功"的集合里（例如插件把消息只排进队列）：不当失败上报
-            self._log("warning", f"[转发] 本次没有可重试的目标，{int(gap)} 秒后再确认: {text[:24]!r}")
-            return
-        level = "warning" if tries <= self._forward_max_tries else "error"
-        self._log(level, f"[转发] 这条没发出去（第 {tries} 次，失败目标 "
-                         f"{len(failed)} 个）：{text[:24]!r}；{int(gap)} 秒后重试失败的目标"
-                         f"（已成功的目标不会重发）")
+        if sent:
+            # 部分成功：**立刻**记历史（否则标签一变就会被当成新消息，重发一遍私聊）
+            self._mark_forwarded(contact, text, label, disp)
+        self._schedule_fwd_plan(contact, text, label, disp, sticker, failed)
 
     def _warm_emoji_store(self) -> None:
         """后台预热表情包名字索引（失败无所谓，收到表情时会按需再建）。"""
@@ -1004,18 +1143,22 @@ class MessageBridge:
 
     def _forward(self, contact, text: str, time_label: str = "",
                  sticker: dict | None = None,
-                 skip: set | None = None) -> tuple[bool, list, list]:
-        """转发到所有 QQ 目标。返回 (是否全部成功, 成功的目标, 失败的目标)。
+                 only: list | None = None) -> tuple[bool, list, list]:
+        """转发到 QQ 目标。返回 (是否全部成功, 成功的目标, 失败的目标)。
 
         sticker：表情图（{data, kind, animated}）。给了就发"图片（+说明文字）"，
         失败自动退回纯文字。**单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字。
-        skip：这次不重发的目标（上次已经成功的）——避免"群失败就把私聊再刷一遍"。
+        only：只发这些目标（补投计划用它**只重试失败的目标**，绝不碰已经成功的那几个）。
         """
         targets = self._qq_targets()
         if not targets:
             self._log("info", f"[占位] 收到小天才消息（未配置 QQ 目标，仅打印）: {text}")
             return True, [], []
-        skip = skip or set()
+        if only is not None:
+            wanted = {(t, i) for t, i in only}
+            targets = [t for t in targets if t in wanted]
+            if not targets:
+                return True, [], []
         # 转发格式：[日期时间] [本地配置昵称] 消息内容。
         # 时间优先取小天才 App 内该消息的日期标签（如 "昨天 23:42"、"8月30日"）；
         # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
@@ -1037,10 +1180,6 @@ class MessageBridge:
         failed: list = []
         for target_type, target_id in targets:
             why = ""
-            if (target_type, target_id) in skip:
-                self._log("debug", f"[转发] 跳过上次已成功的目标 {target_type}:{target_id}")
-                sent.append((target_type, target_id))
-                continue
             try:
                 if image_b64:
                     send_image = getattr(self.forwarder, "send_image", None)
