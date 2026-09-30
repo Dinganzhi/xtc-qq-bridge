@@ -132,13 +132,15 @@ class Xiaotiancai:
     # 图片（照片）消息归一化后的文本（见模块级 IMAGE_TEXT 注释）；挂成类属性方便外部引用
     IMAGE_TEXT = IMAGE_TEXT
 
-    def __init__(self, adb: ADBController, cfg: dict | None = None, logger=None):
+    def __init__(self, adb: ADBController, cfg: dict | None = None, logger=None,
+                 cache_path: str | None = None):
         self.adb = adb
         cfg = cfg or {}
         self.package = cfg.get("package", "com.xtc.watch")
         self.main_activity = cfg.get("main_activity", ".MainActivity")
         self.ui = cfg.get("ui", {}) or {}
         self.logger = logger
+        self._cache_path = cache_path or ""
         self._warned_not_login = False
         # 登录态缓存：is_logged_in() 需要 dump 界面（1~2s），轮询每 2s 调一次会明显变慢；
         # 这里按 login_state_ttl 秒缓存，登录动作/启动动作后主动失效。
@@ -169,7 +171,10 @@ class Xiaotiancai:
         self._snapshot = None
         self._snapshot_ts = float("-inf")
         # 发送按钮坐标缓存 + 快路径开关（省掉"注入后 dump 一次找发送按钮"的 ~3 秒）
+        # 缓存会落盘（cache_path）：重启后第一条消息也能走"先手打字"，
+        # 否则重启后的第一条只能走稳妥流程（多 dump 两三次 = 十几秒）。
         self._send_cache: dict | None = None
+        self._load_send_cache()
         # "先手打字"的中间状态（begin_blind_send -> end_blind_send）
         self._blind: dict | None = None
         self._blind_enabled = bool(self.ui.get("blind_send", True))
@@ -1971,6 +1976,7 @@ class Xiaotiancai:
                     "point": (int(center[0]), int(center[1])),
                     "input_point": ((x1 + x2) // 2, (y1 + y2) // 2),
                 }
+                self._save_send_cache()   # 落盘：重启后第一条消息也能走"先手打字"
         except Exception as e:  # noqa: BLE001 缓存失败不影响发送
             self.log("debug", f"发送按钮坐标缓存失败: {e}")
 
@@ -2068,7 +2074,56 @@ class Xiaotiancai:
         if not ok and retryable:
             # 没发出去（文字还在输入框里）：清掉缓存坐标，让稳妥流程重来
             self._send_cache = None
+            self._save_send_cache()
         return ok, why, retryable
+
+    # ---- 发送坐标缓存的落盘（重启后第一条消息也能"先手打字"） ----
+    def _load_send_cache(self) -> None:
+        """从磁盘恢复上次学到的发送按钮坐标（拿不到就照旧现场学）。"""
+        if not self._cache_path:
+            return
+        try:
+            import json
+            import os
+            if not os.path.exists(self._cache_path):
+                return
+            with open(self._cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            inp = tuple(data.get("input") or ())
+            pt = tuple(data.get("point") or ())
+            ip = tuple(data.get("input_point") or ())
+            if len(inp) == 4 and len(pt) == 2:
+                self._send_cache = {
+                    "input": tuple(int(v) for v in inp),
+                    "point": tuple(int(v) for v in pt),
+                    "input_point": (tuple(int(v) for v in ip) if len(ip) == 2
+                                    else ((inp[0] + inp[2]) // 2, (inp[1] + inp[3]) // 2)),
+                }
+                self.log("debug", f"已恢复发送按钮坐标缓存: {data}")
+        except Exception as e:  # noqa: BLE001 缓存坏了不影响功能（大不了重新学）
+            self.log("debug", f"读取发送按钮坐标缓存失败: {e}")
+
+    def _save_send_cache(self) -> None:
+        """把发送按钮坐标缓存落盘（下次启动直接用；用前仍会校验输入框位置/屏幕尺寸）。"""
+        if not self._cache_path:
+            return
+        try:
+            import json
+            import os
+            data = {
+                "input": [int(v) for v in self._send_cache["input"]],
+                "point": [int(v) for v in self._send_cache["point"]],
+                "input_point": [int(v) for v in (self._send_cache.get("input_point") or ())],
+            }
+            os.makedirs(os.path.dirname(self._cache_path) or ".", exist_ok=True)
+            tmp = self._cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._cache_path)
+        except Exception as e:  # noqa: BLE001 落盘失败不影响功能
+            self.log("debug", f"写入发送按钮坐标缓存失败: {e}")
 
     def learn_send_point(self, probe: str = "a") -> bool:
         """启动时用一次"探针注入"学出发送按钮坐标（不会发出任何消息）。
@@ -2078,6 +2133,22 @@ class Xiaotiancai:
         这里往输入框注入一个探针字符 -> dump 一次 -> 记下输入框与发送按钮坐标 ->
         立刻清空输入框。全程只输入、不点发送，所以不会有任何消息被发出去。
         """
+        try:
+            # 探针注入可能因为"输入框刚点、输入法还没挂上"而白注一次（实机踩过：启动时
+            # 学坐标失败 -> 重启后的第一条只能走稳妥流程，多花十几秒），所以重试一轮。
+            for attempt in range(2):
+                if self._learn_send_point_once(probe):
+                    return True
+                self.log("debug", f"第 {attempt + 1} 次学习发送按钮坐标未成功，重试一次")
+                time.sleep(0.5)
+            self.log("debug", "没能学出发送按钮坐标（首次发送仍走稳妥流程）")
+            return False
+        except Exception as e:  # noqa: BLE001 学不到就退回稳妥流程
+            self.log("debug", f"学习发送按钮坐标失败: {e}")
+            return False
+
+    def _learn_send_point_once(self, probe: str = "a") -> bool:
+        """学一次发送按钮坐标（只注入探针、不点发送，学完立刻清空输入框）。"""
         try:
             root = self.recent_snapshot() or self._dump_with_retry(1)
             edit = self._find_input(root) if root is not None else None
@@ -2091,15 +2162,24 @@ class Xiaotiancai:
             snap = self._dump_with_retry(1)          # 有内容了 -> 发送按钮出现
             if snap is None:
                 return False
+            # 探针没进输入框（刚启动时输入法常常还没挂上，实机踩过）：改用**带校验的完整
+            # 策略链**再试一次（含剪贴板兜底）。学不到坐标不影响正确性，只是第一条会慢一些。
+            cur = self._find_input(snap)
+            if cur is not None and probe not in (self._input_text_of(cur) or ""):
+                self.log("debug", "探针未进入输入框，改用带校验的注入流程再试一次")
+                if not self.adb.input_text(probe, verify=self.input_verifier(probe)):
+                    self._clear_chat_input(self._dump_with_retry(1) or snap)
+                    return False
+                snap = self._last_verify_root or self._dump_with_retry(1) or snap
+                self._last_verify_root = None
             send_node = self._find_send(snap)
             if send_node is not None and bounds:
                 self._remember_send_point(bounds, send_node, snap)
             # 清掉探针字符：绝不留内容在输入框里（否则会被拼进下一条消息）
             self._clear_chat_input(self._dump_with_retry(1) or snap)
             done = self._send_cache is not None
-            self.log("info" if done else "debug",
-                     "已学出发送按钮坐标（先手打字可用）" if done
-                     else "没能学出发送按钮坐标（首次发送仍走稳妥流程）")
+            if done:
+                self.log("info", "已学出发送按钮坐标（先手打字可用）")
             return done
         except Exception as e:  # noqa: BLE001 学不到就退回稳妥流程
             self.log("debug", f"学习发送按钮坐标失败: {e}")

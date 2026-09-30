@@ -277,7 +277,9 @@ def main() -> None:
             log.warning("保持常亮设置未生效（镜像可能不允许写设置）；息屏时桥接会自动唤醒屏幕")
 
     from xiaotiancai import Xiaotiancai
-    xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=log)
+    # 发送按钮坐标缓存落盘：重启后第一条 QQ 消息也能走"先手打字"（否则要多等两三次 dump）
+    xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=log,
+                      cache_path=str(runtime_paths.data_path("ui_send_cache.json")))
     xtc.launch()
 
     xc_cfg = cfg.get("xiaotiancai") or {}

@@ -32,6 +32,11 @@ adb:
 # ---------- 转发（QQ 侧） ----------
 forward:
   mode: "plugin"                                 # plugin=转发到 AstrBot 插件；log=仅打印调试
+  # 转发失败的重试纪律（小天才 -> QQ）：
+  #   只重试**没成功的目标**（私聊成功、群失败时不会把私聊再发一遍），
+  #   且按下面的间隔退避重试，不会"每轮轮询都重发"（旧行为会把私聊刷屏、并把发送拖慢）
+  retry_max_tries: 3                             # 前几次的间隔用 retry_backoff；超过后间隔 ×4 继续试
+  retry_backoff: 60                              # 首次失败后等多少秒再重试（秒）
   plugin:
     base_url: "http://127.0.0.1:11452"           # 与插件配置 http_port 一致
     token: "change-me-bridge-token"              # 与插件配置 token 一致（建议改随机串）

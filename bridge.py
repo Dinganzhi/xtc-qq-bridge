@@ -8,6 +8,7 @@ webhook.enabled=true 且 NapCat/插件回调就绪后启用。
 from __future__ import annotations
 
 import base64
+import collections
 import json
 import os
 import queue
@@ -232,7 +233,28 @@ class MessageBridge:
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
         self._job_queue: queue.Queue = queue.Queue()
+        # "发送专用"高优先级队列：QQ->小天才 是**用户正等着看**的交互（他在 QQ 里发完
+        # 就盯着手表），绝不能排在小天才->QQ 的转发、历史查询、聊天内"发送成功"回执后面。
+        # 实测（09-29 日志）：一条 QQ 消息在队列里等了 15~47 秒才轮到，就是被这些任务占着。
+        self._fast_queue: queue.Queue = queue.Queue()
+        # 为了给发送让路而"先取出来、稍后再做"的普通任务（保持原有先后顺序）
+        self._held_jobs: collections.deque = collections.deque()
         self._job_thread: threading.Thread | None = None
+        # 单条消息的转发重试状态：key -> {"tries", "sent", "next_ts"}。
+        # 为什么需要：QQ 侧某个目标一直失败（例如群被限流）时，旧实现因为"没成功就不记历史"
+        # 而每轮轮询都重发一次 —— 已成功的目标（私聊）被反复重发（用户被刷屏），
+        # 界面被持续占用，QQ->小天才 的发送排队几十秒。现在改成：只重试**没成功的目标**，
+        # 且按退避节奏重试，绝不无限重发。
+        self._forward_state: dict[tuple, dict] = {}
+        _fwd = cfg.get("forward") or {}
+        try:
+            self._forward_max_tries = int(_fwd.get("max_tries", 3) or 3)
+        except (TypeError, ValueError):
+            self._forward_max_tries = 3
+        try:
+            self._forward_retry_backoff = float(_fwd.get("retry_backoff", 60) or 60)
+        except (TypeError, ValueError):
+            self._forward_retry_backoff = 60.0
         self._last_chat_open = float("-inf")  # 聊天窗口重开冷却（初值 -inf：见上）
         # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
         self._auto_login_enabled = bool(
@@ -289,12 +311,36 @@ class MessageBridge:
             self._job_thread.join(timeout=5)
 
     # ------------------------------------------------------------------ 任务队列（FIFO，保证顺序）
+    def _next_job(self):
+        """取下一个任务：**发送优先**（返回 (来源队列, 任务)）。
+
+        规则：
+          1) 发送队列里有活 -> 先做发送（用户正等着）；
+          2) 之前为让路而暂存的任务 -> 按原顺序继续（不会再被插队）；
+          3) 否则从普通队列取；取到后发现发送在排队 -> 把普通任务暂存，先做发送。
+        这样既不饿死普通任务，也不会让"最新的一条 QQ 消息"排在一堆转发后面。
+        """
+        try:
+            return self._fast_queue, self._fast_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self._held_jobs:
+            return self._held_jobs.popleft()
+        try:
+            job = self._job_queue.get(timeout=0.2)
+        except queue.Empty:
+            return None
+        if not self._fast_queue.empty():
+            self._held_jobs.appendleft((self._job_queue, job))
+            return self._fast_queue, self._fast_queue.get_nowait()
+        return self._job_queue, job
+
     def _job_worker(self) -> None:
         while self.running:
-            try:
-                job = self._job_queue.get(timeout=1)
-            except queue.Empty:
+            picked = self._next_job()
+            if picked is None:
                 continue
+            src, job = picked
             try:
                 kind = job[0]
                 if kind == "send":
@@ -308,6 +354,9 @@ class MessageBridge:
                     f_disp = job[5] if len(job) > 5 else ""
                     self._do_forward_job(f_contact, f_text, f_label, sticker=f_sticker,
                                          display_label=f_disp)
+                elif kind == "confirm":
+                    # 小天才聊天里的"发送成功：…"回执：低优先级（见 _queue_confirm_xtc）
+                    self._confirm_xtc_delivery(job[1])
                 elif kind == "login":
                     _, request_id = job
                     self._do_login_job(request_id)
@@ -317,8 +366,8 @@ class MessageBridge:
                 elif kind == "history":
                     # 小天才历史消息：count + 回传方式（request_id 或写入小天才聊天）+ 来源过滤
                     _, count, request_id, into_chat = job[:4]
-                    src = job[4] if len(job) > 4 else ""
-                    self._do_history_job(count, request_id, into_chat, src)
+                    src_name = job[4] if len(job) > 4 else ""
+                    self._do_history_job(count, request_id, into_chat, src_name)
                 elif kind == "cmd":
                     # xtc 侧命令（在小天才聊天里输入的 /小天才 xxx，手表侧或家长侧均可）
                     _, text = job
@@ -331,7 +380,10 @@ class MessageBridge:
             except Exception as e:  # noqa: BLE001
                 self._log("warning", f"任务处理异常: {e}")
             finally:
-                self._job_queue.task_done()
+                try:
+                    src.task_done()
+                except ValueError:  # noqa: BLE001 理论上不会发生，别让工作线程挂掉
+                    pass
 
     # ------------------------------------------------------------------ 轮询
     def _poll_loop(self) -> None:
@@ -476,7 +528,8 @@ class MessageBridge:
                     label = self._abs_time_label(raw_label) or raw_label
                     key = ("xtc", contact or "", text, label)
                     dup = (self.history.seen(*key) or self.dedup.seen(key)
-                           or self.echo.is_echo(text))
+                           or self.echo.is_echo(text)
+                           or self._forward_backing_off(key))
                     if not dup and not label:
                         # 读不到时间标签时只能按文本保守判定：宁可不重发，也不要反复刷同一条
                         dup = self.msgs.seen(text, "xtc")
@@ -591,6 +644,11 @@ class MessageBridge:
                 # 但不当作边界，继续往上找更老的那几条
                 self._log("debug", f"[补发] 这条最近试过，先跳过: {text[:24]!r}")
                 continue
+            if self._forward_backing_off(self._fwd_key(contact, text, ident)):
+                # 上次转发失败、正在退避：**不当作边界**（库里仍没有它），但这一轮不重发。
+                # 旧实现没有这层，于是"群发失败"会让同一条消息每 5 秒被重转一次，刷屏 + 拖慢发送。
+                self._log("debug", f"[补发] 这条在失败退避中，先跳过: {text[:24]!r}")
+                continue
             # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
             if it.get("sticker") or it.get("image"):
@@ -673,25 +731,79 @@ class MessageBridge:
         self._job_queue.put(("forward", contact, text, label or "", sticker,
                              display_label or label or ""))
 
+    def _fwd_key(self, contact, text: str, label: str) -> tuple:
+        """转发身份键（与实时/补发两条路径共用，必须同源）。"""
+        return ("xtc", contact or "", text, label or "")
+
+    def _fwd_state(self, key: tuple) -> dict:
+        """取（或建）某条消息的转发重试状态。只保留最近 50 条，避免无限增长。"""
+        st = self._forward_state.get(key)
+        if st is not None:
+            return st
+        while len(self._forward_state) >= 50:
+            self._forward_state.pop(next(iter(self._forward_state)), None)
+        st = {"tries": 0, "sent": set(), "next_ts": 0.0}
+        self._forward_state[key] = st
+        return st
+
+    def _forward_backing_off(self, key: tuple) -> bool:
+        """这条消息是否处于"失败退避"中（退避期间两条路径都不再重复转发）。"""
+        st = self._forward_state.get(key)
+        if not st:
+            return False
+        return time.monotonic() < float(st.get("next_ts") or 0.0)
+
+    def _queue_confirm_xtc(self, message: str) -> None:
+        """小天才聊天里的"发送成功：…"回执 -> 入**普通队列**（低优先级）。
+
+        为什么不再同步做：它要在聊天页里点输入框/打字/点发送（占界面锁好几秒），
+        同步做就会把"用户刚在 QQ 发的那条消息"一起堵在后面（实测堵过 20 秒）。
+        """
+        self._job_queue.put(("confirm", message))
+
     def _do_forward_job(self, contact: str, text: str, label: str,
                         sticker: dict | None = None, display_label: str = "") -> None:
-        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败下轮会重试）。
+        """工作线程里真正执行转发；成功才写入长期历史与消息库（失败按退避重试）。
 
         label 是身份标签（去重/历史都用它），display_label 只用于给 QQ 那条消息的抬头时间。
+        失败重试的三条纪律（用户实测过的坑）：
+          * **只重试没成功的目标**：私聊成功、群失败时，绝不把私聊再发一遍；
+          * **退避重试**：不再"每轮轮询都重发"（旧实现会 5 秒一轮刷到天荒地老）；
+          * 超过 max_tries 后降到分钟级间隔继续试，消息不会丢，也不会刷屏。
         """
         disp = display_label or label
+        key = self._fwd_key(contact, text, label)
+        st = self._fwd_state(key)
+        now = time.monotonic()
+        if now < float(st.get("next_ts") or 0.0):
+            return                              # 退避中：本轮不试
+        st["tries"] = int(st.get("tries") or 0) + 1
         try:
-            ok = self._forward(contact, text, disp, sticker=sticker)
+            ok, sent, failed = self._forward(contact, text, disp, sticker=sticker,
+                                             skip=set(st.get("sent") or ()))
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
-            ok = False
-        if not ok:
-            self._log("warning", f"[转发] 这条没发出去，稍后重试: {text[:24]!r}")
+            ok, sent, failed = False, [], []
+        st["sent"] = set(st.get("sent") or ()) | set(sent)
+        if ok:
+            self._forward_state.pop(key, None)
+            self.history.mark("xtc", contact or "", text, label or "")
+            if not self.msgs.seen(text, "xtc"):
+                self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
+                                 source=self._xtc_source(contact), source_id=contact or "")
             return
-        self.history.mark("xtc", contact or "", text, label or "")
-        if not self.msgs.seen(text, "xtc"):
-            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
-                             source=self._xtc_source(contact), source_id=contact or "")
+        tries = int(st["tries"])
+        # 退避：前两次按 retry_backoff，之后按 4 倍（分钟级）——重试仍然发生，但不再刷屏
+        gap = self._forward_retry_backoff * (1.0 if tries < 2 else 4.0)
+        st["next_ts"] = now + gap
+        if not failed:
+            # 所有目标都在"上次已成功"的集合里（例如插件把消息只排进队列）：不当失败上报
+            self._log("warning", f"[转发] 本次没有可重试的目标，{int(gap)} 秒后再确认: {text[:24]!r}")
+            return
+        level = "warning" if tries <= self._forward_max_tries else "error"
+        self._log(level, f"[转发] 这条没发出去（第 {tries} 次，失败目标 "
+                         f"{len(failed)} 个）：{text[:24]!r}；{int(gap)} 秒后重试失败的目标"
+                         f"（已成功的目标不会重发）")
 
     def _warm_emoji_store(self) -> None:
         """后台预热表情包名字索引（失败无所谓，收到表情时会按需再建）。"""
@@ -891,16 +1003,19 @@ class MessageBridge:
                   "（或执行 wsa:// 设置里的 Repair），桥接会自动重连 ADB 继续工作")
 
     def _forward(self, contact, text: str, time_label: str = "",
-                 sticker: dict | None = None) -> bool:
-        """转发到所有 QQ 目标。返回是否全部成功（供轮询决定是否记入长期历史）。
+                 sticker: dict | None = None,
+                 skip: set | None = None) -> tuple[bool, list, list]:
+        """转发到所有 QQ 目标。返回 (是否全部成功, 成功的目标, 失败的目标)。
 
         sticker：表情图（{data, kind, animated}）。给了就发"图片（+说明文字）"，
         失败自动退回纯文字。**单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字。
+        skip：这次不重发的目标（上次已经成功的）——避免"群失败就把私聊再刷一遍"。
         """
         targets = self._qq_targets()
         if not targets:
             self._log("info", f"[占位] 收到小天才消息（未配置 QQ 目标，仅打印）: {text}")
-            return True
+            return True, [], []
+        skip = skip or set()
         # 转发格式：[日期时间] [本地配置昵称] 消息内容。
         # 时间优先取小天才 App 内该消息的日期标签（如 "昨天 23:42"、"8月30日"）；
         # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
@@ -918,8 +1033,14 @@ class MessageBridge:
                 image_b64 = ""
         ok_all = True
         queued = False
+        sent: list = []
+        failed: list = []
         for target_type, target_id in targets:
             why = ""
+            if (target_type, target_id) in skip:
+                self._log("debug", f"[转发] 跳过上次已成功的目标 {target_type}:{target_id}")
+                sent.append((target_type, target_id))
+                continue
             try:
                 if image_b64:
                     send_image = getattr(self.forwarder, "send_image", None)
@@ -939,14 +1060,17 @@ class MessageBridge:
                 # 插件只把消息排进队列（事件循环还没起来）：没真的发出去，
                 # 不能报"转发成功"，更不能发"发送成功"的送达确认
                 queued = True
+                sent.append((target_type, target_id))   # 已交给插件，重发会变成两条
                 self._log("warning", f"[转发未确认] {target_type}:{target_id} "
                                      "插件刚启动，消息只是排队（未确认已发出）")
                 continue
             shown = message + (f"（+{sticker.get('label') or '表情图'} {image_size} 字节）"
                                if image_b64 else "")
             if ok:
+                sent.append((target_type, target_id))
                 self._log("info", f"[转发成功] {target_type}:{target_id} <- {shown}")
             else:
+                failed.append((target_type, target_id))
                 self._log("error", f"[转发失败] {target_type}:{target_id} <- {shown}"
                                    + (f"  原因: {why}" if why else ""))
                 ok_all = False
@@ -954,13 +1078,14 @@ class MessageBridge:
             # 标记原文 + 格式化消息：多实例/重启后也不会再转发同一条
             self.echo.mark(text)
             self.echo.mark(message)
-            self._confirm_xtc_delivery(message)  # 小天才侧送达确认（发送成功：<内容>）
+            # 小天才侧送达确认（发送成功：<内容>）走**低优先级任务**，不堵住后续发送
+            self._queue_confirm_xtc(message)
         elif ok_all and queued:
             # 已交出去但没确认：同样记历史避免重复，但不发"发送成功"（不撒谎）
             self.echo.mark(text)
             self.echo.mark(message)
             self._log("info", "小天才侧送达确认已跳过：本次转发未确认（插件排队中）")
-        return ok_all
+        return ok_all, sent, failed
 
     def _send_text(self, target_type, target_id, message: str) -> tuple:
         """发纯文字（兼容只有 send() 的旧转发器）。返回 (ok, why)。"""
@@ -1051,12 +1176,14 @@ class MessageBridge:
         # 收到就打印：便于在控制台确认 QQ 命令/消息真的到达了桥接（用户报告"看不到"）
         self._log("info", f"[收到QQ命令] 来源={where} 内容={text!r}"
                           + (f" request_id={request_id}" if request_id else "")
-                          + f"（队列中 {self._job_queue.qsize()} 条待处理）")
+                          + f"（队列中 {self._job_queue.qsize() + self._fast_queue.qsize()}"
+                            " 条待处理）")
         # 让轮询先停一轮 dump，把 adb/操作锁让给发送（见 _poll_loop 开头的让路逻辑）
         if not self._send_pending:
             self._send_pending_ts = time.monotonic()
         self._send_pending = True
-        self._job_queue.put(("send", text, user_id, group_id, request_id))
+        # 走**发送专用队列**：工作线程优先处理它，不排在转发/历史/回执后面（见 _next_job）
+        self._fast_queue.put(("send", text, user_id, group_id, request_id))
         return True
 
     def _blind_send_allowed(self, contact: str) -> bool:
@@ -1083,6 +1210,48 @@ class MessageBridge:
             return False
         return True
 
+    def _push_text_to_xtc(self, text: str, tag: str = "QQ->小天才") -> bool:
+        """把一段文字送进小天才聊天窗口（能用"先手打字"就用，失败退回稳妥流程）。
+
+        tag 只用于日志前缀（QQ->小天才 / 送达确认），两条路径共用同一套发送逻辑，
+        所以"回执"也能享受先手打字的 ~1 秒速度，而不是每次都走 2~3 次 dump 的稳妥流程。
+        """
+        contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+        if not contact:
+            self._log("error", "反向转发需要 config.yaml -> target.xtc_contact")
+            return False
+        ok = False
+        skip_safe = False
+        # ① "先手打字"：直接按缓存坐标点输入框 + 广播注入 + 点发送，
+        #    **不等轮询那次 dump、也不抢操作锁** —— 文字 ~1 秒内就出现在输入框里。
+        #    复核放在后面（要 dump），失败再退回稳妥流程。
+        if self._blind_send_allowed(contact):
+            t0 = time.monotonic()
+            staged, why = self.xtc.begin_blind_send(text)
+            if staged:
+                self._log("info", f"[{tag}] 已先手输入（{time.monotonic() - t0:.1f}s），"
+                                  "正在复核…")
+                with self._op_lock:
+                    ok, why, retryable = self.xtc.end_blind_send(text)
+                if ok:
+                    self._log("info", f"[{tag}] 先手发送已复核通过"
+                                      f"（总 {time.monotonic() - t0:.1f}s）")
+                else:
+                    skip_safe = not retryable
+                    self._log("warning" if skip_safe else "info",
+                              f"[{tag}] 先手发送未确认（{why}）"
+                              + ("，且不宜重发，按失败上报" if skip_safe else "，改用稳妥流程"))
+            else:
+                self._log("debug", f"[{tag}] 先手输入未启用（{why}），走稳妥流程")
+        # ② 稳妥流程（未走先手 / 先手没发出去且可安全重发时）
+        if not ok and not skip_safe:
+            with self._op_lock:
+                in_chat = self.xtc.open_chat(contact)
+                ok = in_chat and self.xtc.send_message(text)
+            if not in_chat:
+                self._log("error", f"[{tag}] 未能进入小天才聊天窗口，未发送")
+        return ok
+
     def _do_send_job(self, text: str, user_id: str, group_id: str, request_id: str) -> None:
         """实际执行 QQ->小天才 发送 + 送达确认（工作线程内，按入队顺序）。"""
         self.echo.mark(text)
@@ -1091,45 +1260,20 @@ class MessageBridge:
             self._log("error", "反向转发需要 config.yaml -> target.xtc_contact")
             return
         self._log("info", f"[QQ->小天才] 开始发送: {text[:80]!r}")
+        t_all = time.monotonic()
         ok = False
-        skip_safe = False
         try:
-            # ① "先手打字"：直接按缓存坐标点输入框 + 广播注入 + 点发送，
-            #    **不等轮询那次 dump、也不抢操作锁** —— 文字 ~1 秒内就出现在输入框里。
-            #    复核放在后面（要 dump），失败再退回稳妥流程。
-            if self._blind_send_allowed(contact):
-                t0 = time.monotonic()
-                staged, why = self.xtc.begin_blind_send(text)
-                if staged:
-                    self._log("info", f"[QQ->小天才] 已先手输入（{time.monotonic() - t0:.1f}s），"
-                                      "正在复核…")
-                    with self._op_lock:
-                        ok, why, retryable = self.xtc.end_blind_send(text)
-                    if ok:
-                        self._log("info", f"[QQ->小天才] 先手发送已复核通过"
-                                          f"（总 {time.monotonic() - t0:.1f}s）")
-                    else:
-                        skip_safe = not retryable
-                        self._log("warning" if skip_safe else "info",
-                                  f"[QQ->小天才] 先手发送未确认（{why}）"
-                                  + ("，且不宜重发，按失败上报" if skip_safe else "，改用稳妥流程"))
-                else:
-                    self._log("debug", f"[QQ->小天才] 先手输入未启用（{why}），走稳妥流程")
-            # ② 稳妥流程（未走先手 / 先手没发出去且可安全重发时）
-            if not ok and not skip_safe:
-                with self._op_lock:
-                    in_chat = self.xtc.open_chat(contact)
-                    ok = in_chat and self.xtc.send_message(text)
-                if not in_chat:
-                    self._log("error", "[QQ->小天才] 未能进入小天才聊天窗口，未发送")
+            ok = self._push_text_to_xtc(text, tag="QQ->小天才")
         except Exception as e:  # noqa: BLE001 单条发送异常不能让工作线程退出
             self._log("warning", f"[QQ->小天才] 发送异常: {e}")
             ok = False
         finally:
             # 队列里还有待发的就继续让路（_send_pending_ts 不刷新，最长 30 秒兜底）
-            self._send_pending = not self._job_queue.empty()
+            self._send_pending = not (self._job_queue.empty() and self._fast_queue.empty())
+        # 带上总耗时：以后"到底慢在哪一步"看这一行就够了（输入阶段/复核阶段也各有日志）
         self._log("info" if ok else "error",
-                  f"[QQ->小天才] {'发送成功' if ok else '发送失败'}: {text[:80]!r}")
+                  f"[QQ->小天才] {'发送成功' if ok else '发送失败'}"
+                  f"（总 {time.monotonic() - t_all:.1f}s）: {text[:80]!r}")
         if ok:
             # 记录到长期历史：即使重启，这条消息也不会被当作"新消息"转发回 QQ
             self.history.mark("qq2xtc", text)
@@ -1209,17 +1353,23 @@ class MessageBridge:
 
     def _confirm_xtc_delivery(self, message: str) -> None:
         """小天才消息转发到 QQ 成功后，在小天才聊天内回复「发送成功：<转发内容>」。
-        确认消息以"发送成功"开头且为家长侧消息（右侧气泡），读取路径按前缀过滤，不会循环转发。"""
+        确认消息以"发送成功"开头且为家长侧消息（右侧气泡），读取路径按前缀过滤，不会循环转发。
+
+        这段是**低优先级任务**（见 `_queue_confirm_xtc`）：要往聊天页打字，占界面锁好几秒，
+        所以排在用户新发的 QQ 消息后面做；能用先手打字就用（~1 秒）。"""
         if not self._confirm_delivery():
             return
         try:
-            if not self.xtc.is_in_chat():
+            contact = (self.cfg.get("target") or {}).get("xtc_contact", "")
+            # 能用先手打字时不必先 dump 一次查"在不在聊天页"（门闩已经保证刚确认过聊天页）
+            if not self._blind_send_allowed(contact) and not self.xtc.is_in_chat():
                 return  # 不在聊天页就不打扰
             confirm_text = "发送成功：" + message
             self.echo.mark(confirm_text)
-            with self._op_lock:
-                self.xtc.send_message(confirm_text)
-            self._log("info", f"[送达确认] 已在小天才聊天回复 {confirm_text}")
+            if self._push_text_to_xtc(confirm_text, tag="送达确认"):
+                self._log("info", f"[送达确认] 已在小天才聊天回复 {confirm_text}")
+            else:
+                self._log("warning", f"[送达确认] 未能在小天才聊天回复 {confirm_text}")
         except Exception as e:  # noqa: BLE001
             self._log("debug", f"小天才送达确认跳过: {e}")
 

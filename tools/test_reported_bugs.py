@@ -805,6 +805,64 @@ def test_poll_loop_yields_to_pending_send() -> None:
         cleanup(root)
 
 
+def test_send_jumps_ahead_of_other_jobs() -> None:
+    """QQ->小天才 的发送必须**优先**：实测它曾被转发/回执/历史任务堵 15~47 秒。
+
+    规则（`_next_job`）：发送队列非空就先做发送；为了给发送让路而先取出来的普通任务
+    按**原顺序**暂存、稍后先做（不会打乱 小天才->QQ 的转发次序）。
+    """
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+
+        # 普通任务先入队、发送后入队 -> 发送仍然先被取到
+        br._job_queue.put(("forward", "c", "老的转发", "13:00", None, "13:00"))
+        br._fast_queue.put(("send", "新消息", "10001", "", ""))
+        src1, job1 = br._next_job()
+        check("发送优先于先入队的转发", job1[0] == "send" and job1[1] == "新消息", str(job1))
+        check("发送任务来自发送专用队列", src1 is br._fast_queue, str(src1))
+        src2, job2 = br._next_job()
+        check("让路时被暂存的普通任务随后执行（顺序不乱）",
+              job2[0] == "forward" and job2[2] == "老的转发", str(job2))
+        check("暂存任务归还的是原队列（task_done 计数不会错）", src2 is br._job_queue, str(src2))
+
+        # 多个转发保持原有先后顺序（暂存栈不能把后面的插到前面）
+        br._job_queue.put(("forward", "c", "转发1", "13:01", None, "13:01"))
+        br._job_queue.put(("forward", "c", "转发2", "13:02", None, "13:02"))
+        br._fast_queue.put(("send", "插队的发送", "10001", "", ""))
+        order = [br._next_job()[1][0]]
+        br._fast_queue.put(("send", "又来一条", "10001", "", ""))
+        while True:
+            picked = br._next_job()
+            if picked is None:
+                break
+            order.append(picked[1][0])
+            if picked[1][0] == "forward":
+                order.append(picked[1][2])
+        check("发送连续插队，转发仍按原顺序",
+              order[:2] == ["send", "send"]
+              and [x for x in order if x in ("转发1", "转发2")] == ["转发1", "转发2"],
+              str(order))
+
+        # 队列里的发送会计入"待处理"（轮询据此让路）
+        br2 = bridge_mod.MessageBridge({"target": {"xtc_contact": "张三"},
+                                        "xiaotiancai": {}, "webhook": {}},
+                                       adb=None, xtc=None, forwarder=None, logger=None)
+        br2.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br2._cmd_done_file = str(_paths(root)["done"])
+        br2._do_send_job = lambda *a: None            # 只测入队与让路标记
+        br2.forward_to_xiaotiancai("测试", "10001")
+        check("反向消息进的是发送专用队列",
+              br2._fast_queue.qsize() == 1 and br2._job_queue.qsize() == 0
+              and br2._send_pending is True,
+              f"fast={br2._fast_queue.qsize()} normal={br2._job_queue.qsize()}")
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -3958,6 +4016,9 @@ def test_no_delivery_confirm_on_forward_failure() -> None:
 
     用户报告：小天才→QQ 明明发送失败，手表聊天里却出现"发送成功：…"。
     根因是旧客户端把 HTTP 200 当成功（插件失败也是 200 + {"ok": false}）。
+
+    注意：确认改成**低优先级任务**（`confirm` 入队，见 `_queue_confirm_xtc`），
+    所以这里查"有没有排队等回执"，而不是"是否已经同步写进聊天"。
     """
     root = tmp_root()
 
@@ -3977,6 +4038,9 @@ def test_no_delivery_confirm_on_forward_failure() -> None:
             self.sent: list = []
 
         def is_in_chat(self):
+            return True
+
+        def open_chat(self, contact):
             return True
 
         def send_message(self, text):
@@ -3999,8 +4063,18 @@ def test_no_delivery_confirm_on_forward_failure() -> None:
         except Exception as e:  # noqa: BLE001
             check(f"{name}: 转发链路不抛异常", False, f"{type(e).__name__}: {e}")
             continue
+        pending = []
+        while not br._job_queue.empty():
+            pending.append(br._job_queue.get_nowait())
+        confirms = [j for j in pending if j and j[0] == "confirm"]
         check(f"{name} -> 送达确认={'有' if expect else '无'}",
-              bool(xtc.sent) == expect, f"sent={xtc.sent}")
+              bool(confirms) == expect, f"pending={pending}")
+        if expect:
+            # 排队之后真的执行一遍 -> 才写进小天才聊天（异步，但不丢）
+            br._confirm_xtc_delivery(confirms[0][1])
+            check(f"{name} -> 执行后确实在小天才侧回执",
+                  bool(xtc.sent) and xtc.sent[0].startswith("发送成功："),
+                  f"sent={xtc.sent}")
     cleanup(root)
 
 
@@ -4300,7 +4374,8 @@ def test_backlog_walk_until_known() -> None:
         check("命令与系统提示被跳过且不算边界",
               n4 == 1 and "新消息" in fwd3.sent[0], f"n={n4} sent={fwd3.sent}")
 
-        # 转发失败：不入库（所以之后还会被当成"库里没有"重试），但受 120 秒节流保护
+        # 转发失败：不入库（所以之后还会被当成"库里没有"重试），但按**退避**重试 ——
+        # 旧实现是"每轮轮询都重发"，一条群发失败的消息会把私聊刷成几十条（用户实测）。
         fwd4 = _Fwd(ok=False)
         br4 = _backlog_bridge(root, fwd4, bubbles("会失败的"))
         check("转发失败时不入库",
@@ -4309,9 +4384,58 @@ def test_backlog_walk_until_known() -> None:
         check("失败的消息没进消息库（之后还会重试）",
               br4.msgs.seen("会失败的", "xtc") is False)
         br4.dedup = bridge_mod.Deduplicator()      # 模拟 120 秒节流窗口过去
+        fwd4.sent.clear()
+        check("退避窗口内不重发（不会每轮刷屏重转）",
+              br4._forward_backlog(None, "屑猹不喝茶") == 0 and not fwd4.sent,
+              f"sent={fwd4.sent}")
+        # 模拟退避时间过去 -> 允许再试一次，且这次成功就入库
+        for st in br4._forward_state.values():
+            st["next_ts"] = 0.0
         fwd4.ok = True
         n5 = br4._forward_backlog(None, "屑猹不喝茶")
-        check("节流窗口过后会重试", n5 == 1, f"n={n5}")
+        check("退避窗口过后会重试", n5 == 1, f"n={n5}")
+        check("重试成功后入库（之后不再重发）",
+              br4.msgs.seen("会失败的", "xtc") is True)
+
+        # 部分成功：私聊已成功、群失败 -> 只重试群，绝不把私聊再发一遍
+        class _FwdPartial(_Fwd):
+            def __init__(self):
+                super().__init__(ok=True)
+                self.group_ok = False
+                self.private_sends = 0
+                self.group_sends = 0
+
+            def send_detail(self, t, i, m):
+                if t == "group":
+                    self.group_sends += 1
+                    self.sent.append(m)
+                    return self.group_ok, "" if self.group_ok else "群被限流"
+                self.private_sends += 1
+                self.sent.append(m)
+                return True, ""
+
+        cfg2 = {"target": {"xtc_contact": "张三",
+                           "qq_private": "2218631043", "qq_group": "472805002"},
+                "xiaotiancai": {}, "webhook": {}}
+        fwd7 = _FwdPartial()
+        br7 = bridge_mod.MessageBridge(cfg2, adb=None, xtc=None, forwarder=fwd7, logger=None)
+        # 状态文件也用 .bugtest 前缀（tmp_root/cleanup 只会清这一类，否则会跨次运行残留）
+        _p = f".bugtest{_SEQ['n']}_partial"
+        br7.msgs = MessageLog(path=str(root / f"{_p}_msg.json"))
+        br7._cmd_done_file = str(root / f"{_p}_done.json")
+        br7._do_forward_job("屑猹不喝茶", "只成功一半", "13:00")
+        check("私聊成功、群失败 -> 整条按失败上报（不入库）",
+              fwd7.private_sends == 1 and fwd7.group_sends == 1
+              and br7.msgs.seen("只成功一半", "xtc") is False,
+              f"p={fwd7.private_sends} g={fwd7.group_sends}")
+        for st in br7._forward_state.values():
+            st["next_ts"] = 0.0
+        fwd7.group_ok = True
+        br7._do_forward_job("屑猹不喝茶", "只成功一半", "13:00")
+        check("重试只补失败的目标（私聊不再发第二遍）",
+              fwd7.private_sends == 1 and fwd7.group_sends == 2,
+              f"p={fwd7.private_sends} g={fwd7.group_sends}")
+        check("补成功后入库", br7.msgs.seen("只成功一半", "xtc") is True)
 
         # 上限：只补最早的一批，剩下的下一轮继续
         fwd5 = _Fwd()
@@ -4405,6 +4529,7 @@ def main() -> int:
                test_recent_snapshot_window, test_plain_injection_skips_dump,
                test_ime_check_is_cached, test_launch_app_skips_hard_failures_fast,
                test_poll_loop_yields_to_pending_send,
+              test_send_jumps_ahead_of_other_jobs,
                test_png_encoder_and_crop, test_screencap_header_parsing,
                test_sticker_detection_and_capture, test_sticker_forward_one_way,
                test_emoji_store_reads_original_file, test_blind_send_fast_typing,
