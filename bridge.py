@@ -268,6 +268,24 @@ class MessageBridge:
                 0.0, float(_fwd.get("content_dedup_secs", 300) or 0))
         except (TypeError, ValueError):
             self._forward_content_guard = 300.0
+        # 媒体（图片/表情）**还没下载完**时的等待重试：App 先画出占位图，原图可能
+        # 几秒~几分钟后才落盘（实测 22:12 检测到消息、22:19 原图才出现）。
+        # 这期间先不转发，否则 QQ 只会收到"图片"两个字。
+        self._pending_media: dict[tuple, dict] = {}
+        _media = cfg.get("emoji") or {}
+        try:
+            self._media_retry_max = max(1, int(_media.get("wait_retries", 8) or 8))
+        except (TypeError, ValueError):
+            self._media_retry_max = 8
+        try:
+            self._media_retry_base = max(1.0, float(_media.get("wait_base", 5) or 5))
+        except (TypeError, ValueError):
+            self._media_retry_base = 5.0
+        try:
+            self._media_retry_max_wait = max(
+                30.0, float(_media.get("wait_max_secs", 1800) or 1800))
+        except (TypeError, ValueError):
+            self._media_retry_max_wait = 1800.0
         self._last_chat_open = float("-inf")  # 聊天窗口重开冷却（初值 -inf：见上）
         # 自动登录检测开关（/小天才 自动登录 可切换；默认开启）
         self._auto_login_enabled = bool(
@@ -552,6 +570,14 @@ class MessageBridge:
                     if not dup and not label:
                         # 读不到时间标签时只能按文本保守判定：宁可不重发，也不要反复刷同一条
                         dup = self.msgs.seen(text, "xtc")
+                    # 图片/表情：媒体（原图/贴纸）可能**还没下载完**（App 先画出占位图，
+                    # 原图要过几秒~几分钟才落盘）。这时不能马上按"文字"转发 ——
+                    # 否则 QQ 只会收到"图片"两个字（用户实测：22:12 检测到、22:19 原图才出现）。
+                    is_media = (text == getattr(self.xtc, "IMAGE_TEXT", "图片")
+                                or text.startswith("表情"))
+                    mkey = self._fwd_key(contact, text, label)
+                    if not dup and is_media and self._media_retry_decision(mkey) == "wait":
+                        dup = True          # 本轮静默跳过：还在等媒体，不转发也不刷日志
                     if not dup:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
@@ -560,22 +586,40 @@ class MessageBridge:
                         # 发送会点输入框/打字/写"发送成功"提示，界面一动坐标就废了。
                         # 传消息自己的时间：检测可能滞后几分钟（刚重启/刚唤醒时），
                         # 缓存文件是"消息显示时"写进去的，只有按消息时间才找得回原图。
-                        if text == getattr(self.xtc, "IMAGE_TEXT", "图片") or text.startswith("表情"):
+                        if is_media:
                             got_lock = self._op_lock.acquire(timeout=self._media_lock_timeout)
                             try:
                                 sticker = self._capture_sticker(
-                                    root, text, near_epoch=self._label_epoch(time_label or ""))
+                                    root, text, near_epoch=self._label_epoch(time_label or ""),
+                                    match_label=key[3] or raw_label)
                             finally:
                                 if got_lock:
                                     self._op_lock.release()
+                            if sticker is None:
+                                # 拿不到媒体：登记"稍后重试"，**这一轮先不发**
+                                # （不发的话 QQ 只会收到"图片"两个字）
+                                self._media_retry_failed(mkey, contact, text, label, time_label,
+                                                         "界面上还是占位图、缓存里也还没有原图")
+                                skip_media = True
+                            else:
+                                self._media_retry_clear(mkey)
+                                skip_media = False
                         else:
                             sticker = None
-                        # 异步转发。**身份标签用归一化后的绝对时间**（与补发路径完全一致）：
-                        # 以前这里传的是原始标签（如 "21:55"），而补发用的是绝对标签
-                        # （"09-29 21:55"）—— 两条路径算出的去重键不同，于是同一条消息
-                        # 会被"补发 + 实时"各转发一次（用户报的"2 转发了两遍"就是这么来的）。
-                        self._queue_forward(contact, text, label, sticker=sticker,
-                                            display_label=time_label)
+                            skip_media = False
+                        if not skip_media:
+                            # 异步转发。**身份标签用归一化后的绝对时间**（与补发路径完全一致）：
+                            # 以前这里传的是原始标签（如 "21:55"），而补发用的是绝对标签
+                            # （"09-29 21:55"）—— 两条路径算出的去重键不同，于是同一条消息
+                            # 会被"补发 + 实时"各转发一次（用户报的"2 转发了两遍"就是这么来的）。
+                            self._queue_forward(contact, text, label, sticker=sticker,
+                                                display_label=time_label)
+                # 媒体（图片/表情）当时没就绪的那些：到点后重试取图并补发（不依赖"还是不是最新"）
+                if self._pending_media:
+                    try:
+                        self._retry_pending_media(root)
+                    except Exception as e:  # noqa: BLE001 重试异常不影响轮询
+                        self._log("warning", f"[媒体] 重试流程异常: {e}")
             except Exception as e:  # noqa: BLE001 单轮异常不致命
                 self._log("warning", f"轮询异常: {e}")
             # 只补"剩下的"时间：一轮里 dump+转发可能已花 3~4 秒，再无条件 sleep
@@ -672,8 +716,22 @@ class MessageBridge:
             # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
             if it.get("sticker") or it.get("image"):
+                mkey = self._fwd_key(contact, text, ident)
+                decision = self._media_retry_decision(mkey)
+                if decision == "wait":
+                    # 媒体还没就绪、也还没到重试时间：**直接停**，不往上翻（否则顺序会反：
+                    # 老消息反而先到 QQ）。到点由 `_retry_pending_media` 取图后补发。
+                    self._log("debug", f"[补发] 媒体还没就绪，先等它: {text[:24]!r}")
+                    break
                 sticker = self._capture_sticker(
-                    root, text, near_epoch=self._label_epoch(disp_lbl or own_lbl))
+                    root, text, near_epoch=self._label_epoch(disp_lbl or own_lbl),
+                    match_label=ident or disp_lbl)
+                if sticker is None and decision != "give_up":
+                    # 还没到"等太久"：登记重试并停在这里；到点后由 _retry_pending_media 处理
+                    self._media_retry_failed(mkey, contact, text, ident, disp_lbl,
+                                             "界面上还是占位图、缓存里也还没有原图")
+                    break
+                self._media_retry_clear(mkey)
             pending.append((text, ident, sticker, disp_lbl))
 
         if not pending:
@@ -752,6 +810,80 @@ class MessageBridge:
         # "真的要发出去"那一刻（见 _do_forward_job），否则刚入队的这条会被自己挡掉。
         self._job_queue.put(("forward", contact, text, label or "", sticker,
                              display_label or label or ""))
+
+    # ---- 媒体（图片/表情）还没下载完时的"等一会儿再取" ----
+    def _media_retry_decision(self, key: tuple) -> str:
+        """返回 'now'（可以试取）/ 'wait'（还没到点）/ 'give_up'（等太久了，按文字发）。"""
+        st = self._pending_media.get(key)
+        if st is None:
+            return "now"
+        now = time.monotonic()
+        if (now - float(st.get("first_ts") or now) > self._media_retry_max_wait
+                or int(st.get("tries") or 0) >= self._media_retry_max):
+            return "give_up"
+        if now < float(st.get("next_ts") or 0.0):
+            return "wait"
+        return "now"
+
+    def _media_retry_failed(self, key: tuple, contact, text: str, label: str,
+                            disp: str, reason: str = "") -> None:
+        """媒体取不到：登记"稍后重试"，这一轮**先不转发**（免得 QQ 只收到"图片"两个字）。"""
+        now = time.monotonic()
+        st = self._pending_media.get(key)
+        if st is None:
+            while len(self._pending_media) >= 20:      # 只留最近若干条
+                self._pending_media.pop(next(iter(self._pending_media)), None)
+            st = {"tries": 0, "first_ts": now, "next_ts": now}
+            self._pending_media[key] = st
+        st["tries"] = int(st.get("tries") or 0) + 1
+        gap = min(300.0, self._media_retry_base * (2 ** (st["tries"] - 1)))
+        st["next_ts"] = now + gap
+        st.update({"contact": contact, "text": text, "label": label, "disp": disp})
+        self._log("info", f"[媒体] {text[:24]!r} 的原图还没就绪（{reason or '缓存/界面里都还没有'}）；"
+                          f"{int(gap)} 秒后重试（第 {st['tries']}/{self._media_retry_max} 次），"
+                          "先不发文字，免得只发出去「图片」两个字")
+
+    def _media_retry_clear(self, key: tuple) -> None:
+        self._pending_media.pop(key, None)
+
+    def _retry_pending_media(self, root) -> None:
+        """到点后重试"媒体还没就绪"的消息：拿到图就补发，等太久就退回发文字。
+
+        为什么放在轮询里、而且**不依赖"它还是不是最新一条"**：App 先画出"图片"占位气泡、
+        原图可能几分钟后才落盘（实测 22:12 检测到、22:19:44 原图文件才出现）。这期间要是
+        用户又发了别的消息，光标/补发都轮不到它了 —— 这里按**消息自己的时间标签**去找那条
+        气泡，找到就取图补发（顺序上它比后来的消息早，回 QQ 时会带自己的时间抬头）。
+        """
+        if not self._pending_media:
+            return
+        for key, st in list(self._pending_media.items()):
+            contact = st.get("contact")
+            text = st.get("text") or ""
+            label = st.get("label") or ""
+            disp = st.get("disp") or label
+            decision = self._media_retry_decision(key)
+            if decision == "wait":
+                continue
+            sticker = None
+            if decision == "now":          # give_up 时不再取图，直接按文字发
+                got_lock = self._op_lock.acquire(timeout=self._media_lock_timeout)
+                try:
+                    sticker = self._capture_sticker(
+                        root, text, near_epoch=self._label_epoch(disp or label),
+                        match_label=label or disp)
+                except Exception as e:  # noqa: BLE001 取图失败继续等下一轮
+                    self._log("debug", f"[媒体] 重试取图失败: {e}")
+                finally:
+                    if got_lock:
+                        self._op_lock.release()
+            if sticker is None and decision != "give_up":
+                self._media_retry_failed(key, contact, text, label, disp,
+                                         "重试时还是没拿到原图/截图")
+                continue
+            self._media_retry_clear(key)
+            self._log("info", f"[媒体] {'拿到图，补发' if sticker else '等太久了，按文字转发'}: "
+                              f"{text[:24]!r}")
+            self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
 
     def _fwd_key(self, contact, text: str, label: str) -> tuple:
         """转发身份键（与实时/补发两条路径共用，必须同源）。"""
@@ -953,7 +1085,8 @@ class MessageBridge:
             self._log("debug", f"表情包索引预热失败: {e}")
 
     def _capture_sticker(self, root, text: str,
-                         near_epoch: float | None = None) -> dict | None:
+                         near_epoch: float | None = None,
+                         match_label: str = "") -> dict | None:
         """取"要发到 QQ 的那张图"（表情包 **和** 照片都走这里）。
 
         表情包：
@@ -990,9 +1123,10 @@ class MessageBridge:
         item = None
         try:
             if is_image:
-                item = self.xtc.image_of_latest(root, text)
+                item = self.xtc.image_of_latest(root, text, match_label=match_label)
             else:
-                item = self.xtc.sticker_of_latest(root, text) or self.xtc.sticker_of_latest(root, "")
+                item = (self.xtc.sticker_of_latest(root, text, match_label=match_label)
+                        or self.xtc.sticker_of_latest(root, ""))
         except Exception as e:  # noqa: BLE001 定位失败不影响取原图
             self._log("debug", f"定位图片/表情气泡失败: {e}")
         aspect = None

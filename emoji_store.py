@@ -38,6 +38,11 @@ from utils import imgtool
 # 表情包解包目录（相对 App 的外部数据根目录）
 EMOJI_SUBDIR = "files/xtcdata/telwatch/weichat/emoji"
 
+# App **自己的聊天照片目录**（实机：`weichat/picture/img_<md5>.jpg`，原图）。
+# 比 Glide 缓存干净得多：这里**只有聊天里的照片**，没有头像、没有贴纸、没有缩略图，
+# 所以候选少、判定准（缓存目录里几十个文件混在一起，只能靠"刚写过"+唯一性猜）。
+PHOTO_SUBDIR = "files/xtcdata/telwatch/weichat/picture"
+
 IMAGE_KINDS = ("gif", "png", "webp", "jpeg")
 
 # 相似度门槛：实测"同一张"能到 0.95 上下，而缓存里最像的无关图片只有 0.63
@@ -179,12 +184,23 @@ class EmojiStore:
         实测整个缓存也就几十个文件，一次 `find` 全列出来比按时间窗反复筛更省事，
         也不会因为"文件被重新渲染过（mtime 被刷新）"而漏掉目标；挑哪张靠像素核对。
         """
+        return self._listing(f"{self.root}/cache", max_bytes=max_bytes, min_bytes=min_bytes)
+
+    def _photo_dir_listing(self, max_bytes: int | None = None,
+                           min_bytes: int = 0) -> tuple[list[tuple[float, int, str]], float]:
+        """App 自己的聊天照片目录（`weichat/picture`）里的 ([(mtime, size, path)], 设备时间)。"""
+        return self._listing(f"{self.root}/{PHOTO_SUBDIR}", max_bytes=max_bytes,
+                             min_bytes=min_bytes)
+
+    def _listing(self, where: str, max_bytes: int | None = None,
+                 min_bytes: int = 0) -> tuple[list[tuple[float, int, str]], float]:
+        """列某个目录下的文件： [(mtime, size, path)] + 设备当前时间。"""
         try:
             listing = self.adb.shell(
-                f"date +%s; find {self.root}/cache -type f "
+                f"date +%s; find {where} -type f "
                 f"-exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", timeout=60)
         except Exception as e:  # noqa: BLE001 取不到就走别的路
-            self._log("debug", f"读图片缓存失败: {e}")
+            self._log("debug", f"列目录失败 {where}: {e}")
             return [], time.time()
         now = 0.0
         rows: list[tuple[float, int, str]] = []
@@ -243,20 +259,42 @@ class EmojiStore:
         文件同样刚写过；真老的照片本来就没有新鲜文件，自然落到截图兜底。
         """
         win = float(window if window is not None else self.photo_window)
-        rows, dev_now = self._cache_listing(max_bytes=self.photo_max_bytes,
-                                            min_bytes=int(min_bytes or self.photo_min_bytes))
-        # 参照时刻：① 这条消息自己的时间（文件可能在"收到时"写进缓存）；
-        # ② **设备当前时间**（App 重新渲染时会重写缓存文件）。两个都算"对得上"。
+        min_b = int(min_bytes or self.photo_min_bytes)
         targets = [float(near_epoch)] if near_epoch else []
+        # ① 先在 **App 自己的聊天照片目录**（`weichat/picture/*.jpg`）里找：那里只有聊天
+        #    照片（没有头像/贴纸），候选最少、最准，而且是原图。
+        rows, dev_now = self._photo_dir_listing(max_bytes=self.photo_max_bytes, min_bytes=min_b)
+        t1 = list(targets)
         if allow_now:
-            targets.append(dev_now)
-        if not targets:
+            t1.append(dev_now)
+        # 照片目录里**只有聊天照片**，所以允许"结构上唯一的候选"（形状/大小都对、就这一张）
+        # 即使它的 mtime 已经过去很久 —— App 不一定会为重看的老照片重写文件。
+        got = self._pick_photo(rows, t1, win, aspect, min_px, where="照片目录", unique_ok=True)
+        if got:
+            return got
+        # ② 再退回 Glide 缓存（混着头像/贴纸，靠"刚写过"+唯一性把关，不能放宽时间）
+        rows, dev_now = self._cache_listing(max_bytes=self.photo_max_bytes, min_bytes=min_b)
+        t2 = [float(near_epoch)] if near_epoch else []
+        if allow_now:
+            t2.append(dev_now)
+        if not t2:
             return None
-        cands: list[tuple] = []
+        return self._pick_photo(rows, t2, win, aspect, min_px, where="图片缓存")
+
+    def _pick_photo(self, rows: list, targets: list, win: float, aspect,
+                    min_px: int, where: str = "", unique_ok: bool = False) -> dict | None:
+        """从候选里挑**唯一**一张符合"更大 + 形状一致 + 时间对得上"的照片原图。
+
+        时间信号是决定性的（实测正确那张水位 9 秒，其余 1~6 天）：App 显示图片时会把原图
+        重新写进缓存；"正在看的那张"必定刚写过。窗内不止一张就**不猜**（退回气泡截图）。
+
+        unique_ok：允许"结构上唯一"的候选（用于 App 自己的照片目录 —— 那里只有聊天照片，
+        形状又对得上，比 Glide 缓存可靠得多）。返回 None 表示这里没有可信候选。
+        """
+        if not rows:
+            return None
+        struct: list[tuple] = []
         for mtime, size, path in rows:
-            d = min(abs(mtime - t) for t in targets)
-            if d > win:
-                continue
             info = self.sniff(self._read_head(path))
             if not info or info.get("kind") not in IMAGE_KINDS:
                 continue
@@ -266,20 +304,41 @@ class EmojiStore:
             if aspect and h:
                 if abs(w / h - aspect) > 0.12 * max(1.0, aspect):
                     continue
+            struct.append((mtime, size, path, info))
+        if not struct:
+            return None
+        if unique_ok and len(struct) == 1:
+            mtime, size, path, info = struct[0]
+            data = self._read(path)
+            if not data:
+                return None
+            self._log("debug", f"[图片] {where}里只有这一张候选（{info.get('w')}x{info.get('h')}、"
+                               f"{size} 字节、水位 {time.time() - mtime:.0f}s），按它发")
+            out = dict(info)
+            out.update({"data": data, "path": path, "source": "cache-photo",
+                        "mtime": mtime, "score": None})
+            return out
+        if not targets:
+            return None
+        cands: list[tuple] = []
+        for mtime, size, path, info in struct:
+            d = min(abs(mtime - t) for t in targets)
+            if d > win:
+                continue
             cands.append((d, -size, mtime, size, path, info))
         if not cands:
             return None
         cands.sort()
         if len(cands) > 1:
             # 窗内不止一张 -> 分不清是哪张（例如刚翻过好几张照片），不猜
-            self._log("info", f"[图片] 缓存里有 {len(cands)} 张'刚写过'的大图，分不清是哪张，"
-                              "改用气泡截图")
+            self._log("info", f"[图片] {where}里有 {len(cands)} 张'刚写过'的大图，"
+                              "分不清是哪张，改用气泡截图")
             return None
         d, _neg, mtime, size, path, info = cands[0]
         data = self._read(path)
         if not data:
             return None
-        self._log("debug", f"[图片] 命中缓存原图 {path}（{size} 字节，水位 {d:.0f}s）")
+        self._log("debug", f"[图片] 命中{where}原图 {path}（{size} 字节，水位 {d:.0f}s）")
         out = dict(info)
         out.update({"data": data, "path": path, "source": "cache-photo",
                     "mtime": mtime, "score": None})

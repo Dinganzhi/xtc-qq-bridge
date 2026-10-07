@@ -1871,11 +1871,15 @@ def test_photo_original_pick_is_conservative() -> None:
     files = {photo_p: photo, other_p: other, sticker_p: sticker}
 
     class FakeAdb:
-        def __init__(self, listing):
-            self.listing = listing
+        def __init__(self, listing, photo_listing: str = ""):
+            self.listing = listing            # Glide 缓存目录
+            self.photo_listing = photo_listing  # App 自己的聊天照片目录 weichat/picture
 
         def shell(self, cmd, timeout=None):
             if cmd.startswith("date +%s;"):
+                # 两个目录要分开返回：照片目录里只有聊天照片，判定规则不一样
+                if "/weichat/picture" in cmd:
+                    return f"{now}\n{self.photo_listing}"
                 return f"{now}\n{self.listing}"
             if "head -c" in cmd:
                 path = cmd.split("head -c")[1].split("|")[0].strip().split(None, 1)[1]
@@ -1937,6 +1941,126 @@ def test_photo_original_pick_is_conservative() -> None:
     got7 = EmojiStore(FakeAdb(listing_fresh2), package="com.xtc.watch", logger=None).find_photo(
         near_epoch=None, aspect=136 / 180, min_px=180)
     check("窗内有两张'刚写过'的大图时不猜（退回截图）", got7 is None, str(got7))
+
+    # ---- App 自己的聊天照片目录（weichat/picture，只有聊天照片，实测 img_<md5>.jpg）----
+    pic_p = "/sdcard/Android/data/com.xtc.watch/files/xtcdata/telwatch/weichat/picture/img_a.jpg"
+    pic2_p = "/sdcard/Android/data/com.xtc.watch/files/xtcdata/telwatch/weichat/picture/img_b.jpg"
+    files[pic_p] = photo
+    files[pic2_p] = other
+    # ① 只有一张、形状也对得上 -> 即使 mtime 很老（App 不会为重看的老照片重写文件）也采用
+    store_pic = EmojiStore(FakeAdb("", f"{now - 7200} {len(photo)} {pic_p}"),
+                           package="com.xtc.watch", logger=None)
+    gotp = store_pic.find_photo(near_epoch=now - 7200, aspect=136 / 180, min_px=180)
+    check("照片目录里结构唯一的候选会被采用（不怕 mtime 老）",
+          bool(gotp) and gotp["path"] == pic_p, str(gotp and gotp.get("path")))
+    # ② 形状对不上的不算候选
+    gotp2 = EmojiStore(FakeAdb("", f"{now - 7200} {len(photo)} {pic_p}"),
+                       package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=now - 7200, aspect=1.0, min_px=180)
+    check("照片目录里形状对不上就不取", gotp2 is None, str(gotp2 and gotp2.get("path")))
+    # ③ 有两张形状都对得上 -> 用时间窗选"刚写过"的那张；两张都刚写过 -> 不猜
+    two = (f"{now - 3600} {len(photo)} {pic_p}\n{now - 6} {len(other)} {pic2_p}")
+    gotp3 = EmojiStore(FakeAdb("", two), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=None, aspect=136 / 180, min_px=180)
+    check("照片目录里多张候选时按'刚写过'挑唯一那张",
+          bool(gotp3) and gotp3["path"] == pic2_p, str(gotp3 and gotp3.get("path")))
+    two_fresh = (f"{now - 6} {len(photo)} {pic_p}\n{now - 8} {len(other)} {pic2_p}")
+    gotp4 = EmojiStore(FakeAdb("", two_fresh), package="com.xtc.watch", logger=None).find_photo(
+        near_epoch=None, aspect=136 / 180, min_px=180)
+    check("照片目录里两张都刚写过 -> 不猜（退回截图）", gotp4 is None,
+          str(gotp4 and gotp4.get("path")))
+
+
+def test_media_pending_retry_when_original_arrives_late() -> None:
+    """图片/表情刚到时**原图往往还没下载完**（App 先画占位图）。
+
+    实测：22:12:12 检测到"图片"、22:12:17 抠到的还是占位图（主色占比 0.92、标准差 9）、
+    原图文件 22:19:44 才落盘 -> 旧实现当场退回发文字，QQ 只收到"图片"两个字。
+    现在：先扣住不发，等原图就绪再补发；等太久才退回文字（消息不丢）。
+    """
+    root = tmp_root()
+    try:
+        state = {"ready": False, "n": 0}
+
+        class _Xtc:
+            IMAGE_TEXT = "图片"
+
+            def image_of_latest(self, root, text="", match_label=""):
+                if not state["ready"]:
+                    return None
+                state["n"] += 1
+                return {"text": "图片", "bounds": (470, 300, 610, 500), "image": True,
+                        "time_label": "22:10", "own_label": "22:10"}
+
+            def capture_sticker(self, bounds):
+                if not state["ready"]:
+                    return None
+                return _png_pattern(140, 200, (230, 230, 230), (20, 20, 110, 190),
+                                    (40, 30, 200))
+
+        class _Fwd:
+            def __init__(self):
+                self.images: list = []
+                self.texts: list = []
+
+            def send(self, t, i, m):
+                return True
+
+            def send_detail(self, t, i, m):
+                self.texts.append(m)
+                return True, ""
+
+            def send_image(self, t, i, b64, caption=""):
+                self.images.append((b64, caption))
+                return True, ""
+
+        fwd = _Fwd()
+        br = bridge_mod.MessageBridge(
+            {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+             "xiaotiancai": {}, "webhook": {}}, adb=None, xtc=_Xtc(), forwarder=fwd,
+            logger=None)
+        _p = f".bugtest{_SEQ['n']}_media"
+        br.msgs = MessageLog(path=str(root / f"{_p}_msg.json"))
+        br._cmd_done_file = str(root / f"{_p}_done.json")
+        br._emoji_photo = False           # 只走"气泡截图"这条路，避免依赖缓存
+        br._emoji_store = None
+        queued: list = []
+        br._queue_forward = lambda c, t, l, sticker=None, display_label="": queued.append(
+            (c, t, l, sticker, display_label))
+
+        # ① 原图还没就绪：登记等待，**不转发**
+        br._media_retry_failed(("xtc", "", "图片", "10-07 22:10"), "屑猹不喝茶", "图片",
+                               "10-07 22:10", "22:10", "占位图")
+        check("原图没就绪时先扣住不发（免得只发出去「图片」两个字）",
+              not queued and br._pending_media, f"queued={queued}")
+        # 还没到点：什么都不做
+        br._retry_pending_media(ET.fromstring(node_xml("")))
+        check("还没到重试时间就不动它", not queued, f"queued={queued}")
+
+        # ② 原图就绪 + 到点：取到图后补发（带图，不是文字）
+        state["ready"] = True
+        for st in br._pending_media.values():
+            st["next_ts"] = 0.0
+        br._retry_pending_media(ET.fromstring(node_xml("")))
+        check("原图就绪后补发的是**图片**（不是文字）",
+              len(queued) == 1 and queued[0][3] and queued[0][3].get("data"),
+              f"queued={[(q[1], bool(q[3])) for q in queued]}")
+        check("补发成功后清掉等待状态", not br._pending_media, f"{br._pending_media}")
+
+        # ③ 一直拿不到：等太久后退回文字（消息不丢，也不会发空白图）
+        queued.clear()
+        state["ready"] = False
+        br._media_retry_failed(("xtc", "", "图片", "10-07 22:20"), "屑猹不喝茶", "图片",
+                               "10-07 22:20", "22:20", "占位图")
+        for st in br._pending_media.values():
+            st["tries"] = br._media_retry_max
+            st["next_ts"] = 0.0
+        br._retry_pending_media(ET.fromstring(node_xml("")))
+        check("等太久后退回发文字（消息不丢、也不发空白图）",
+              len(queued) == 1 and not queued[0][3], f"queued={queued}")
+        check("退回文字后同样清掉等待状态", not br._pending_media, f"{br._pending_media}")
+    finally:
+        cleanup(root)
 
 
 def test_check_uses_configured_adb() -> None:
@@ -2383,7 +2507,7 @@ def test_backlog_media_uses_fresh_dump() -> None:
         def _is_system_msg(self, text):
             return text.startswith("发送成功")
 
-        def image_of_latest(self, root, text=""):
+        def image_of_latest(self, root, text="", match_label=""):
             # 第一次 dump 时气泡还在；重新 dump 之后它已被顶走 -> 返回 None
             return dict(bubble) if (self.adb.keep_visible or self.adb.dumps <= 1) else None
 
@@ -2417,8 +2541,18 @@ def test_backlog_media_uses_fresh_dump() -> None:
         check("补发时确实重新读了一次界面", adb.dumps >= 1, f"dumps={adb.dumps}")
         check("读界面时占着界面锁（发送线程动不了界面）",
               adb.locked_during_dump and all(adb.locked_during_dump), str(adb.locked_during_dump))
-        check("气泡被顶走后不发空白图，退回文字", n == 1 and not fwd.images
-              and any("图片" in m for m in fwd.texts), f"texts={fwd.texts} images={fwd.images}")
+        # 拿不到图时**先不要发**（否则 QQ 只收到"图片"两个字）：登记等待重试，
+        # 等媒体就绪（或等太久放弃）再按文字发。
+        check("气泡被顶走、图取不到时先扣住不发（等原图）",
+              n == 0 and not fwd.images and not fwd.texts and br._pending_media,
+              f"texts={fwd.texts} images={fwd.images} pending={br._pending_media}")
+        # 逼到"等太久了" -> 退回发文字（保证消息不丢，且不是空白图）
+        for st in br._pending_media.values():
+            st["tries"] = br._media_retry_max
+        n1 = br._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        check("等太久后按文字转发（消息不丢、也不发空白图）",
+              n1 == 1 and not fwd.images and any("图片" in m for m in fwd.texts),
+              f"texts={fwd.texts} images={fwd.images}")
 
         # ② 对照组：重新 dump 里气泡还在 -> 正常取到图
         adb2 = _Adb(keep_visible=True)
@@ -4623,6 +4757,7 @@ def main() -> int:
                test_cache_pick_verifies_pixels_against_screen,
                test_image_message_is_forwarded,
                test_photo_original_pick_is_conservative,
+               test_media_pending_retry_when_original_arrives_late,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
                test_missing_time_label_uses_previous_message_time,

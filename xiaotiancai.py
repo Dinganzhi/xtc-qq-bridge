@@ -2724,24 +2724,22 @@ class Xiaotiancai:
         out.sort(key=lambda it: it["y_bottom"])
         return out
 
-    def image_of_latest(self, root: ET.Element, text: str = "") -> dict | None:
-        """最新一条**对方发来的图片（照片）**气泡信息；没有则 None（给桥接取图用）。"""
+    def image_of_latest(self, root: ET.Element, text: str = "",
+                        match_label: str = "") -> dict | None:
+        """最新一条**对方发来的图片（照片）**气泡信息；没有则 None（给桥接取图用）。
+
+        match_label：只认身份/显示标签与它一致的那条（补发重试用 —— 那时光标可能已经
+        滚到别的照片上，"最新一条图片"未必还是原来那条）。
+        """
         try:
             items = self._chat_bubbles(root, include_own=False)
         except Exception as e:  # noqa: BLE001 判定失败不影响文字转发
             self.log("debug", f"解析图片气泡失败: {e}")
             return None
-        want = (text or "").strip()
-        hit = None
-        for it in items:                      # 已按 y 从小到大（旧->新）
-            if not it.get("image"):
-                continue
-            if want and it.get("text") != want:
-                continue
-            hit = it
-        return hit
+        return self._pick_bubble(items, "image", text, match_label)
 
-    def sticker_of_latest(self, root: ET.Element, text: str = "") -> dict | None:
+    def sticker_of_latest(self, root: ET.Element, text: str = "",
+                          match_label: str = "") -> dict | None:
         """最新一条**对方发来的表情**气泡信息 {text, bounds, time_label}；没有则 None。
 
         给桥接用：轮询读到"表情X"时，据此拿到气泡位置，把贴纸原样截图发给 QQ
@@ -2752,13 +2750,24 @@ class Xiaotiancai:
         except Exception as e:  # noqa: BLE001 判定失败不影响文字转发
             self.log("debug", f"解析表情气泡失败: {e}")
             return None
+        return self._pick_bubble(items, "sticker", text, match_label)
+
+    @staticmethod
+    def _pick_bubble(items: list[dict], flag: str, text: str, match_label: str = ""):
+        """按 flag(image/sticker) + 文本 + 标签，从旧到新取**最后一条**命中的气泡。"""
         want = (text or "").strip()
+        want_lbl = (match_label or "").strip()
         hit = None
         for it in items:                      # 已按 y 从小到大（旧->新）
-            if not it.get("sticker"):
+            if not it.get(flag):
                 continue
             if want and it.get("text") != want:
                 continue
+            if want_lbl:
+                labels = {str(it.get("own_label") or "").strip(),
+                          str(it.get("time_label") or "").strip()}
+                if want_lbl not in labels:
+                    continue
             hit = it
         return hit
 
