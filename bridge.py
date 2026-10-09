@@ -229,6 +229,15 @@ class MessageBridge:
         _xc = cfg.get("xiaotiancai") or {}
         self._catchup_enabled = bool(_xc.get("catchup_missed", True))
         self._catchup_max = int(_xc.get("catchup_max", 0) or 0)   # 0 = 不限制（默认）
+        # 每轮最多往上看多少条气泡（可见区本来只有几条）：撞到"库里已有"的消息**不再停下**，
+        # 而是继续往上找没转发过的（用户实测：16:38 的消息被更新的 19:19 照片挡住，5 小时后才发）
+        self._catchup_scan = int(_xc.get("catchup_scan", 30) or 0)  # 0 = 不限制
+        # 补发"太旧就别发了"（秒，0 = 不限）：想避免"21:48 突然收到 16:38 的消息"就设它，
+        # 例如 1800 = 超过 30 分钟的消息不再补发（会记进历史，不会每轮再翻出来）
+        try:
+            self._catchup_max_age = max(0.0, float(_xc.get("catchup_max_age", 0) or 0))
+        except (TypeError, ValueError):
+            self._catchup_max_age = 0.0
         self._wsa_reconnect_hinted = False  # WSA 断网提示只打一次
         # FIFO 任务队列：QQ->小天才 发送 / 登录 由单工作线程串行执行，
         # 保证多消息到达时按顺序处理，避免并发抢锁导致前后关系紊乱
@@ -688,7 +697,12 @@ class MessageBridge:
                 self._log("debug", "[补发] 没能重新读界面，按现有快照取图")
 
         pending: list[tuple[str, str, dict | None, str]] = []
+        scanned = 0
         for it in reversed(bubbles):                # 从最新往回走
+            scanned += 1
+            if self._catchup_scan and scanned > self._catchup_scan:
+                # 只扫可见范围内的这么多条（可见区本来就只有几条），避免无界翻找
+                break
             text = (it.get("text") or "").strip()
             if not text:
                 continue
@@ -715,8 +729,23 @@ class MessageBridge:
                 # 15:46 发的被写成 15:41）。身份 ident 不变，只影响显示。
                 disp_lbl = self._display_time_label(
                     contact, ident or self._abs_time_label(disp_lbl) or disp_lbl)
+            if self._catchup_max_age > 0:
+                age = self._label_age(ident or disp_lbl)
+                if age is not None and age > self._catchup_max_age:
+                    # 太旧的积压消息不补发（用户实测：21:48 突然收到 16:38 的消息，很困惑）。
+                    # 记进历史，避免每轮都把它当成"库里没有"再翻出来。
+                    self._log_once(f"stale:{text[:16]}",
+                                   f"[补发] 这条是 {age / 60:.0f} 分钟前的，超过 "
+                                   f"catchup_max_age（{self._catchup_max_age / 60:.0f} 分钟），"
+                                   f"跳过不转发: {text[:24]!r}", interval=300)
+                    self.history.mark("xtc", contact or "", text, ident)
+                    continue
             if self._in_store(contact, text, ident):
-                break                               # 撞库 -> 停，不再往上翻
+                # 库里有它 -> 不重复转发。但**不能就此停住往下翻**：用户实测
+                # "16:38 发的两条消息到 21:48 才转发" —— 就是因为更新的那条（19:19 的照片）
+                # 已经在库里，旧实现一撞库就 break，把比它更老、却从没转发过的消息永远挡在外面。
+                self._log("debug", f"[补发] 库里已有，跳过（继续往上找）: {text[:24]!r}")
+                continue
             if self.dedup.seen(("xtc", contact or "", text, ident)):
                 # 刚试过（120 秒内：正在发的、或上次转发失败的）：本轮先跳过它，
                 # 但不当作边界，继续往上找更老的那几条
@@ -897,6 +926,13 @@ class MessageBridge:
             self._log("info", f"[媒体] {'拿到图，补发' if sticker else '等太久了，按文字转发'}: "
                               f"{text[:24]!r}")
             self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
+
+    def _label_age(self, label: str) -> float | None:
+        """某个时间标签距今多少秒（解析不出来返回 None）。"""
+        epoch = self._label_epoch(label) if label else None
+        if not epoch:
+            return None
+        return max(0.0, time.time() - float(epoch))
 
     def _display_time_label(self, contact, label: str) -> str:
         """挑一个**显示**用的时间：App 的分组标签只画在一组消息的第一条上方。

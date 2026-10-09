@@ -1040,6 +1040,104 @@ def test_forward_type_markers() -> None:
         cleanup(root)
 
 
+def test_backlog_scans_past_known_messages() -> None:
+    """更新的消息已经在库里，**不能挡住**比它更老、却从没转发过的消息。
+
+    用户实测：手表 16:38 发的两条一直没转发，直到 21:48 才突然发出来 —— 因为 19:19 的
+    照片已经在库里，"撞库即停"把它们永远挡在外面了（可见区只有几条，一直轮不到）。
+    """
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self):
+            self.sent: list = []
+
+        def send(self, t, i, m):
+            self.sent.append(m)
+            return True
+
+        def send_detail(self, t, i, m):
+            self.sent.append(m)
+            return True, ""
+
+    def bubbles(*texts):
+        return [{"text": t, "time_label": "16:38", "own_label": "16:38"} for t in texts]
+
+    try:
+        fwd = _Fwd()
+        br = _backlog_bridge(root, fwd,
+                             bubbles("更早的一条", "16:38 我还没发。", "16:38 那个是表情包。",
+                                     "19:19 图片"),
+                             known=["更早的一条", "19:19 图片"])
+        n = br._forward_backlog(None, "屑猹不喝茶")
+        check("更新的消息已在库里时不挡住更老的未转发消息", n == 2, f"n={n} sent={fwd.sent}")
+        check("补的是那两条、且按 旧->新 顺序",
+              len(fwd.sent) == 2 and "我还没发" in fwd.sent[0] and "表情包" in fwd.sent[1],
+              str(fwd.sent))
+        check("库里已有的不会被重复补发",
+              all("19:19" not in m and "更早" not in m for m in fwd.sent), str(fwd.sent))
+
+        # 扫描上限：可见区内太多时只扫最近 catchup_scan 条（防止无界翻找）
+        fwd2 = _Fwd()
+        br2 = _backlog_bridge(root, fwd2,
+                              bubbles(*[f"m{i}" for i in range(10)]), known=[])
+        br2._catchup_scan = 3
+        br2._forward_backlog(None, "屑猹不喝茶")
+        check("补发扫描有上限（catchup_scan）", len(br2._pending_media) == 0 and len(fwd2.sent) == 3,
+              f"sent={len(fwd2.sent)}")
+    finally:
+        cleanup(root)
+
+
+def test_catchup_max_age_skips_stale() -> None:
+    """可选的"太旧就别补发"开关：catchup_max_age（秒，0 = 不限，默认）。
+
+    用户实测：21:48 突然收到手表 16:38 发的消息，很困惑。想避免就把这个值设上
+    （例如 1800 = 超过 30 分钟的不再补发）；跳过时会记进历史，不会每轮再翻出来。
+    """
+    from datetime import datetime, timedelta
+
+    root = tmp_root()
+
+    class _Fwd:
+        def __init__(self):
+            self.sent: list = []
+
+        def send(self, t, i, m):
+            self.sent.append(m)
+            return True
+
+        def send_detail(self, t, i, m):
+            self.sent.append(m)
+            return True, ""
+
+    old = (datetime.now() - timedelta(hours=5)).strftime("%m-%d %H:%M")
+    fresh = datetime.now().strftime("%m-%d %H:%M")
+
+    def bubbles(pairs):
+        return [{"text": t, "time_label": lbl, "own_label": lbl} for t, lbl in pairs]
+
+    try:
+        fwd = _Fwd()
+        br = _backlog_bridge(root, fwd, bubbles([("五小时前的", old), ("刚发的", fresh)]))
+        br._catchup_max_age = 1800
+        n = br._forward_backlog(None, "屑猹不喝茶")
+        check("超过 catchup_max_age 的积压消息不补发", n == 1 and "刚发的" in fwd.sent[0],
+              f"n={n} sent={fwd.sent}")
+        fwd.sent.clear()
+        check("被跳过的也不会每轮再翻出来（已记历史）",
+              br._forward_backlog(None, "屑猹不喝茶") == 0 and not fwd.sent,
+              f"sent={fwd.sent}")
+
+        # 默认（0 = 不限）：老消息照样补（换个干净前缀，别读到上面那轮的历史）
+        fwd2 = _Fwd()
+        br2 = _backlog_bridge(tmp_root(), fwd2, bubbles([("五小时前的", old)]))
+        check("默认不限时仍然补发老消息（保持原行为）",
+              br2._forward_backlog(None, "屑猹不喝茶") == 1 and fwd2.sent, f"sent={fwd2.sent}")
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -4883,6 +4981,8 @@ def main() -> int:
                test_media_pending_retry_when_original_arrives_late,
                test_group_time_label_is_not_stale,
                test_forward_type_markers,
+               test_backlog_scans_past_known_messages,
+               test_catchup_max_age_skips_stale,
                test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,

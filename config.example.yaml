@@ -72,9 +72,13 @@ xiaotiancai:
   package: "com.xtc.watch"
   main_activity: ".MainActivity"
   check_interval: 2
-  # 漏消息补发：从最新一条往回走，撞到"库里已有"的那条就停（启动前积压的也一起补）
+  # 漏消息补发：从最新一条往回走，把"可见范围内"没入库的都补上（库里已有的跳过、不再停）
+  #   —— 为什么不停：用户实测手表 16:38 发的两条被更新的 19:19 照片挡住，直到 21:48 才发出来
   catchup_missed: true                           # 总开关
   catchup_max: 0                                 # 单次最多补几条；0 = 不限制（默认）
+  catchup_scan: 30                               # 每轮最多往上看多少条气泡（可见区本来只有几条）
+  catchup_max_age: 0                             # 太旧的积压消息不补发（秒）；0 = 不限（默认）
+                                                 # 想避免"21:48 突然收到 16:38 的消息"就设 1800
   label_stale_secs: 60                           # App 的分组时间标签复用超过这么多秒后，改用当前时间显示
                                                  # （App 只在一组消息的第一条上画标签，同组后面的其实更晚）
   auto_install_adbkeyboard: true                 # 先查设备上有没有；没有才用项目目录里的本地 APK（不联网）
