@@ -922,6 +922,124 @@ def test_forward_retry_thread_only_retries_failed_targets() -> None:
         cleanup(root)
 
 
+def test_group_time_label_is_not_stale() -> None:
+    """App 的分组时间标签只画在一组消息的第一条上：同组后面的消息其实更晚。
+
+    用户实测：15:41 那条之后同一组里的消息（15:46 才发）也被写成 15:41。
+    规则：同一个 App 标签已经用过、且隔了超过 label_stale_secs（默认 60 秒）-> 用当前时间；
+    **身份仍用 App 标签**（否则身份会跟着时间漂移，又会出现"同一条被反复转发"）。
+    """
+    from datetime import datetime
+
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        label = "10-09 15:41"
+        check("第一条用 App 标签", br._display_time_label("屑猹不喝茶", label) == label)
+        br._label_used[("屑猹不喝茶", label)] = time.time() - 20
+        check("同一分钟内的第二条仍用 App 标签（正常情况）",
+              br._display_time_label("屑猹不喝茶", label) == label)
+        br._label_used[("屑猹不喝茶", label)] = time.time() - 120
+        got = br._display_time_label("屑猹不喝茶", label)
+        check("同标签隔了 2 分钟 -> 用当前时间（不再写 15:41）",
+              got != label and got == datetime.now().strftime("%m-%d %H:%M"),
+              f"{got!r} vs {label!r}")
+        check("不同联系人互不影响（第一条仍用 App 标签）",
+              br._display_time_label("张三", label) == label)
+        check("没有标签时给兜底时间（不是空）",
+              br._display_time_label("屑猹不喝茶", "") != "")
+    finally:
+        cleanup(root)
+
+
+def test_clipped_bubble_detection() -> None:
+    """贴消息列表边的气泡 = 被裁（抠图只有半张）：必须能判出来，并滚进可视区。
+
+    实测：气泡 (78,178,198,280) 贴着列表顶(178) 时，抠到的是半张贴纸（3526 字节），
+    与原图比对只有 0.78 -> 退回发半张截图；往下滚一屏后同一张能到 0.99。
+    """
+    ui = {"interaction_delay": 0.01}
+    view = n(cls="androidx.recyclerview.widget.RecyclerView",
+             rid="com.xtc.watch:id/rv_chat_msg_chat", bounds="[22,178][472,576]")
+
+    def xml_with(bubble_bounds: str) -> str:
+        return node_xml(view + n(cls="android.widget.ImageView", text="",
+                                 desc="屑猹不喝茶发的消息,表情开心",
+                                 rid="com.xtc.watch:id/chat_msg_item_content",
+                                 bounds=bubble_bounds))
+
+    adb = FakeAdb(xml_with("[78,178][198,280]"), "com.xtc.watch/.ChatActivity")
+    adb.dump_ui = lambda retries=3, delay=2.0: ET.fromstring(xml_with("[78,178][198,280]"))
+    xtc = Xiaotiancai(adb, {"ui": ui}, logger=None)
+    check("能读到消息列表可视区",
+          xtc.chat_view_bounds(ET.fromstring(xml_with("[78,178][198,280]"))) == (22, 178, 472, 576))
+    check("贴顶边的气泡判为被裁",
+          xtc.bubble_clipped(ET.fromstring(xml_with("[78,178][198,280]")),
+                             (78, 178, 198, 280)) is True)
+    check("完整可见的气泡不算被裁",
+          xtc.bubble_clipped(ET.fromstring(xml_with("[78,280][198,400]")),
+                             (78, 280, 198, 400)) is False)
+    check("比可视区还高的气泡一定算被裁",
+          xtc.bubble_clipped(ET.fromstring(xml_with("[78,100][198,700]")),
+                             (78, 100, 198, 700)) is True)
+
+
+def test_forward_type_markers() -> None:
+    """表情和图片在发出去的文字里要有**类型标记**（用户要求：表情标成表情、图片是图片）。
+
+    为什么需要：贴纸拿不到原图时会退化成一张 png 气泡截图，看起来和照片一模一样，
+    用户分不清哪条是表情、哪条是照片。标记只加在发出去的文字上，判重身份不变。
+    """
+    root = tmp_root()
+    try:
+        class _X:
+            IMAGE_TEXT = "图片"
+
+        br = bridge_mod.MessageBridge(
+            {"target": {"xtc_contact": "屑猹不喝茶", "qq_private": "2218631043"},
+             "xiaotiancai": {}, "webhook": {}},
+            adb=None, xtc=_X(), forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        cases = (("图片", "[图片]"),
+                 ("表情开心", "[表情] 开心"),
+                 ("表情", "[表情]"),
+                 ("表情弹吉他.png", "[表情] 弹吉他"),
+                 ("你好呀", "你好呀"))
+        for src, want in cases:
+            got = br._typed_body(src)
+            check(f"{src!r} -> {got!r}", got == want, f"want={want!r}")
+
+        class _Fwd:
+            def __init__(self):
+                self.texts: list = []
+                self.images: list = []
+
+            def send(self, t, i, m):
+                return True
+
+            def send_detail(self, t, i, m):
+                self.texts.append(m)
+                return True, ""
+
+            def send_image(self, t, i, b, caption=""):
+                self.images.append((b, caption))
+                return True, ""
+
+        fwd = _Fwd()
+        br.forwarder = fwd
+        br._forward("屑猹不喝茶", "图片", "15:24", sticker={"data": b"x", "kind": "png"})
+        check("表情/图片发出去的说明文字带类型标记",
+              bool(fwd.images) and "[图片]" in fwd.images[0][1], str(fwd.images)[:90])
+        check("去重身份没被标记污染（find 用的还是原始 text）",
+              br._typed_body("图片") == "[图片]" and "图片" == "图片")
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -4763,6 +4881,9 @@ def main() -> int:
                test_image_message_is_forwarded,
                test_photo_original_pick_is_conservative,
                test_media_pending_retry_when_original_arrives_late,
+               test_group_time_label_is_not_stale,
+               test_forward_type_markers,
+               test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
                test_missing_time_label_uses_previous_message_time,

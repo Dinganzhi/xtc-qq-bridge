@@ -75,6 +75,8 @@ xiaotiancai:
   # 漏消息补发：从最新一条往回走，撞到"库里已有"的那条就停（启动前积压的也一起补）
   catchup_missed: true                           # 总开关
   catchup_max: 0                                 # 单次最多补几条；0 = 不限制（默认）
+  label_stale_secs: 60                           # App 的分组时间标签复用超过这么多秒后，改用当前时间显示
+                                                 # （App 只在一组消息的第一条上画标签，同组后面的其实更晚）
   auto_install_adbkeyboard: true                 # 先查设备上有没有；没有才用项目目录里的本地 APK（不联网）
   login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
     phone: ""                                    # 手机号

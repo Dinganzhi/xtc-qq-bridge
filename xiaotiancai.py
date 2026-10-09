@@ -2771,6 +2771,54 @@ class Xiaotiancai:
             hit = it
         return hit
 
+    def chat_view_bounds(self, root: ET.Element):
+        """消息列表的**可视区** bounds（被列表裁掉的气泡会贴着它的边）。"""
+        for n in root.iter("node"):
+            if self._id_tail(n) in ("rv_chat_msg_chat", "rv_chat_msg", "lv_chat_msg"):
+                b = self._bounds(n)
+                if b:
+                    return b
+        for n in root.iter("node"):
+            if (n.get("class") or "").endswith("RecyclerView"):
+                b = self._bounds(n)
+                if b:
+                    return b
+        return None
+
+    def bubble_clipped(self, root: ET.Element, bounds, tol: int = 2) -> bool:
+        """气泡是不是被消息列表裁到了（贴着可视区上/下边 = 有内容被裁掉）。
+
+        为什么必须判：抠图是按气泡 bounds 裁的 —— 被裁掉一半时抠下来的就是**半张图**，
+        拿去和原图比像素必然不过（实测 0.78 < 0.80），最后发给 QQ 的就是那半张截图
+        （用户报的"表情只有一小半、还是 png"）。
+        """
+        vb = self.chat_view_bounds(root)
+        if not vb or not bounds:
+            return False
+        _x1, y1, _x2, y2 = bounds
+        _vx1, vy1, _vx2, vy2 = vb
+        if (y2 - y1) >= (vy2 - vy1):
+            return True                        # 比可视区还高：怎么都在裁
+        return (y1 <= vy1 + tol) or (y2 >= vy2 - tol)
+
+    def scroll_chat_by(self, vb, dy: int, duration: int = 300) -> bool:
+        """把消息列表按 dy 拖动：正数 = 内容往下（看更早的），负数 = 内容往上（看更新的）。"""
+        if not vb:
+            return False
+        cx = (vb[0] + vb[2]) // 2
+        vh = max(20, vb[3] - vb[1])
+        if dy > 0:
+            y0 = vb[1] + vh // 4
+        else:
+            y0 = vb[3] - vh // 4
+        try:
+            self.adb.swipe(cx, y0, cx, y0 + int(dy), duration)
+        except Exception as e:  # noqa: BLE001 滑动失败就算了（调用方会退避/等重试）
+            self.log("debug", f"滚动消息列表失败: {e}")
+            return False
+        time.sleep(0.45)
+        return True
+
     def capture_sticker(self, bounds) -> bytes | None:
         """把表情气泡那块**截图抠成 PNG**（失败返回 None，调用方退回发文字）。
 

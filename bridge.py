@@ -272,6 +272,13 @@ class MessageBridge:
         # 几秒~几分钟后才落盘（实测 22:12 检测到消息、22:19 原图才出现）。
         # 这期间先不转发，否则 QQ 只会收到"图片"两个字。
         self._pending_media: dict[tuple, dict] = {}
+        # 同一 App 时间标签"第一次被用掉"的时刻：同组后续消息其实更晚（用户实测 15:46 被写成
+        # 15:41），超过 label_stale_secs 就用当前时间显示（身份仍用 App 标签）
+        self._label_used: dict[tuple, float] = {}
+        try:
+            self._label_stale_secs = max(10.0, float(_xc.get("label_stale_secs", 60) or 60))
+        except (TypeError, ValueError):
+            self._label_stale_secs = 60.0
         _media = cfg.get("emoji") or {}
         try:
             self._media_retry_max = max(1, int(_media.get("wait_retries", 8) or 8))
@@ -615,7 +622,8 @@ class MessageBridge:
                             # （"09-29 21:55"）—— 两条路径算出的去重键不同，于是同一条消息
                             # 会被"补发 + 实时"各转发一次（用户报的"2 转发了两遍"就是这么来的）。
                             self._queue_forward(contact, text, label, sticker=sticker,
-                                                display_label=time_label)
+                                                display_label=self._display_time_label(contact,
+                                                                                       label))
                 # 媒体（图片/表情）当时没就绪的那些：到点后重试取图并补发（不依赖"还是不是最新"）
                 if self._pending_media:
                     try:
@@ -702,6 +710,11 @@ class MessageBridge:
                 # 退回用"上一条已入库消息的时间"，而不是"当前时间" —— 否则补发旧消息会写成
                 # 转发时刻（用户实测：22:04 发的"噢"在 22:20 被补发，显示成了 22:20）。
                 disp_lbl = self._estimate_time_label()
+            else:
+                # 显示时间：同组标签"已经用过且隔了 60 秒以上"就用当前时间（用户实测：
+                # 15:46 发的被写成 15:41）。身份 ident 不变，只影响显示。
+                disp_lbl = self._display_time_label(
+                    contact, ident or self._abs_time_label(disp_lbl) or disp_lbl)
             if self._in_store(contact, text, ident):
                 break                               # 撞库 -> 停，不再往上翻
             if self.dedup.seen(("xtc", contact or "", text, ident)):
@@ -884,6 +897,27 @@ class MessageBridge:
             self._log("info", f"[媒体] {'拿到图，补发' if sticker else '等太久了，按文字转发'}: "
                               f"{text[:24]!r}")
             self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
+
+    def _display_time_label(self, contact, label: str) -> str:
+        """挑一个**显示**用的时间：App 的分组标签只画在一组消息的第一条上方。
+
+        用户实测：15:41 那条之后同一组里的消息（其实 15:46 才发）也被写成 15:41。
+        规则：同一个 App 标签我们已经用它转发过、且距那时已经超过 `label_stale_secs`
+        （默认 60 秒）-> 说明这条是**同组里更晚**的消息，改用当前时间。
+        **身份（去重/历史）仍然用 App 标签**，只有显示时间变 —— 否则身份会跟着时间漂移，
+        又会出现"同一条被反复转发"的老问题。
+        """
+        if not label:
+            return self._estimate_time_label() or datetime.now().strftime("%m-%d %H:%M")
+        now = time.time()
+        key = (contact or "", label)
+        first = self._label_used.get(key)
+        if first is None:
+            self._label_used[key] = now
+            return label
+        if now - first > self._label_stale_secs:
+            return datetime.fromtimestamp(now).strftime("%m-%d %H:%M")
+        return label
 
     def _fwd_key(self, contact, text: str, label: str) -> tuple:
         """转发身份键（与实时/补发两条路径共用，必须同源）。"""
@@ -1120,15 +1154,56 @@ class MessageBridge:
         # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）——查表情包索引前先去掉
         name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
         # 先在快照里定位气泡：① 拿它的形状去缓存里挑原图 ② 抠它的截图当核对基准/兜底
-        item = None
+        def _locate(r):
+            try:
+                if is_image:
+                    return self.xtc.image_of_latest(r, text, match_label=match_label)
+                return (self.xtc.sticker_of_latest(r, text, match_label=match_label)
+                        or self.xtc.sticker_of_latest(r, ""))
+            except Exception as e:  # noqa: BLE001 定位失败不影响取原图
+                self._log("debug", f"定位图片/表情气泡失败: {e}")
+                return None
+
+        item = _locate(root)
+        # **气泡被消息列表裁掉时先滚进可视区**：实测贴边那条抠下来只有半张（原图比对
+        # 0.78 不过 -> 发出去的是半张 png），往下滚一屏后同一张能到 0.99。
+        # 抓完图按原路滚回去（列表停在中间会让轮询读不到新消息）。
+        steps: list[int] = []
+        vb = None
+        if item is not None:
+            try:
+                vb = self.xtc.chat_view_bounds(root)
+            except Exception as e:  # noqa: BLE001 拿不到可视区就按"没被裁"处理
+                self._log("debug", f"读消息列表可视区失败（按未裁处理）: {e}")
+                vb = None
+        for _ in range(2):
+            if not item or not vb or not self.xtc.bubble_clipped(root, item["bounds"]):
+                break
+            dy = int((vb[3] - vb[1]) * 0.3) or 40
+            # 贴着上边 = 上面被裁 -> 内容往下拖；贴着下边 = 下面被裁 -> 内容往上拖
+            step = dy if item["bounds"][1] <= vb[1] + 2 else -dy
+            if not self.xtc.scroll_chat_by(vb, step):
+                break
+            steps.append(step)
+            fresh = self.xtc._dump_with_retry(1)
+            if fresh is None:
+                break
+            root = fresh
+            item = _locate(root)
+        if steps:
+            self._log("info", f"[媒体] 这条气泡被消息列表裁到了，已滚动 {len(steps)} 次取完整图"
+                              "（抓完会滚回底部）")
         try:
-            if is_image:
-                item = self.xtc.image_of_latest(root, text, match_label=match_label)
-            else:
-                item = (self.xtc.sticker_of_latest(root, text, match_label=match_label)
-                        or self.xtc.sticker_of_latest(root, ""))
-        except Exception as e:  # noqa: BLE001 定位失败不影响取原图
-            self._log("debug", f"定位图片/表情气泡失败: {e}")
+            return self._capture_media_now(root, text, name, is_image, item,
+                                           near_epoch=near_epoch)
+        finally:
+            # 滚回原位：逆向、同样次数（列表停在中间会让轮询读不到新消息）
+            for step in reversed(steps):
+                self.xtc.scroll_chat_by(vb, -step)
+
+    def _capture_media_now(self, root, text: str, name: str, is_image: bool, item,
+                           near_epoch: float | None = None) -> dict | None:
+        """真正取图（气泡已确保完整可见）。拆出来是为了让"滚动 -> 取图 -> 滚回"成对出现。"""
         aspect = None
         if item and item.get("bounds"):
             x1, y1, x2, y2 = item["bounds"]
@@ -1216,7 +1291,7 @@ class MessageBridge:
                                   f"{len(got['data'])} 字节（{got.get('w')}x{got.get('h')}）{tag}")
                 return got
         if ref:
-            self._log("info", f"[表情包] 没有可信原图（{name!r}），发界面气泡截图"
+            self._log("info", f"[表情包] 没有可信原图（{name!r}），发界面气泡截图 "
                               f"{len(ref)} 字节（静止一帧）")
             return {"data": ref, "kind": "png", "animated": False, "source": "screenshot"}
         if not item:
@@ -1275,6 +1350,29 @@ class MessageBridge:
                   "若使用 WSA / WSABuilds 且经常断网，可先在 WSA 设置里重启子系统"
                   "（或执行 wsa:// 设置里的 Repair），桥接会自动重连 ADB 继续工作")
 
+    def _typed_body(self, text: str) -> str:
+        """给转发内容加上**类型标记**，让表情和照片一眼分得开（用户要求）。
+
+        * 表情（贴纸）-> `[表情] 开心`（名字读不到时就是 `[表情]`）
+        * 照片（图片消息）-> `[图片]`
+        * 文字消息原样不动
+
+        为什么要标：贴纸拿不到原图时会退化成**气泡截图**（一张 png），看起来和照片没区别，
+        用户分不清哪条是表情、哪条是照片（实测 15:24 那条）。标记只加在**发出去的文字**上，
+        去重/历史的身份仍然是原始 `text`，不会影响判重。
+        """
+        t = (text or "").strip()
+        if not t:
+            return t
+        if t == getattr(self.xtc, "IMAGE_TEXT", "图片"):
+            return "[图片]"
+        if t.startswith("表情"):
+            name = t[len("表情"):].strip()
+            # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）—— 显示时去掉
+            name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
+            return f"[表情] {name}" if name else "[表情]"
+        return t
+
     def _forward(self, contact, text: str, time_label: str = "",
                  sticker: dict | None = None,
                  only: list | None = None) -> tuple[bool, list, list]:
@@ -1298,7 +1396,7 @@ class MessageBridge:
         # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
         time_str = self._format_xtc_time(time_label)
         nickname = self._display_name(contact)
-        message = f"[{time_str}] [{nickname}] {text}"
+        message = f"[{time_str}] [{nickname}] {self._typed_body(text)}"
         image_b64 = ""
         image_size = 0
         if sticker and sticker.get("data"):
