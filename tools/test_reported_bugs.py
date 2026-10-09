@@ -2546,13 +2546,18 @@ def test_backlog_media_uses_fresh_dump() -> None:
         check("气泡被顶走、图取不到时先扣住不发（等原图）",
               n == 0 and not fwd.images and not fwd.texts and br._pending_media,
               f"texts={fwd.texts} images={fwd.images} pending={br._pending_media}")
-        # 逼到"等太久了" -> 退回发文字（保证消息不丢，且不是空白图）
+        # 逼到"等太久了" -> 由重试流程退回发文字（保证消息不丢，且不是空白图）
         for st in br._pending_media.values():
             st["tries"] = br._media_retry_max
         n1 = br._forward_backlog(ET.fromstring(node_xml("")), "屑猹不喝茶")
+        check("等待期间补发不再重复抠图/转发（交给重试流程统筹）",
+              n1 == 0 and not fwd.images and not fwd.texts,
+              f"n={n1} texts={fwd.texts} images={fwd.images}")
+        br._retry_pending_media(ET.fromstring(node_xml("")))
         check("等太久后按文字转发（消息不丢、也不发空白图）",
-              n1 == 1 and not fwd.images and any("图片" in m for m in fwd.texts),
+              not fwd.images and any("图片" in m for m in fwd.texts),
               f"texts={fwd.texts} images={fwd.images}")
+        check("退回文字后清掉等待状态", not br._pending_media, f"{br._pending_media}")
 
         # ② 对照组：重新 dump 里气泡还在 -> 正常取到图
         adb2 = _Adb(keep_visible=True)

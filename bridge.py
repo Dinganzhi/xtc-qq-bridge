@@ -573,11 +573,13 @@ class MessageBridge:
                     # 图片/表情：媒体（原图/贴纸）可能**还没下载完**（App 先画出占位图，
                     # 原图要过几秒~几分钟才落盘）。这时不能马上按"文字"转发 ——
                     # 否则 QQ 只会收到"图片"两个字（用户实测：22:12 检测到、22:19 原图才出现）。
+                    # 已经在等待重试队列里的：这一轮什么都不做（重试节奏由 _retry_pending_media
+                    # 统一掌握，避免同一条消息一轮里被抠图两三次）。
                     is_media = (text == getattr(self.xtc, "IMAGE_TEXT", "图片")
                                 or text.startswith("表情"))
                     mkey = self._fwd_key(contact, text, label)
-                    if not dup and is_media and self._media_retry_decision(mkey) == "wait":
-                        dup = True          # 本轮静默跳过：还在等媒体，不转发也不刷日志
+                    if not dup and is_media and mkey in self._pending_media:
+                        dup = True          # 本轮静默跳过：在等媒体/重试中，不转发也不刷日志
                     if not dup:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
@@ -717,21 +719,19 @@ class MessageBridge:
             sticker = None
             if it.get("sticker") or it.get("image"):
                 mkey = self._fwd_key(contact, text, ident)
-                decision = self._media_retry_decision(mkey)
-                if decision == "wait":
-                    # 媒体还没就绪、也还没到重试时间：**直接停**，不往上翻（否则顺序会反：
-                    # 老消息反而先到 QQ）。到点由 `_retry_pending_media` 取图后补发。
-                    self._log("debug", f"[补发] 媒体还没就绪，先等它: {text[:24]!r}")
+                if mkey in self._pending_media:
+                    # 已经在"等媒体"队列里：交给 `_retry_pending_media`（那里掌握退避节奏，
+                    # 而且不依赖它是不是最新一条）。这里**直接停**，不往上翻（否则顺序会反）。
+                    self._log("debug", f"[补发] 这条的媒体在等待重试，先跳过: {text[:24]!r}")
                     break
                 sticker = self._capture_sticker(
                     root, text, near_epoch=self._label_epoch(disp_lbl or own_lbl),
                     match_label=ident or disp_lbl)
-                if sticker is None and decision != "give_up":
-                    # 还没到"等太久"：登记重试并停在这里；到点后由 _retry_pending_media 处理
+                if sticker is None:
+                    # 媒体还没就绪：登记等待重试，这一条先不放行（不发"图片"两个字）
                     self._media_retry_failed(mkey, contact, text, ident, disp_lbl,
                                              "界面上还是占位图、缓存里也还没有原图")
                     break
-                self._media_retry_clear(mkey)
             pending.append((text, ident, sticker, disp_lbl))
 
         if not pending:
