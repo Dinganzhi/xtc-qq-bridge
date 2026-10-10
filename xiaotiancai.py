@@ -164,6 +164,7 @@ class Xiaotiancai:
         self._last_label_retry = float("-inf")  # "快照里没有时间标签"的补救重读节流
         self._throttle: dict[str, float] = {}   # 同类失败告警节流：key -> 上次打印时刻
         self._last_verify_root = None   # 注入校验时的界面快照（复用给"找发送按钮"，省一次 dump）
+        self._last_confirm_root = None  # 发送后确认用的快照（复用给"补点一次发送"，省一次 dump）
         # 弹窗自动关闭的"同一弹窗最多试几轮"状态（空 key 表示当前没有弹窗）
         self._popup_key = ""            # 当前弹窗的指纹（Activity + 标题 + 说明前若干字）
         self._popup_tries = 0           # 这个弹窗已经尝试关闭的轮数
@@ -183,11 +184,13 @@ class Xiaotiancai:
             self._snapshot_reuse = max(0.0, float(self.ui.get("snapshot_reuse", 3.0)))
         except (TypeError, ValueError):
             self._snapshot_reuse = 3.0
-        # 点发送后等多久再 dump 确认：太短会白 dump 一次（约 3 秒），太长就只是慢一点
+        # 点发送后等多久再 dump 确认：太短会白 dump 一次（约 3 秒），太长就只是慢一点。
+        # 实测（24 次发送）：第一次 dump 常常撞上界面还没稳定而失败 -> 又花一次 dump，
+        # 所以默认给到 0.6~0.8 秒，整体反而更快（`performance.profile` 会按档位覆盖它）。
         try:
-            self._confirm_delay = max(0.0, float(self.ui.get("confirm_delay", 0.45)))
+            self._confirm_delay = max(0.0, float(self.ui.get("confirm_delay", 0.6)))
         except (TypeError, ValueError):
-            self._confirm_delay = 0.45
+            self._confirm_delay = 0.6
         self.last_open_reason = ""   # 最近一次 open_chat 失败的原因（桥接据此去重打印）
 
     def log(self, level: str, msg: str):
@@ -1938,29 +1941,50 @@ class Xiaotiancai:
         """缓存的发送按钮可点坐标；**仅当输入框位置与缓存时一致**才返回
 
         为什么要这个判断：WSA 窗口能被缩放/最大化，布局一变，缓存下来的绝对坐标
-        可能落到别的控件上（例如"更多"）。位置对不上就返回 None，退回
-        "注入后 dump 找按钮"的稳妥流程，宁可慢一点也不乱点。
+        可能落到别的控件上（例如"更多"）。所以：
+          * 输入框位置一致 -> 直接用缓存坐标（最稳）；
+          * 只有**输入框高度**变了（多行文字 / 键盘收起）-> 按"相对输入框右下角的偏移"
+            换算（发送按钮就在输入框右下角外侧），实测多行消息就属于这种，以前会直接
+            放弃快路径、退回两次 dump 的稳妥流程；
+          * 宽度也变了（窗口被缩放）或偏移离谱 -> 返回 None，退回稳妥流程，宁可慢也不乱点。
 
         已知残余风险（可接受）：位置比对用的是**最近快照**，所以"刚缩放完窗口、还没
         轮到下一次轮询 dump 就发消息"这一种情况仍可能按旧坐标点一次；点完的确认 dump
-        会发现没发出去，随后清掉缓存并退回稳妥流程（多余点开的弹层也会被清掉），
-        所以最坏是多花一次 dump，不会静默发错。
+        会发现没发出去（文字还在框里），随后**就着快照补点一次**（`_retap_send`），
+        仍不行才清缓存退回稳妥流程 —— 最坏是多花一次 dump，不会静默发错。
         """
         cache = self._send_cache
         if not cache or not input_bounds:
             return None
-        if not self._same_bounds(cache.get("input"), input_bounds):
-            return None
         point = cache.get("point")
-        if not point:
+        cached_in = cache.get("input")
+        if not point or not cached_in:
             return None
         try:
             w, h = self.adb.get_screen_size()
-            if not (0 <= int(point[0]) <= int(w) and 0 <= int(point[1]) <= int(h)):
-                return None
         except Exception:  # noqa: BLE001 拿不到屏幕尺寸就不冒险
             return None
-        return (int(point[0]), int(point[1]))
+        if self._same_bounds(cached_in, input_bounds):
+            x, y = int(point[0]), int(point[1])
+            return (x, y) if (0 <= x <= int(w) and 0 <= y <= int(h)) else None
+        # 输入框位置对不上：**先看是不是"输入框变高了"**（多行文字 / 键盘收起）。
+        # 发送按钮固定在输入框右下角外侧，所以按"相对输入框右下角的偏移"换算仍然准；
+        # 但窗口被缩放时**宽度**也会变，那种情况必须放弃（绝对坐标会落到别的控件上）。
+        cx1, cy1, cx2, cy2 = (int(v) for v in cached_in)
+        ix1, iy1, ix2, iy2 = (int(v) for v in input_bounds)
+        cw, iw = max(1, cx2 - cx1), max(1, ix2 - ix1)
+        if abs(iw - cw) > 0.25 * cw:
+            return None                        # 宽度都变了 = 窗口被缩放，别猜
+        dx = int(point[0]) - cx2                # 按钮相对输入框右边
+        dy = int(point[1]) - cy2                # 按钮相对输入框下边（一般是个小负数）
+        if not (-24 <= dx <= 200 and -90 <= dy <= 60):
+            return None                        # 偏移太离谱 = 布局不是这一种，别猜
+        x, y = ix2 + dx, iy2 + dy
+        if not (0 <= x <= int(w) and 0 <= y <= int(h)):
+            return None
+        self.log("debug", f"输入框高度变了（{cy2 - cy1} -> {iy2 - iy1}），"
+                          f"按相对偏移换算发送按钮坐标 -> ({x}, {y})")
+        return (x, y)
 
     def _remember_send_point(self, input_bounds, send_node, root: ET.Element) -> None:
         """记下这次点成功的发送按钮坐标 + 输入框坐标，供下次"先手打字"用。"""
@@ -2060,19 +2084,27 @@ class Xiaotiancai:
 
         用一次 dump 同时判断：出现新己方气泡（最强证据）/ 出现新失败提示 /
         输入框仍留有内容（没发出去，可安全重发）/ 输入框已清空且无新失败提示。
+
+        文字还留在输入框里时**先就着快照补点一次发送**（见 `_retap_send`）：实测那多半只是
+        那一下没点中（输入框变高了/按钮位置变了），补点一次就出去了 —— 比回退到
+        "清空 + 重新注入 + 重新找按钮"的稳妥流程快 5~8 秒。
         """
         blind = self._blind or {}
         self._blind = None
         if not blind:
             return False, "没有待复核的先手发送", False
+        base_fail = blind.get("base_fail") or []
+        base_own = blind.get("base_own") or {}
         try:
-            ok, why = self._confirm_sent(text, blind.get("base_fail") or [],
-                                         blind.get("base_own") or {})
+            ok, why = self._confirm_sent(text, base_fail, base_own)
+            retryable = "输入框仍留有内容" in (why or "")
+            if not ok and retryable:
+                ok, why = self._retap_send(text, base_fail, base_own)
+                retryable = (not ok) and ("输入框仍留有内容" in (why or ""))
         except AdbError as e:
             return False, f"复核失败: {e}", False
-        retryable = "输入框仍留有内容" in (why or "")
         if not ok and retryable:
-            # 没发出去（文字还在输入框里）：清掉缓存坐标，让稳妥流程重来
+            # 补点还是没发出去（文字仍在输入框里）：清掉缓存坐标，让稳妥流程重来
             self._send_cache = None
             self._save_send_cache()
         return ok, why, retryable
@@ -2202,34 +2234,74 @@ class Xiaotiancai:
         第一次 dump 前先等 `_confirm_delay`：点发送后 App 要一点时间才把气泡画出来，
         等太短会白 dump 一次（WSA 上一次 ~3 秒，白等就变成"发一条要十几秒"）。
         后面几次只在前一次证据不足时才继续。
+
+        每次 dump 的**结果与耗时**都记下来：多花了一次 dump 就在 INFO 里写一行说明，
+        "到底慢在哪一步"从此不用猜（实测最常见的就是第一次 dump 撞上界面还没稳定而失败）。
         """
         last = "界面读取失败"
         base_fail_cnt = self._counter(base_fail)
+        notes: list[str] = []
         for i in range(3):
             time.sleep(self._confirm_delay if i == 0 else 0.5)
+            t0 = time.monotonic()
             try:
                 root = self._dump_fast()
             except AdbError as e:
                 last = f"界面读取失败({e})"
+                notes.append(f"第{i + 1}次 dump 失败（{time.monotonic() - t0:.1f}s）")
                 continue
+            self._last_confirm_root = root      # 供"补点一次发送"复用，省一次 dump
             # 新出现的"发送失败"提示 = 明确失败
             now_fail = self._counter(self._fail_signature(root))
             new_fail = [k for k, v in now_fail.items() if v > base_fail_cnt.get(k, 0)]
             if new_fail:
                 return False, f"出现发送失败提示（{new_fail[0][:30]}）"
             if self._has_new_own_bubble(root, text, base_own):
-                return True, "已出现己方消息气泡"     # 最强证据：消息真的进了聊天记录
+                return True, self._confirm_note("已出现己方消息气泡", i, notes)
             edit = self._find_input(root)
             if edit is None:
                 last = "未找到输入框，无法确认"
+                notes.append(f"第{i + 1}次没读到输入框（{time.monotonic() - t0:.1f}s）")
                 continue
             cur = self._input_text_of(edit)
             needle = (text or "").strip()
             if needle and cur and needle in cur:
                 return False, "输入框仍留有内容"
             # 输入框已清空且没有新的失败提示：视为已发出（App 点发送后立即清空输入框）
-            return True, "输入框已清空且无失败提示"
-        return False, last
+            return True, self._confirm_note("输入框已清空且无失败提示", i, notes)
+        return False, last + ("（" + "；".join(notes) + "）" if notes else "")
+
+    def _confirm_note(self, why: str, attempt: int, notes: list) -> str:
+        """确认成功时，若不止 dump 了一次就写一行 INFO（便于用户/排查看"慢在哪"）。"""
+        if attempt <= 0 and not notes:
+            return why
+        detail = f"（用了 {attempt + 1} 次 dump"
+        if notes:
+            detail += "：" + "；".join(notes)
+        detail += "）"
+        self.log("info", f"发送确认{detail}")
+        return why + detail
+
+    def _retap_send(self, text: str, base_fail: list, base_own: dict) -> tuple[bool, str]:
+        """复核发现"文字还留在输入框里"（那次点发送没生效）时：**就着刚才那份快照里的
+        发送按钮再点一次**，然后重新确认。
+
+        为什么这么做：回退到稳妥流程要"清空输入框 -> 重新聚焦 -> 重新注入 -> 重新找按钮 ->
+        再确认"（多 2~3 次 dump，实测多花 5~8 秒）。实测文字已经在框里、只是那一下没点中，
+        直接补点一次就发出去了（顺手把发送按钮的新坐标记进缓存，下次盲打更准）。
+        """
+        root = self._last_confirm_root
+        if root is None:
+            return False, "没有可复用的界面快照"
+        node = self._find_send(root)
+        if node is None:
+            return False, "复核快照里没有发送按钮"
+        edit = self._find_input(root)
+        self._tap_send(node, root)
+        if edit is not None:
+            self._remember_send_point(self._bounds(edit), node, root)
+        self.log("info", "文字还留在输入框里（那一下没点中）-> 就着快照补点一次发送")
+        return self._confirm_sent(text, base_fail, base_own)
 
     def _switch_to_text_mode(self, root: ET.Element) -> bool:
         """语音模式 -> 文字模式：单击 iv_left_img_view（实测单击即可切换）。"""

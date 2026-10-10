@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml  # noqa: E402
 import bridge as bridge_mod  # noqa: E402
 from adb_controller import ADBController  # noqa: E402
-from emoji_store import EmojiStore  # noqa: E402
 from utils import imgtool  # noqa: E402
 from xiaotiancai import IMAGE_TEXT, Xiaotiancai  # noqa: E402
 

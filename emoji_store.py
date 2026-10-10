@@ -54,7 +54,7 @@ class EmojiStore:
     """按名字/像素比对从小天才 App 的数据目录里取表情原图。"""
 
     def __init__(self, adb, package: str = "com.xtc.watch", logger=None,
-                 recent_secs: float = 45.0, index_ttl: float = 600.0,
+                 index_ttl: float = 600.0,
                  max_px: int = 600, max_bytes: int = 512 * 1024,
                  near_window: float = 300.0, fresh_window: float = 1800.0,
                  match_ok: float = MATCH_OK, max_reads: int = 16,
@@ -65,7 +65,6 @@ class EmojiStore:
         self.adb = adb
         self.package = package
         self.logger = logger
-        self.recent_secs = max(5.0, float(recent_secs))   # 缓存"刚写进来"的时间窗
         self.near_window = max(10.0, float(near_window))  # 按消息时间找缓存时允许的偏差
         # 补发/重渲染时，App 会重新写缓存文件（mtime 与消息时间能差十几分钟），
         # 所以"最近写过"的窗口给到 30 分钟；挑哪张靠像素核对，不靠时间

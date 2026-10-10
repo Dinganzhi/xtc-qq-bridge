@@ -221,12 +221,25 @@ def main() -> None:
         sys.exit(2)
 
     cfg = load_config(str(cfg_path))
+    # 速度/稳定档位：把 performance.profile 的默认值**填空**进 cfg（用户写死的键不动）
+    import speed_profile
+    _profile, _filled, _pinned = speed_profile.apply_profile(cfg)
     log = setup_logger(level=(cfg.get("logging") or {}).get("level", "INFO"),
                        file=(cfg.get("logging") or {}).get("file"))
     if not args.no_banner:
         log.info(f"小天才 <-> QQ 桥接 v{__version__} | 配置: {cfg_path}")
         log.info(f"数据目录: {runtime_paths.APP_DIR}（{'冻结' if runtime_paths.IS_FROZEN else '源码'}运行）"
                  f"{'' if runtime_paths.IS_FROZEN else ''}")
+        log.info(f"速度档位: {_profile}（套用了 {len(_filled)} 项默认值；"
+                 f"config.yaml -> performance.profile 可改，单独写某个键可覆盖档位）")
+        if _pinned:
+            log.info(f"  · 你在 config.yaml 里写死、档位不会覆盖的 {len(_pinned)} 项："
+                     + "、".join(_pinned[:8]) + ("…" if len(_pinned) > 8 else "")
+                     + "（想让档位说了算：performance.force: true）")
+        _raw = speed_profile.raw_profile(cfg)
+        if _raw and _raw.lower() not in speed_profile.PROFILES:
+            log.warning(f"performance.profile={_raw!r} 不是有效档位"
+                        f"（可选 {'/'.join(speed_profile.PROFILE_NAMES)}），已按 {_profile} 运行")
 
     from adb_controller import ADBController
     adb_cfg = cfg.get("adb") or {}
@@ -354,7 +367,12 @@ def run_check(config_path=None) -> int:
     try:
         cfg_path = runtime_paths.resolve_config(config_path)
         if cfg_path.exists():
-            adb_cfg = (load_config(str(cfg_path)).get("adb") or {})
+            _c = load_config(str(cfg_path))
+            import speed_profile
+            _p, _f, _pinned = speed_profile.apply_profile(_c)
+            adb_cfg = (_c.get("adb") or {})
+            print(f"速度档位: {_p}（套用 {len(_f)} 项默认值"
+                  + (f"，另有 {len(_pinned)} 项在 config.yaml 里写死" if _pinned else "") + "）")
     except Exception:  # noqa: BLE001 配置有问题时退回自动探测，别让自检本身失败
         adb_cfg = {}
     try:

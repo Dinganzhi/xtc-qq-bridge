@@ -32,6 +32,12 @@ xtc = Xiaotiancai(adb, cfg.get("xiaotiancai") or {}, logger=None)
 root = adb.dump_ui(retries=2, delay=0.5)
 out.append(f"state={xtc.app_state(root)} in_chat={xtc.is_in_chat(root)} "
            f"title={xtc.chat_title(root)!r}")
+# 消息列表可视区：气泡贴它的边 = 被裁（抠图只有半张，见 emoji_clip_probe.py）
+out.append(f"消息列表可视区={xtc.chat_view_bounds(root)}")
+for it in xtc._chat_bubbles(root, include_own=True):
+    if it.get("bounds"):
+        out.append(f"  气泡 {it['bounds']} 被列表裁到={xtc.bubble_clipped(root, it['bounds'])} "
+                   f"text={it.get('text')!r}")
 out.append("--- 原始节点（chat_msg_item_content）---")
 for n in root.iter("node"):
     rid = n.get("resource-id") or ""

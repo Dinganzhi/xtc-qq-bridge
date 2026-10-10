@@ -4,6 +4,16 @@
 #  建议阅读 README.md 后再进行编辑
 # =====================================================================
 
+# ---------- 速度 / 稳定 档位（先选这个，其它项按需微调） ----------
+# stable   = 稳定优先：不用"先手打字"、每条都先读界面再注入，等得更久、重试更宽容
+# balanced = 均衡（默认）：先手打字 + 读界面兜底，绝大多数人用这个
+# fast     = 速度优先：先手打字 + 更短等待 + 轮询留空隙（发送更容易立刻拿到界面锁）
+# turbo    = 极速：能省的都省（dump 重试 1 次、发送只试 1 轮）——失败会更多地如实上报
+# 档位只**填空**：你在下面任何地方显式写过的键都不会被覆盖
+#   （例：profile: fast + xiaotiancai.ui.confirm_delay: 1.2 也完全可以）
+performance:
+  profile: "balanced"
+
 # ---------- ADB / 模拟器 / 容器（Windows / Linux / macOS 通用） ----------
 # 设备查找顺序：已有的在线设备 -> 环境变量 ADB_SERIAL -> WSA 端口（仅 Windows）
 #   -> 常见 adb 端口（5555 通用 / 16384 MuMu / 62001 夜神 / 21503 逍遥 / 5556 Waydroid）。
@@ -23,9 +33,11 @@ adb:
   keep_awake_interval: 10                        # 每隔多少秒发一次 WAKEUP 保活（0=关）。
                                                  # 实测 WSA 约每 50 秒睡一次虚拟屏（screen_off_timeout 拉满也挡不住），
                                                  # 每 10 秒一次 WAKEUP 能连续保持 Awake、App 一直留在前台（单次仅 0.08s）
-  input_retries: 2                               # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
-  dump_retries: 2                                # UI dump 默认重试次数（交互路径自动用更快的单次 dump）
-  dump_delay: 0.8                                # UI dump 重试间隔（秒，逐轮递增等待界面空闲）
+                                                 # ★ 保活间隔 / 注入重试 / dump 重试与间隔 都由 performance.profile 决定，
+                                                 #   想单独改就取消下面几行的注释（写了就优先于档位）
+  # input_retries: 2                             # 文本注入重试轮数（每一轮会依次尝试广播/base64/码点/剪贴板）
+  # dump_retries: 2                              # UI dump 默认重试次数（交互路径自动用更快的单次 dump）
+  # dump_delay: 0.8                              # UI dump 重试间隔（秒，逐轮递增等待界面空闲）
   dump_timeout: 60                               # 单次 uiautomator dump 超时（秒）
   focus_cache_ttl: 1.5                           # 前台组件缓存秒数（减少 dumpsys，提升点击/发送速度）
 
@@ -35,8 +47,9 @@ forward:
   # 转发失败的重试纪律（小天才 -> QQ）：
   #   只有**没成功的目标**会被补投（私聊成功、群失败时不会把私聊再发一遍）；
   #   补投按下面的间隔退避、到次数上限就放弃并报一次错（不会"每轮轮询都重发"刷屏）
-  retry_max_tries: 3                             # 最多补投几次；0 = 失败就放弃（不补投）
-  retry_backoff: 60                              # 第一次补投前等多少秒（之后每次 ×4）
+  #   ★ 这两个键由 performance.profile 决定，想单独改就取消注释
+  # retry_max_tries: 3                           # 最多补投几次；0 = 失败就放弃（不补投）
+  # retry_backoff: 60                            # 第一次补投前等多少秒（之后每次 ×4）
   content_dedup_secs: 300                        # 同一联系人 + 同一内容，多少秒内不重复转发
                                                  # （App 的时间标签会时有时无，靠它挡住重复；0 = 关闭）
   plugin:
@@ -71,16 +84,15 @@ target:
 xiaotiancai:
   package: "com.xtc.watch"
   main_activity: ".MainActivity"
-  check_interval: 2
+  # check_interval: 2                            # 轮询间隔（秒）——由 performance.profile 决定，想单独改就取消注释
   # 漏消息补发：从最新一条往回走，把"可见范围内"没入库的都补上（库里已有的跳过、不再停）
   #   —— 为什么不停：用户实测手表 16:38 发的两条被更新的 19:19 照片挡住，直到 21:48 才发出来
   catchup_missed: true                           # 总开关
   catchup_max: 0                                 # 单次最多补几条；0 = 不限制（默认）
-  catchup_scan: 30                               # 每轮最多往上看多少条气泡（可见区本来只有几条）
   catchup_max_age: 0                             # 太旧的积压消息不补发（秒）；0 = 不限（默认）
                                                  # 想避免"21:48 突然收到 16:38 的消息"就设 1800
-  label_stale_secs: 60                           # App 的分组时间标签复用超过这么多秒后，改用当前时间显示
-                                                 # （App 只在一组消息的第一条上画标签，同组后面的其实更晚）
+  # catchup_scan: 30                             # 每轮最多往上看多少条气泡（由档位决定）
+  # label_stale_secs: 60                         # App 分组标签复用多久后改用当前时间（由档位决定）
   auto_install_adbkeyboard: true                 # 先查设备上有没有；没有才用项目目录里的本地 APK（不联网）
   login:                                         # 账密登录（/小天才登录 命令 + 自动检测用）
     phone: ""                                    # 手机号
@@ -120,10 +132,12 @@ xiaotiancai:
     interaction_delay: 0.6                       # 点击/输入之间的等待（秒）；设备慢可调大到 1.0
     send_retries: 2                              # 发送确认失败时的重试轮数（仅在"输入框仍留有内容"时重发）
     # ---- 发送提速（WSA 上一次 uiautomator dump 约 3~4 秒，所以关键在"数 dump 次数"）----
-    fast_send: true                              # 布局没变时直接广播注入 + 点缓存的发送按钮坐标（省 1 次 dump）
-    snapshot_reuse: 3.0                          # 复用"最近界面快照"的秒数（轮询每 2 秒 dump 一次；0 = 不复用）
-    confirm_delay: 0.45                          # 点发送后等多久再 dump 确认（太短会白 dump 一次）
-    blind_send: true                             # "先手打字"：按上次成功发送的坐标直接输入+点发送，
+    # ★ 下面这几项**由 performance.profile 决定**（stable/balanced/fast/turbo）。
+    #   想单独覆盖某一项，就取消它的注释并写死（写了就优先于档位）：
+    # fast_send: true                            # 布局没变时直接广播注入 + 点缓存的发送按钮坐标（省 1 次 dump）
+    # snapshot_reuse: 3.0                        # 复用"最近界面快照"的秒数（轮询每 2 秒 dump 一次；0 = 不复用）
+    # confirm_delay: 0.8                         # 点发送后等多久再 dump 确认（太短会白 dump 一次，实测 0.6~0.8 最划算）
+    # blind_send: true                           # "先手打字"：按上次成功发送的坐标直接输入+点发送，
                                                  # 不等轮询的 dump（QQ 发消息到文字出现 ~1 秒）；关掉则每条都先读界面
     send_fail_markers: ["发送失败", "发送不成功", "未发送", "网络异常", "网络不可用", "发送异常", "无法发送"]
     popup_skip_texts: ["以后再说", "稍后再说", "暂不更新", "不更新", "稍后更新", "下次再说", "暂不升级", "忽略此版本", "取消", "关闭"]
@@ -164,10 +178,10 @@ emoji:
   forward_photo: true                            # 照片是否取原图（关掉只发气泡截图，省流量）
   caption: true                                  # 图片是否带一句说明（[时间] [昵称] 内容）
   from_app_data: true                            # 从 App 可读数据目录/图片缓存取原图（推荐）
-  cache_recent_secs: 45                          # 图片缓存里"刚写进来"的时间窗（秒）
-  wait_retries: 8                                # 原图还没下载完时最多重试几次（间隔翻倍）
-  wait_base: 5                                   # 首次等待秒数（之后 10/20/40…，单次最长 5 分钟）
-  wait_max_secs: 1800                            # 最多等多久（秒）；超过就退回发"图片"两个字
+  # ★ 下面三项由 performance.profile 决定，想单独改就取消注释
+  # wait_retries: 8                              # 原图还没下载完时最多重试几次（间隔翻倍）
+  # wait_base: 5                                 # 首次等待秒数（之后 10/20/40…，单次最长 5 分钟）
+  # wait_max_secs: 1800                          # 最多等多久（秒）；超过就退回发"图片"两个字
 
 # ---------- WSA / WSABuilds 断网怎么办 ----------
 # 本项目**不再自带网络守护工具**。WSA 断网时手工处理即可（桥接会自动重连 ADB 继续工作）：

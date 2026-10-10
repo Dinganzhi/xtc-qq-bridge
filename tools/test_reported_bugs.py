@@ -278,6 +278,7 @@ class FastChatAdb(ChatAdb):
         self.plain_injects = 0
         self.sends = 0
         self.blind_tap_sends = True     # False = 模拟"盲点没点中发送按钮"
+        self.element_tap_sends = True   # False = 模拟"连按控件也点不动"（发送按钮失效）
         self.set_ui(input_text=self._input(), tip=self._tip(), bubble=self._bubble())
 
     def dump_ui(self, retries: int = 3, delay: float = 2.0):
@@ -307,6 +308,8 @@ class FastChatAdb(ChatAdb):
         self.calls.append(f"tap {rid}")
         if not rid.endswith("tv_send_view"):
             return
+        if not self.element_tap_sends:
+            return                      # 模拟"发送按钮点不动"
         self.sends += 1
         self._apply_send()
 
@@ -617,13 +620,14 @@ def test_send_speed_fast_path() -> None:
     check("确实点到了发送按钮（不是盲点空转）", adb2.sends == 1, f"sends={adb2.sends}")
     check("首次发送的 dump 次数也没有变多", first_dumps <= 3, f"first_dumps={first_dumps}")
 
-    # ④ 布局变了（WSA 窗口缩放/键盘顶起输入框）-> 不许按旧坐标盲点，退回稳妥流程。
-    #    轮询会持续 dump，所以布局变化会体现在下一份快照里；这里手动模拟那次 dump。
+    # ④ 布局变了：**只有高度变了**（键盘顶起输入框 / 多行文字）-> 按相对偏移换算发送按钮
+    #    坐标，快路径照走（实测多行消息就是这种，以前会白白退回两次 dump 的稳妥流程）；
+    #    **宽度也变了**（WSA 窗口被缩放）-> 不许猜，退回稳妥流程。
     adb3 = FastChatAdb()
     xtc4 = Xiaotiancai(adb3, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
                        logger=None)
     xtc4.send_message(text)
-    adb3.input_bounds = "[40,1500][900,1600]"     # 输入框整体上移 200px
+    adb3.input_bounds = "[40,1500][900,1600]"     # 输入框整体上移 200px（宽度没变）
     adb3.send_bounds = "[920,1500][1060,1600]"
     adb3.set_ui(input_text="", tip="", bubble="")
     xtc4._dump_fast()                             # 轮询读到新布局
@@ -631,16 +635,34 @@ def test_send_speed_fast_path() -> None:
     adb3.plain_injects = 0
     ok4 = xtc4.send_message("第三条消息")
     check("布局变了仍能发出", ok4 is True)
-    check("布局变了不按旧坐标盲点（走带校验的稳妥流程）", adb3.plain_injects == 0,
+    check("只有高度变了 -> 仍走快路径（相对偏移换算）", adb3.plain_injects == 1,
           f"plain_injects={adb3.plain_injects}")
-    check("布局变了会重新 dump 找按钮", adb3.dumps >= 2, f"dumps={adb3.dumps}")
+    check("快路径仍然只 dump 1 次", adb3.dumps == 1, f"dumps={adb3.dumps}")
 
-    # ⑤ 快路径点偏了（输入框仍留有内容）-> 退回稳妥流程重发，且**只发一条**
+    # 宽度也变了（窗口被缩放）-> 绝对坐标不可信，退回"注入 + dump 找按钮"的稳妥流程
+    adb3w = FastChatAdb()
+    xtc4w = Xiaotiancai(adb3w, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
+                        logger=None)
+    xtc4w.send_message(text)
+    adb3w.input_bounds = "[40,120][400,190]"      # 宽度从 860 变 360
+    adb3w.send_bounds = "[420,120][520,190]"
+    adb3w.set_ui(input_text="", tip="", bubble="")
+    xtc4w._dump_fast()
+    adb3w.dumps = 0
+    adb3w.plain_injects = 0
+    ok4w = xtc4w.send_message("窗口缩放后的消息")
+    check("窗口缩放后仍能发出", ok4w is True)
+    check("宽度变了不按旧坐标盲点（走带校验的稳妥流程）", adb3w.plain_injects == 0,
+          f"plain_injects={adb3w.plain_injects}")
+    check("宽度变了会重新 dump 找按钮", adb3w.dumps >= 2, f"dumps={adb3w.dumps}")
+
+    # ⑤ 快路径点偏了（输入框仍留有内容）-> **就着快照补点一次发送**（比重走稳妥流程快得多），
+    #    仍然只发一条；补点也不成功时如实上报失败并清掉缓存坐标。
     adb5 = FastChatAdb()
     xtc5 = Xiaotiancai(adb5, {"ui": {"interaction_delay": 0.05, "send_retries": 1}},
                        logger=None)
     xtc5.send_message(text)                        # 先缓存坐标
-    adb5.blind_tap_sends = False                   # 之后盲点不再生效
+    adb5.blind_tap_sends = False                   # 盲点那一发没点中（但快照里的按钮还能点）
     adb5.sends = 0
     ok5 = xtc5.send_message("第四条消息")
     check("快路径点偏后仍能发出", ok5 is True)
@@ -1138,6 +1160,64 @@ def test_catchup_max_age_skips_stale() -> None:
         cleanup(root)
 
 
+def test_speed_profiles() -> None:
+    """速度/稳定档位：`performance.profile` = stable / balanced / fast / turbo。
+
+    规则：档位**只填空**（用户写死的键一律不动），非法档位名回落到 balanced。
+    """
+    import speed_profile as sp
+
+    cfg = {"performance": {"profile": "fast"}}
+    name, filled, _pinned = sp.apply_profile(cfg)
+    check("fast 档套用了默认值", name == "fast" and len(filled) > 5, f"filled={len(filled)}")
+    ui = cfg["xiaotiancai"]["ui"]
+    check("fast 档：先手打字 / 快路径都开着", ui["blind_send"] is True and ui["fast_send"] is True)
+    check("fast 档：确认等待比 balanced 长（避免第一帧没画好白 dump 一次）",
+          ui["confirm_delay"] >= sp.PROFILES["balanced"]["xiaotiancai.ui.confirm_delay"],
+          f"{ui['confirm_delay']} vs {sp.PROFILES['balanced']['xiaotiancai.ui.confirm_delay']}")
+    check("fast 档：轮询间隔留出空隙（发送更容易立刻拿到界面锁）",
+          cfg["xiaotiancai"]["check_interval"] >= 3, str(cfg["xiaotiancai"]["check_interval"]))
+
+    cfg2 = {"performance": {"profile": "fast"},
+            "xiaotiancai": {"ui": {"confirm_delay": 1.5}, "check_interval": 2}}
+    _n2, _f2, _p2 = sp.apply_profile(cfg2)
+    check("用户写死的键不被档位覆盖",
+          cfg2["xiaotiancai"]["ui"]["confirm_delay"] == 1.5
+          and cfg2["xiaotiancai"]["check_interval"] == 2,
+          str(cfg2["xiaotiancai"]))
+    check("写死而跳过的键会被列出来（启动日志里提示）",
+          len(_p2) == 2 and any("confirm_delay" in x for x in _p2), str(_p2))
+
+    # performance.force: true -> 档位说了算（连写死的键也覆盖）
+    cfg2f = {"performance": {"profile": "fast", "force": True},
+             "xiaotiancai": {"ui": {"confirm_delay": 1.5}}}
+    sp.apply_profile(cfg2f)
+    check("performance.force=true 时档位覆盖写死的键",
+          cfg2f["xiaotiancai"]["ui"]["confirm_delay"] == sp.PROFILES["fast"]["xiaotiancai.ui.confirm_delay"],
+          str(cfg2f["xiaotiancai"]["ui"]["confirm_delay"]))
+
+    cfg3 = {"performance": {"profile": "stable"}}
+    sp.apply_profile(cfg3)
+    check("stable 档关闭先手打字与快路径（每条都先读界面再注入）",
+          cfg3["xiaotiancai"]["ui"]["blind_send"] is False
+          and cfg3["xiaotiancai"]["ui"]["fast_send"] is False)
+    check("stable 档 dump 重试更多（更宽容）",
+          cfg3["adb"]["dump_retries"] >= sp.PROFILES["fast"]["adb.dump_retries"])
+
+    cfg4 = {"performance": {"profile": "turbo"}}
+    sp.apply_profile(cfg4)
+    check("turbo 档在最省的那一档（dump 重试 1 次、发送重试 1 轮）",
+          cfg4["adb"]["dump_retries"] == 1 and cfg4["xiaotiancai"]["ui"]["send_retries"] == 1)
+
+    check("非法档位名回落到 balanced", sp.get_profile({"performance": {"profile": "nope"}}) == "balanced")
+    check("顶层 speed_profile 也认", sp.get_profile({"speed_profile": "turbo"}) == "turbo")
+    check("大小写不敏感", sp.get_profile({"performance": {"profile": "FAST"}}) == "fast")
+    # 档位真的会被 Xiaotiancai 读进去（不是一个只写不读的配置）
+    xtc = Xiaotiancai(FakeAdb(chat_page_xml()), {"ui": cfg3["xiaotiancai"]["ui"]}, logger=None)
+    check("stable 档下先手打字确实被关掉",
+          xtc.blind_send_ready() is False and xtc._blind_enabled is False)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -1314,7 +1394,7 @@ def test_emoji_store_reads_original_file() -> None:
     # ② 缓存里有"刚写进来"的动图 -> 名字查不到时用它（保住动画）
     adb = FakeAdb({cache_gif: gif(), desc: index},
                   listing=f"995 28583 {cache_gif}\n960 9999 {root}/cache/old.jpg")
-    store = EmojiStore(adb, package="com.xtc.watch", recent_secs=45)
+    store = EmojiStore(adb, package="com.xtc.watch")
     got = store.find("啊啊啊")
     check("名字查不到时取缓存里最近的动图",
           bool(got) and got["source"] == "cache" and got["animated"] is True,
@@ -1325,7 +1405,7 @@ def test_emoji_store_reads_original_file() -> None:
     # ②b 名字能命中时**优先**用表情包文件（确定性），不冒险用缓存里"最近的那张"
     adb_b = FakeAdb({cache_gif: gif(), pack_png: png(), desc: index},
                     listing=f"995 28583 {cache_gif}")
-    got_b = EmojiStore(adb_b, package="com.xtc.watch", recent_secs=45).find("爱你")
+    got_b = EmojiStore(adb_b, package="com.xtc.watch").find("爱你")
     check("名字命中时优先用表情包原文件（避免把同时收到的照片当表情）",
           bool(got_b) and got_b["source"] == "pack" and got_b["path"] == pack_png,
           str({k: v for k, v in (got_b or {}).items() if k != "data"}))
@@ -1523,15 +1603,42 @@ def test_blind_send_fast_typing() -> None:
     check("复核通过", ok is True, why3)
     check("成功时不需要重发", retryable is False)
 
-    # ⑤ 复核发现"输入框仍留有内容"（点偏了/没发出去）-> 允许安全重发 + 清掉缓存坐标
+    # ⑤ 复核发现"输入框仍留有内容"（那一下没点中）-> **就着快照补点一次发送**（新的快修法）
     xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
                        "input_point": (1006, 699)}
     xtc.begin_blind_send("你好")
-    adb.set_ui(input_text="你好")                     # 文字还在输入框里
+    adb.blind_tap_sends = False                       # 盲点那一发没点中
+    adb.set_ui(input_text="你好", tip="", bubble="")  # 文字还在输入框里
+    adb.sends = 0
     ok2, why4, retryable2 = xtc.end_blind_send("你好")
-    check("没发出去时如实报未确认", ok2 is False and "输入框仍留有内容" in why4, why4)
-    check("这种情况允许安全重发", retryable2 is True)
+    check("盲点没点中时补点一次发送就成功（不用重走稳妥流程）",
+          ok2 is True and adb.sends >= 1, f"{why4!r} sends={adb.sends}")
+    check("补点成功后不需要重发", retryable2 is False)
+
+    # ⑤b 补点也不生效（两次都没点中）-> 如实报未确认 + 清掉缓存坐标（交给稳妥流程）
+    adb.element_tap_sends = False                     # 连快照里的按钮也点不动
+    xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
+                       "input_point": (1006, 699)}
+    xtc.begin_blind_send("你好")
+    adb.set_ui(input_text="你好", tip="", bubble="")
+    ok3, why5, retryable3 = xtc.end_blind_send("你好")
+    check("两次都没点中时如实报未确认", ok3 is False and "输入框仍留有内容" in why5, why5)
+    check("这种情况允许安全重发", retryable3 is True)
     check("重发前清掉缓存坐标（改用稳妥流程）", xtc._send_cache is None)
+    adb.element_tap_sends = True
+
+    # ⑤c 补点后 App 报"发送失败"（网络异常）-> 如实上报，且**不重发**（避免重复消息）
+    adb.tap_send_fails = True
+    xtc._send_cache = {"input": (833, 678, 1179, 721), "point": (1200, 699),
+                       "input_point": (1006, 699)}
+    xtc.begin_blind_send("你好")
+    adb.blind_tap_sends = False
+    adb.set_ui(input_text="你好", tip="", bubble="")
+    ok6, why6, retryable6 = xtc.end_blind_send("你好")
+    check("出现发送失败提示时如实报失败", ok6 is False and "失败" in why6, why6)
+    check("失败提示类的不重发（避免重复消息）", retryable6 is False)
+    adb.tap_send_fails = False
+    adb.blind_tap_sends = True
 
     # ⑥ 桥接门闩：太久没确认过聊天页 / 标题不对 -> 不先手
     br = bridge_mod.MessageBridge(
@@ -4983,6 +5090,7 @@ def main() -> int:
                test_forward_type_markers,
                test_backlog_scans_past_known_messages,
                test_catchup_max_age_skips_stale,
+               test_speed_profiles,
                test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
