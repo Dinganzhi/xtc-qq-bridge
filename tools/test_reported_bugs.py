@@ -1218,6 +1218,103 @@ def test_speed_profiles() -> None:
           xtc.blind_send_ready() is False and xtc._blind_enabled is False)
 
 
+def test_history_store_keeps_every_media() -> None:
+    """消息库必须把**每一条**图片/表情都存进去（以前只按文本去重 -> 只存了第一条）。
+
+    用户实测：`/小天才 历史消息` 里看不到图片和表情 —— 因为所有照片的文本都是"图片"、
+    同一表情的名字也一样，`msgs.seen(text, "xtc")` 从第二条起就判成"重复"而不入库。
+    现在按"文本 + 时间"判重。
+    """
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        base = time.time()
+        br._mark_forwarded("屑猹不喝茶", "图片", "10-12 20:00", "10-12 20:00")
+        br._mark_forwarded("屑猹不喝茶", "图片", "10-12 20:30", "10-12 20:30")
+        br._mark_forwarded("屑猹不喝茶", "表情开心", "10-12 20:31", "10-12 20:31")
+        br._mark_forwarded("屑猹不喝茶", "表情开心", "10-12 20:32", "10-12 20:32")
+        br._mark_forwarded("屑猹不喝茶", "普通文字", "10-12 20:33", "10-12 20:33")
+        check("两条不同时间的图片都入库（不再被文本去重吃掉）",
+              br.msgs.seen("图片", "xtc") is True, str(br.msgs.recent(10)))
+        count = len([e for e in br.msgs.recent(10) if e.get("text") in ("图片", "表情开心")])
+        check("图片 + 表情各存两条（共 4 条）", count == 4, f"count={count}")
+        # 同一条（同文本 + 时间接近）重复调用不会存两遍
+        br._mark_forwarded("屑猹不喝茶", "普通文字", "10-12 20:33", "10-12 20:33")
+        same = len([e for e in br.msgs.recent(10) if e.get("text") == "普通文字"])
+        check("同一条重放不会重复入库", same == 1, f"same={same}")
+        check("历史格式化里真的能看到图片/表情",
+              "图片" in br._format_history_text(br.msgs.recent(10), 10)
+              and "表情开心" in br._format_history_text(br.msgs.recent(10), 10))
+    finally:
+        cleanup(root)
+
+
+def test_stale_age_and_skip() -> None:
+    """"太旧的积压消息不再转发"的判定（默认 30 分钟）。"""
+    from datetime import datetime, timedelta
+
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._catchup_max_age = 1800
+        now_lbl = datetime.now().strftime("%m-%d %H:%M")
+        old_lbl = (datetime.now() - timedelta(hours=5)).strftime("%m-%d %H:%M")
+        check("刚发的消息不算旧", br._stale_age(now_lbl) is None)
+        age = br._stale_age(old_lbl)
+        check("五小时前的那条判为太旧", age is not None and age > 1800, str(age))
+        br._catchup_max_age = 0
+        check("catchup_max_age=0 表示不限（保持老行为）", br._stale_age(old_lbl) is None)
+        br._catchup_max_age = 6 * 3600
+        check("把上限调到 6 小时就又能发", br._stale_age(old_lbl) is None)
+    finally:
+        cleanup(root)
+
+
+def test_order_hold_while_media_pending() -> None:
+    """有图片/表情在等原图时，后面的消息先压一下 —— 否则 QQ 里会"错位"。
+
+    实测：那张 20:42 的图片在等原图（几十秒），期间/之后的文字先发出去，用户在群里看到
+    "文字排在图片前面"。压住的这段时间消息不会丢（媒体就绪后由补发按顺序带出去），
+    超过 order_hold_secs 就照旧先发（不让一条慢图卡死整条对话）。
+    """
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._order_hold_secs = 45
+        check("没有等图的消息时不压", br._order_hold_active() is False)
+        key = ("xtc", "屑猹不喝茶", "图片", "10-12 20:42")
+        br._media_retry_failed(key, "屑猹不喝茶", "图片", "10-12 20:42", "20:42", "占位图")
+        check("有图在等原图时后面压一下", br._order_hold_active() is True)
+        for st in br._pending_media.values():
+            st["first_ts"] = time.monotonic() - 120
+        check("超过 order_hold_secs 就不压了（宁可错位也不卡死对话）",
+              br._order_hold_active() is False)
+        br._order_hold_secs = 0
+        for st in br._pending_media.values():
+            st["first_ts"] = time.monotonic()
+        check("order_hold_secs=0 表示不压（老行为）", br._order_hold_active() is False)
+        # 压住期间补发这一轮什么都不发（保持顺序），且不会误入队
+        br._order_hold_secs = 45
+        queued: list = []
+        br._queue_forward = lambda *a, **k: queued.append(a)
+        n = br._forward_backlog(None, "屑猹不喝茶")
+        check("压住期间补发也不发任何东西", n == 0 and not queued, f"n={n} queued={queued}")
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -1392,7 +1489,8 @@ def test_emoji_store_reads_original_file() -> None:
                        ensure_ascii=False).encode("utf-16")
 
     # ② 缓存里有"刚写进来"的动图 -> 名字查不到时用它（保住动画）
-    adb = FakeAdb({cache_gif: gif(), desc: index},
+    #    （用真实贴纸尺寸 240x240：小于 sticker_min_px(100) 的会被当成"App 小图标"排除）
+    adb = FakeAdb({cache_gif: gif(240, 240), desc: index},
                   listing=f"995 28583 {cache_gif}\n960 9999 {root}/cache/old.jpg")
     store = EmojiStore(adb, package="com.xtc.watch")
     got = store.find("啊啊啊")
@@ -1401,6 +1499,12 @@ def test_emoji_store_reads_original_file() -> None:
           str({k: v for k, v in (got or {}).items() if k != "data"}))
     check("时间窗外的老文件不会被当成本次表情",
           "old.jpg" not in (got or {}).get("path", ""), str((got or {}).get("path")))
+    # ②a 过小的候选（72x72 的 App 小图标）不再被猜成贴纸（用户报的"错发"）
+    small_gif = f"{root}/cache/big_image/com.xtc.watch/v1/98/small.cnt"
+    adb_small = FakeAdb({small_gif: gif(72, 72), desc: index},
+                        listing=f"995 4577 {small_gif}")
+    got_small = EmojiStore(adb_small, package="com.xtc.watch").find("啊啊啊")
+    check("72x72 的小图标不会被当成贴纸发出去", got_small is None, str(got_small))
 
     # ②b 名字能命中时**优先**用表情包文件（确定性），不冒险用缓存里"最近的那张"
     adb_b = FakeAdb({cache_gif: gif(), pack_png: png(), desc: index},
@@ -5091,6 +5195,9 @@ def main() -> int:
                test_backlog_scans_past_known_messages,
                test_catchup_max_age_skips_stale,
                test_speed_profiles,
+               test_history_store_keeps_every_media,
+               test_stale_age_and_skip,
+               test_order_hold_while_media_pending,
                test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,

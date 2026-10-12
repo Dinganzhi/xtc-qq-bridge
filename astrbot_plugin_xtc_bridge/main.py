@@ -244,10 +244,44 @@ class Main(star.Star):
             extra={"history_count": count, "history_source": source}, timeout=150)
         if not result:
             return
-        if len(result) > 1300:
-            await self._send_plain_to_session(event, result)
+        if len(result) > 1200:
+            # 超长**必须分片发**：AstrBot 会把"一条超长纯文本"包成合并转发 Node
+            # （uin=机器人自己），NapCat 要么报错、要么**把内容发给机器人自己**
+            # （用户实测："用这个命令机器人会给自己也发一个历史消息记录"）。
+            # 分片后每片都在阈值内，就是普通群消息，收得到也不会发给自己。
+            await self._send_plain_chunks(event, result)
         else:
             event.set_result(event.plain_result(result))
+
+    async def _send_plain_chunks(self, event: AstrMessageEvent, text: str,
+                                 chunk: int = 1100) -> None:
+        """把长文本按行切成若干片（每片 <= chunk 字符）逐条发到原会话。"""
+        lines = text.splitlines() or [text]
+        buf: list[str] = []
+        size = 0
+        parts: list[str] = []
+
+        def flush() -> None:
+            nonlocal buf, size
+            if buf:
+                parts.append("\n".join(buf))
+                buf, size = [], 0
+
+        for ln in lines:
+            if len(ln) > chunk:                  # 单行就超长（极少见）：硬切
+                flush()
+                for i in range(0, len(ln), chunk):
+                    parts.append(ln[i:i + chunk])
+                continue
+            if size + len(ln) + 1 > chunk:
+                flush()
+            buf.append(ln)
+            size += len(ln) + 1
+        flush()
+        total = len(parts)
+        for i, part in enumerate(parts, 1):
+            head = f"（{i}/{total}）\n" if total > 1 else ""
+            await self._send_plain_to_session(event, head + part)
 
     async def _send_plain_to_session(self, event: AstrMessageEvent, text: str) -> None:
         """直接向事件所在会话发送纯文本（绕过 result_decorate 的合并转发转换）。"""

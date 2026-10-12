@@ -21,6 +21,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "xiaotiancai.check_interval": 2.0,
         "xiaotiancai.label_stale_secs": 60,
         "xiaotiancai.catchup_scan": 30,
+        "xiaotiancai.catchup_max_age": 3600,     # 一小时内漏掉的还补（更稳）
         "xiaotiancai.ui.blind_send": False,      # 不盲打：每条都先读界面再注入
         "xiaotiancai.ui.fast_send": False,       # 不点缓存坐标
         "xiaotiancai.ui.interaction_delay": 0.8,
@@ -42,6 +43,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "xiaotiancai.check_interval": 2.0,
         "xiaotiancai.label_stale_secs": 60,
         "xiaotiancai.catchup_scan": 30,
+        "xiaotiancai.catchup_max_age": 1800,     # 超过 30 分钟的积压消息不再补（避免"错位"）
         "xiaotiancai.ui.blind_send": True,
         "xiaotiancai.ui.fast_send": True,
         "xiaotiancai.ui.interaction_delay": 0.6,
@@ -63,6 +65,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "xiaotiancai.check_interval": 3.0,       # 轮询留出空隙 -> 发送更容易立刻拿到界面锁
         "xiaotiancai.label_stale_secs": 60,
         "xiaotiancai.catchup_scan": 20,
+        "xiaotiancai.catchup_max_age": 1800,
         "xiaotiancai.ui.blind_send": True,
         "xiaotiancai.ui.fast_send": True,
         "xiaotiancai.ui.interaction_delay": 0.45,
@@ -84,6 +87,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "xiaotiancai.check_interval": 4.0,
         "xiaotiancai.label_stale_secs": 60,
         "xiaotiancai.catchup_scan": 12,
+        "xiaotiancai.catchup_max_age": 1800,
         "xiaotiancai.ui.blind_send": True,
         "xiaotiancai.ui.fast_send": True,
         "xiaotiancai.ui.interaction_delay": 0.3,

@@ -71,6 +71,9 @@ class EmojiStore:
         self.fresh_window = max(10.0, float(fresh_window))
         self.index_ttl = max(0.0, float(index_ttl))       # 名字索引缓存时长
         self.max_px = max(64, int(max_px))                # 太大的图不当表情（多半是照片）
+        # 太小的也不当贴纸：实测缓存里有 72x72 的小图标（App 自己的小表情/角标），
+        # 被"按时间猜"选中时就是一张**错的小图**（用户报的"错发"）。真实贴纸都 ≥100px。
+        self.sticker_min_px = 100
         # 贴纸文件都很小（实测表情包 4~70KB、缓存里的贴纸 0.5~80KB）；限制字节数是为了
         # **不去读、更不去解**那些 1~2MB 的聊天照片（纯 Python 解一张 2000x3000 的 JPEG
         # 要十几秒，实测曾把"找一张表情"拖到 80 秒以上）。
@@ -427,6 +430,11 @@ class EmojiStore:
                         continue                              # WebP 之类解不了 -> 不能核对
             w, h = info.get("w") or 0, info.get("h") or 0
             if max(w, h) > self.max_px:
+                continue
+            if max(w, h) < self.sticker_min_px:
+                # 太小的一律不当贴纸：实测缓存里 72x72 的小图标（App 自己的小表情/角标）
+                # 会被"按时间猜"选中，转发出去就是一张错的小图（用户报的"错发"）。
+                self._log("debug", f"跳过过小的候选 {path}（{w}x{h} < {self.sticker_min_px}）")
                 continue
             anim = 1 if info.get("animated") else 0
             area = w * h

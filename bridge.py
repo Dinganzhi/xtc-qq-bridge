@@ -232,6 +232,13 @@ class MessageBridge:
         # 每轮最多往上看多少条气泡（可见区本来只有几条）：撞到"库里已有"的消息**不再停下**，
         # 而是继续往上找没转发过的（用户实测：16:38 的消息被更新的 19:19 照片挡住，5 小时后才发）
         self._catchup_scan = int(_xc.get("catchup_scan", 30) or 0)  # 0 = 不限制
+        # 有图片/表情还在等原图时，后面的消息最多压多久再发（秒；0 = 不压、照旧先发）
+        # 实测"错位"就是这么来的：那条图在等原图（几秒~几十秒），期间来的文字先发出去，
+        # 于是 QQ 里看到"文字在图前面"。压住一小会儿，等图就绪后按顺序一起发。
+        try:
+            self._order_hold_secs = max(0.0, float(_xc.get("order_hold_secs", 45) or 0))
+        except (TypeError, ValueError):
+            self._order_hold_secs = 45.0
         # 补发"太旧就别发了"（秒，0 = 不限）：想避免"21:48 突然收到 16:38 的消息"就设它，
         # 例如 1800 = 超过 30 分钟的消息不再补发（会记进历史，不会每轮再翻出来）
         try:
@@ -586,6 +593,18 @@ class MessageBridge:
                     if not dup and not label:
                         # 读不到时间标签时只能按文本保守判定：宁可不重发，也不要反复刷同一条
                         dup = self.msgs.seen(text, "xtc")
+                    # 太旧的积压消息不再转发（用户实测："九点四十八分才发了个四点半的消息"）：
+                    # 它必然排在已发过的更新消息后面 = 错位。记进历史，别每轮再翻出来。
+                    if not dup:
+                        stale = self._stale_age(label, raw_label)
+                        if stale is not None:
+                            self._log_once(
+                                f"stale:{text[:16]}",
+                                f"[跳过] 这条是 {stale / 60:.0f} 分钟前的消息"
+                                f"（超过 xiaotiancai.catchup_max_age），不再转发: {text[:24]!r}",
+                                interval=300)
+                            self.history.mark("xtc", contact or "", text, label)
+                            dup = True
                     # 图片/表情：媒体（原图/贴纸）可能**还没下载完**（App 先画出占位图，
                     # 原图要过几秒~几分钟才落盘）。这时不能马上按"文字"转发 ——
                     # 否则 QQ 只会收到"图片"两个字（用户实测：22:12 检测到、22:19 原图才出现）。
@@ -596,6 +615,11 @@ class MessageBridge:
                     mkey = self._fwd_key(contact, text, label)
                     if not dup and is_media and mkey in self._pending_media:
                         dup = True          # 本轮静默跳过：在等媒体/重试中，不转发也不刷日志
+                    if not dup and not is_media and self._order_hold_active():
+                        # 有图片/表情还在等原图：这条先压一下，否则它一定排在那张图前面（错位）。
+                        # 不丢：等媒体就绪后由补发流程按顺序带出去（最多压 order_hold_secs 秒）。
+                        self._log("debug", f"[顺序] 有图片/表情在等原图，这条先压一下: {text[:24]!r}")
+                        dup = True
                     if not dup:
                         self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                                           f"时间={time_label or '(无)'} 内容={text!r}")
@@ -698,6 +722,10 @@ class MessageBridge:
 
         pending: list[tuple[str, str, dict | None, str]] = []
         scanned = 0
+        if self._order_hold_active():
+            # 有图片/表情在等原图：这一轮先不补发任何东西（否则更新的那条会插到图前面 = 错位）
+            self._log("debug", "[补发] 有图片/表情在等原图，先压一轮不补发（保持顺序）")
+            return 0
         for it in reversed(bubbles):                # 从最新往回走
             scanned += 1
             if self._catchup_scan and scanned > self._catchup_scan:
@@ -1011,12 +1039,75 @@ class MessageBridge:
         """
         return ("xtc", contact or "", text or "")
 
+    def _order_hold_active(self) -> bool:
+        """有图片/表情在等原图、且等的时间还在 `order_hold_secs` 内 -> 后面的消息先压一下。
+
+        为什么：那条图（在等原图）如果被后来的文字"插队"，QQ 里就是**错位**
+        （用户实测）。压住的这段时间里消息不会丢：媒体就绪后由补发流程按顺序一起带出去；
+        超过 `order_hold_secs` 就照旧先发，不让一条慢图把整条对话卡死。
+        """
+        if self._order_hold_secs <= 0 or not self._pending_media:
+            return False
+        now = time.monotonic()
+        for st in self._pending_media.values():
+            first = float(st.get("first_ts") or now)
+            if now - first <= self._order_hold_secs:
+                return True
+        return False
+
+    def _stale_age(self, *labels) -> float | None:
+        """这条消息是不是"太旧"了（超过 `catchup_max_age`）？返回年龄（秒）或 None。
+
+        为什么要拦：实测手表 16:38 发的消息到 21:48 才出现在 App 里，桥接照发 —— 用户看到的
+        是"九点四十八分才发了个四点半的消息"，而且这条**必然**排在已发过的更新消息后面（错位）。
+        默认 30 分钟以内才转发；想全部都要就把 `xiaotiancai.catchup_max_age` 设 0。
+        """
+        if self._catchup_max_age <= 0:
+            return None
+        age: float | None = None
+        for lb in labels:
+            a = self._label_age(lb) if lb else None
+            if a is not None:
+                age = a if age is None else min(age, a)
+        if age is not None and age > self._catchup_max_age:
+            return age
+        return None
+
     def _mark_forwarded(self, contact, text: str, label: str, disp: str) -> None:
         """记入长期历史 + 本地消息库（此后轮询不会再把它当成"库里没有"的消息）。"""
         self.history.mark("xtc", contact or "", text, label or "")
-        if not self.msgs.seen(text, "xtc"):
-            self.msgs.append("xtc", contact or "", text, t=self._label_epoch(disp),
-                             source=self._xtc_source(contact), source_id=contact or "")
+        epoch = self._label_epoch(disp)
+        # 消息库去重必须按**这条消息的身份**（文本 + 时间），不能只按文本：
+        # 所有照片的文本都是"图片"、同一个表情的名字也一样 —— 只按文本去重的话，
+        # 第一条之后的所有图片/表情都会被当成"重复"而不入库，
+        # 于是 /小天才 历史消息 里**看不到任何图片和表情**（用户实测）。
+        if self._msg_stored(text, epoch):
+            return
+        self.msgs.append("xtc", contact or "", text, t=epoch,
+                         source=self._xtc_source(contact), source_id=contact or "")
+
+    def _msg_stored(self, text: str, epoch: float | None, window: float = 5.0) -> bool:
+        """消息库里是否已经有"同文本 + 时间几乎相同"的这条（挡住同一条被标记两次）。
+
+        窗口只给 5 秒：它只用来挡"同一条消息在重试路径里被重复标记"，
+        **不按分钟去重** —— 同一分钟里发两张相同的表情、或两张照片，都是两条独立消息。
+        """
+        try:
+            recent = self.msgs.recent(30)
+        except Exception:  # noqa: BLE001 读不到就当没有，宁可多存一条也别丢
+            return False
+        t = text or ""
+        for e in recent:
+            if (e.get("text") or "") != t:
+                continue
+            if epoch is None:
+                return True                      # 没有时间可用时退回"同文本即已存"
+            try:
+                if abs(float(e.get("t") or 0) - float(epoch)) <= window:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _schedule_fwd_plan(self, contact, text: str, label: str, disp: str,
                            sticker: dict | None, failed: list) -> None:
@@ -1229,6 +1320,14 @@ class MessageBridge:
         if steps:
             self._log("info", f"[媒体] 这条气泡被消息列表裁到了，已滚动 {len(steps)} 次取完整图"
                               "（抓完会滚回底部）")
+        if item is None and not is_image:
+            # 表情气泡本来定位到了、滚动后却找不到了（列表又动了/被顶走）：**不许按时间猜缓存** ——
+            # 实测这条路上猜出过一张 72x72 的小图（错发）。返回 None，让调用方按"稍后重试"处理。
+            self._log("info", "[表情包] 滚动后没再找到这条表情气泡，先不取图（稍后重试，避免发错）")
+            if steps:
+                for step in reversed(steps):
+                    self.xtc.scroll_chat_by(vb, -step)
+            return None
         try:
             return self._capture_media_now(root, text, name, is_image, item,
                                            near_epoch=near_epoch)
