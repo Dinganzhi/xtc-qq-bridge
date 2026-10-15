@@ -277,6 +277,7 @@ project/
 | `adb.dump_timeout` | 单次 `uiautomator dump` 超时（秒，默认 60） |
 | `adb.focus_cache_ttl` | 前台组件缓存秒数（默认 1.5；减少 dumpsys，点击/发送更快） |
 | `forward.mode` | `plugin`=走 AstrBot 插件；`log`=仅打印调试 |
+| `emoji.match_ok` | 表情原图与界面气泡的相似度门槛（默认 0.80）。实测同一张 0.95+、无关图 0.5~0.63；调到 0.75 能多认下几张（例如 0.77 那种），代价是偶尔可能认错 |
 | `forward.retry_max_tries` | 转发失败后最多**补投**几次（默认 3；`0` = 失败就放弃）。补投**只补没成功的目标** |
 | `forward.retry_backoff` | 第一次补投前等多少秒（默认 60，之后每次 ×4；不会"每轮轮询都重发"） |
 | `forward.content_dedup_secs` | 同一联系人 + 同一内容多少秒内不重复转发（默认 300；`0` = 关闭）。App 的时间标签会时有时无，靠它挡住重复转发 |

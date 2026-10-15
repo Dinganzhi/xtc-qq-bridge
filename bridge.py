@@ -187,7 +187,7 @@ class MessageBridge:
                 from emoji_store import EmojiStore
                 self._emoji_store = EmojiStore(
                     adb, package=(cfg.get("xiaotiancai") or {}).get("package", "com.xtc.watch"),
-                    logger=logger)
+                    logger=logger, match_ok=float(_emoji.get("match_ok", 0.80) or 0.80))
             except Exception as e:  # noqa: BLE001 取原文件的能力不可用就只用截图
                 self._log("debug", f"表情原文件读取不可用（改为截图）: {e}")
         # 有发送任务在排队/执行时置位：轮询据此让路（见 _poll_loop），别和发送抢 dump
