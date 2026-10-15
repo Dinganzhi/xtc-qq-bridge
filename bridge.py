@@ -269,6 +269,8 @@ class MessageBridge:
         # 内容级"刚转发过"护栏：同一联系人 + 同一文本，N 秒内不再重复转发
         # （App 的时间标签会时有时无，光靠"文本+标签"当身份挡不住重复；用户报告的就是这个）
         self._recent_fwd: dict[tuple, float] = {}
+        # 同内容最近一次转发的时间（身份标签的 epoch）：用来挡"同内容时间倒流"（标签/时钟漂移）
+        self._fwd_clock: dict[tuple, float] = {}
         _fwd = cfg.get("forward") or {}
         try:
             # 0 = 失败就放弃（不补投）；默认 3 次
@@ -605,6 +607,12 @@ class MessageBridge:
                                 interval=300)
                             self.history.mark("xtc", contact or "", text, label)
                             dup = True
+                    if not dup and self._content_went_backwards(contact, text, label):
+                        # 同内容 + 时间比上次转发过的更早 = 标签/时钟漂移（跨零点那类），别重发
+                        self._log("info", f"[跳过] 同内容的消息时间倒流了（{label}），"
+                                          f"判为重复不再转发: {text[:24]!r}")
+                        self.history.mark("xtc", contact or "", text, label)
+                        dup = True
                     # 图片/表情：媒体（原图/贴纸）可能**还没下载完**（App 先画出占位图，
                     # 原图要过几秒~几分钟才落盘）。这时不能马上按"文字"转发 ——
                     # 否则 QQ 只会收到"图片"两个字（用户实测：22:12 检测到、22:19 原图才出现）。
@@ -773,6 +781,12 @@ class MessageBridge:
                 # "16:38 发的两条消息到 21:48 才转发" —— 就是因为更新的那条（19:19 的照片）
                 # 已经在库里，旧实现一撞库就 break，把比它更老、却从没转发过的消息永远挡在外面。
                 self._log("debug", f"[补发] 库里已有，跳过（继续往上找）: {text[:24]!r}")
+                continue
+            if self._content_went_backwards(contact, text, ident):
+                # 同内容 + 时间倒流 = 同一条消息的标签漂移（跨零点那类），别补发
+                self._log("info", f"[补发] 同内容的消息时间倒流了（{ident}），"
+                                  f"判为重复不补发: {text[:24]!r}")
+                self.history.mark("xtc", contact or "", text, ident)
                 continue
             if self.dedup.seen(("xtc", contact or "", text, ident)):
                 # 刚试过（120 秒内：正在发的、或上次转发失败的）：本轮先跳过它，
@@ -1055,6 +1069,31 @@ class MessageBridge:
                 return True
         return False
 
+    def _content_went_backwards(self, contact, text: str, label: str) -> bool:
+        """同内容的消息"时间倒流"了 -> 判为重复（标签/时钟漂移的一种兜底）。
+
+        为什么要这层：实测 10-15 16:23 转发过的表情，跨零点后 App 只给裸时间标签，
+        被算成"10-16 16:23"（未来）-> 身份变了 -> 又发一遍。裸时间标签的问题已从根上修掉，
+        这里再加一道：**同内容 + 时间比上次转发过的更早（超过 60 秒）= 同一条消息的漂移**。
+        同一分钟里发两张一样的表情时间相等，不会被误判（这里要求"早 60 秒以上"）。
+        """
+        epoch = self._label_epoch(label) if label else None
+        if epoch is None:
+            return False
+        last = self._fwd_clock.get((contact or "", text or ""))
+        return last is not None and epoch < float(last) - 60.0
+
+    def _remember_fwd_clock(self, contact, text: str, label: str) -> None:
+        epoch = self._label_epoch(label) if label else None
+        if epoch is None:
+            return
+        key = (contact or "", text or "")
+        prev = self._fwd_clock.get(key)
+        if prev is None or epoch > float(prev):
+            self._fwd_clock[key] = float(epoch)
+        while len(self._fwd_clock) > 200:      # 只留最近若干条，避免无限增长
+            self._fwd_clock.pop(next(iter(self._fwd_clock)), None)
+
     def _stale_age(self, *labels) -> float | None:
         """这条消息是不是"太旧"了（超过 `catchup_max_age`）？返回年龄（秒）或 None。
 
@@ -1076,6 +1115,7 @@ class MessageBridge:
     def _mark_forwarded(self, contact, text: str, label: str, disp: str) -> None:
         """记入长期历史 + 本地消息库（此后轮询不会再把它当成"库里没有"的消息）。"""
         self.history.mark("xtc", contact or "", text, label or "")
+        self._remember_fwd_clock(contact, text, label)
         epoch = self._label_epoch(disp)
         # 消息库去重必须按**这条消息的身份**（文本 + 时间），不能只按文本：
         # 所有照片的文本都是"图片"、同一个表情的名字也一样 —— 只按文本去重的话，
@@ -2205,8 +2245,15 @@ class MessageBridge:
                                second=0, microsecond=0).timestamp()
         m = re.fullmatch(r"(\d{1,2}):(\d{2})", label)
         if m:
-            return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
-                               second=0, microsecond=0).timestamp()
+            dt = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                             second=0, microsecond=0)
+            if dt > now + timedelta(minutes=2):
+                # 只有时分、却落在**未来**：那只能是**昨天**那条 —— App 的分组标签跨零点后
+                # 还画着旧样子（实测 10-15 16:23 的表情在 10-16 00:00 又出现一次，
+                # 被算成"今天 16:23"：身份变了 -> 重复转发，时间也标错一天）。
+                # 消息不可能来自未来，所以这里一律回退一天。
+                dt -= timedelta(days=1)
+            return dt.timestamp()
         m = re.fullmatch(r"(昨天|前天)\s*(\d{1,2}):(\d{2})", label)
         if m:
             days_back = 1 if m.group(1) == "昨天" else 2

@@ -1315,6 +1315,75 @@ def test_order_hold_while_media_pending() -> None:
         cleanup(root)
 
 
+def test_bare_time_label_in_future_is_yesterday() -> None:
+    """跨零点后 App 还画着裸时间标签（`16:23`）时，不能算成"今天 16:23"。
+
+    用户实测：10-15 16:23 正常转发过的表情，在 10-16 00:00 又转发了一遍，而且时间标成了
+    **10-16 16:23**。根因：裸时间标签一律按"今天"解析，跨零点时那条消息的时间就跳到了未来 ——
+    身份从 `10-15 16:23` 变成 `10-16 16:23`（去重/历史全不命中 -> 重发），而且"太旧不转发"
+    的年龄算出来是 0（因为时间在未来）也拦不住。消息不可能来自未来，所以一律回退一天。
+    """
+    from datetime import datetime
+
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        midnight = datetime(2026, 10, 16, 0, 0, 5)
+        got = datetime.fromtimestamp(br._label_epoch("16:23", now=midnight))
+        check("跨零点后的裸时间标签算作昨天",
+              got == datetime(2026, 10, 15, 16, 23), str(got))
+        check("身份也归一化成昨天（与第一次转发一致 -> 不会重发）",
+              br._abs_time_label("16:23", now=midnight) == "10-15 16:23",
+              br._abs_time_label("16:23", now=midnight))
+        same = datetime.fromtimestamp(br._label_epoch("00:00", now=midnight))
+        check("刚过零点的 00:00 仍算今天", same == datetime(2026, 10, 16, 0, 0), str(same))
+        afternoon = datetime(2026, 10, 16, 16, 0, 0)
+        past = datetime.fromtimestamp(br._label_epoch("12:00", now=afternoon))
+        check("白天看到的、已经过去的裸时间算今天",
+              past == datetime(2026, 10, 16, 12, 0), str(past))
+        check("显式的'今天 16:23'不受影响",
+              datetime.fromtimestamp(br._label_epoch("今天 16:23", now=midnight))
+              == datetime(2026, 10, 16, 16, 23))
+    finally:
+        cleanup(root)
+
+
+def test_content_time_going_backwards_is_duplicate() -> None:
+    """同内容的消息"时间倒流"-> 判为重复（跨零点标签漂移的兜底网）。
+
+    裸时间标签跨零点被算成"今天"的问题已从根上修掉；这一层是第二道防线：
+    同内容 + 时间比上次转发过的更早 60 秒以上 = 同一条消息的漂移，不重发。
+    同一分钟里连发两张一样的表情时间相等，不会被误判。
+    """
+    root = tmp_root()
+    try:
+        br = bridge_mod.MessageBridge({"target": {"xtc_contact": "屑猹不喝茶"},
+                                       "xiaotiancai": {}, "webhook": {}},
+                                      adb=None, xtc=None, forwarder=None, logger=None)
+        br.msgs = MessageLog(path=str(_paths(root)["msgs"]))
+        br._cmd_done_file = str(_paths(root)["done"])
+        br._remember_fwd_clock("屑猹不喝茶", "表情哭泣", "10-15 16:23")
+        check("同内容 + 时间更早 -> 判重复",
+              br._content_went_backwards("屑猹不喝茶", "表情哭泣", "10-15 10:00") is True)
+        check("同内容 + 同一时间 -> 不算（同一分钟连发两张一样的表情）",
+              br._content_went_backwards("屑猹不喝茶", "表情哭泣", "10-15 16:23") is False)
+        check("同内容 + 更晚 -> 不算",
+              br._content_went_backwards("屑猹不喝茶", "表情哭泣", "10-15 18:00") is False)
+        check("不同内容互不影响",
+              br._content_went_backwards("屑猹不喝茶", "表情开心", "10-14 08:00") is False)
+        check("没有时间标签时不判定",
+              br._content_went_backwards("屑猹不喝茶", "表情哭泣", "") is False)
+        br._remember_fwd_clock("屑猹不喝茶", "表情哭泣", "10-15 20:00")
+        check("基准会跟着更新的那条走",
+              br._content_went_backwards("屑猹不喝茶", "表情哭泣", "10-15 18:00") is True)
+    finally:
+        cleanup(root)
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -5198,6 +5267,8 @@ def main() -> int:
                test_history_store_keeps_every_media,
                test_stale_age_and_skip,
                test_order_hold_while_media_pending,
+               test_bare_time_label_in_future_is_yesterday,
+               test_content_time_going_backwards_is_duplicate,
                test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
