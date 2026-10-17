@@ -2460,6 +2460,35 @@ class Xiaotiancai:
         return False
 
     # ------------------------------------------------------------------ 读取消息
+    def message_kind(self, root: ET.Element, text: str) -> str:
+        """这条消息到底是什么：`'sticker'`（气泡是表情图）/ `'image'`（照片）/ `'text'`。
+
+        为什么不能只看文本前缀：用户实测手打了一条内容就是"表情"的**文本**消息，
+        旧逻辑按 `text.startswith("表情")` 把它当表情包，等了 10 分钟没有图可发，
+        最后发出一条**没有图、只有"[表情]"的"空气消息"**。
+        这里只认**气泡本身的类型**（`_chat_bubbles` 里给 sticker/image 打的标记）。
+        """
+        t = (text or "").strip()
+        if not t:
+            return "text"
+        if t == IMAGE_TEXT:
+            return "image"                 # "图片"这个文本本身就是 App 给照片的占位文本
+        if not t.startswith("表情"):
+            return "text"
+        try:
+            items = self._chat_bubbles(root, include_own=False)
+        except Exception as e:  # noqa: BLE001 解析失败按文本处理（宁可当文本，也别发空气消息）
+            self.log("debug", f"判断消息类型失败（按文本处理）: {e}")
+            return "text"
+        for it in reversed(items):         # 从新到旧找同一条
+            if (it.get("text") or "").strip() != t:
+                continue
+            if it.get("sticker"):
+                return "sticker"
+            if it.get("image"):
+                return "image"
+        return "text"                      # 界面上的同文本气泡不是图 -> 只是手打的文本
+
     def get_latest_message(self, root: ET.Element | None = None):
         """返回 (contact, text, time_label, own_text, own_recent)；无法确定时
         (None, None, "", "", [])。

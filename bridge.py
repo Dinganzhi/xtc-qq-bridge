@@ -414,8 +414,9 @@ class MessageBridge:
                     _, f_contact, f_text, f_label = job[:4]
                     f_sticker = job[4] if len(job) > 4 else None
                     f_disp = job[5] if len(job) > 5 else ""
+                    f_kind = job[6] if len(job) > 6 else ""
                     self._do_forward_job(f_contact, f_text, f_label, sticker=f_sticker,
-                                         display_label=f_disp)
+                                         display_label=f_disp, kind=f_kind)
                 elif kind == "confirm":
                     # 小天才聊天里的"发送成功：…"回执：低优先级（见 _queue_confirm_xtc）
                     self._confirm_xtc_delivery(job[1])
@@ -616,10 +617,10 @@ class MessageBridge:
                     # 图片/表情：媒体（原图/贴纸）可能**还没下载完**（App 先画出占位图，
                     # 原图要过几秒~几分钟才落盘）。这时不能马上按"文字"转发 ——
                     # 否则 QQ 只会收到"图片"两个字（用户实测：22:12 检测到、22:19 原图才出现）。
-                    # 已经在等待重试队列里的：这一轮什么都不做（重试节奏由 _retry_pending_media
-                    # 统一掌握，避免同一条消息一轮里被抠图两三次）。
-                    is_media = (text == getattr(self.xtc, "IMAGE_TEXT", "图片")
-                                or text.startswith("表情"))
+                    # **类型一律以气泡本身为准**：用户实测手打了一条内容就是"表情"的文本，
+                    # 按前缀判成表情包后等了 10 分钟，最后发出一条没有图的"[表情]"（空气消息）。
+                    kind = self.xtc.message_kind(root, text) if text else "text"
+                    is_media = kind in ("sticker", "image")
                     mkey = self._fwd_key(contact, text, label)
                     if not dup and is_media and mkey in self._pending_media:
                         dup = True          # 本轮静默跳过：在等媒体/重试中，不转发也不刷日志
@@ -641,7 +642,7 @@ class MessageBridge:
                             try:
                                 sticker = self._capture_sticker(
                                     root, text, near_epoch=self._label_epoch(time_label or ""),
-                                    match_label=key[3] or raw_label)
+                                    match_label=key[3] or raw_label, kind=kind)
                             finally:
                                 if got_lock:
                                     self._op_lock.release()
@@ -649,7 +650,8 @@ class MessageBridge:
                                 # 拿不到媒体：登记"稍后重试"，**这一轮先不发**
                                 # （不发的话 QQ 只会收到"图片"两个字）
                                 self._media_retry_failed(mkey, contact, text, label, time_label,
-                                                         "界面上还是占位图、缓存里也还没有原图")
+                                                         "界面上还是占位图、缓存里也还没有原图",
+                                                         kind=kind)
                                 skip_media = True
                             else:
                                 self._media_retry_clear(mkey)
@@ -662,7 +664,7 @@ class MessageBridge:
                             # 以前这里传的是原始标签（如 "21:55"），而补发用的是绝对标签
                             # （"09-29 21:55"）—— 两条路径算出的去重键不同，于是同一条消息
                             # 会被"补发 + 实时"各转发一次（用户报的"2 转发了两遍"就是这么来的）。
-                            self._queue_forward(contact, text, label, sticker=sticker,
+                            self._queue_forward(contact, text, label, sticker=sticker, kind=kind,
                                                 display_label=self._display_time_label(contact,
                                                                                        label))
                 # 媒体（图片/表情）当时没就绪的那些：到点后重试取图并补发（不依赖"还是不是最新"）
@@ -801,7 +803,9 @@ class MessageBridge:
                 continue
             # 补发的表情/图片也取原图：用上面那份**新鲜快照**（整轮共用，坐标不会过期）
             sticker = None
-            if it.get("sticker") or it.get("image"):
+            # 类型以**气泡本身**为准（`it` 就是那条气泡的解析结果）
+            kind = "image" if it.get("image") else ("sticker" if it.get("sticker") else "text")
+            if kind in ("sticker", "image"):
                 mkey = self._fwd_key(contact, text, ident)
                 if mkey in self._pending_media:
                     # 已经在"等媒体"队列里：交给 `_retry_pending_media`（那里掌握退避节奏，
@@ -810,13 +814,13 @@ class MessageBridge:
                     break
                 sticker = self._capture_sticker(
                     root, text, near_epoch=self._label_epoch(disp_lbl or own_lbl),
-                    match_label=ident or disp_lbl)
+                    match_label=ident or disp_lbl, kind=kind)
                 if sticker is None:
                     # 媒体还没就绪：登记等待重试，这一条先不放行（不发"图片"两个字）
                     self._media_retry_failed(mkey, contact, text, ident, disp_lbl,
-                                             "界面上还是占位图、缓存里也还没有原图")
+                                             "界面上还是占位图、缓存里也还没有原图", kind=kind)
                     break
-            pending.append((text, ident, sticker, disp_lbl))
+            pending.append((text, ident, sticker, disp_lbl, kind))
 
         if not pending:
             return 0
@@ -828,11 +832,12 @@ class MessageBridge:
         self._log("info", f"[补发] 有 {len(pending)} 条消息库里没有，按时间顺序补发")
 
         sent = 0
-        for text, label, sticker, disp in pending:
+        for text, label, sticker, disp, kind in pending:
             self._log("info", f"[收到小天才消息] 来源={self._xtc_source(contact)} "
                               f"时间={disp or label or '(无)'} 内容={text!r}（补发）")
             # 异步转发：不阻塞读屏（见 _queue_forward）
-            self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
+            self._queue_forward(contact, text, label, sticker=sticker,
+                                display_label=disp, kind=kind)
             sent += 1
         return sent
 
@@ -877,7 +882,8 @@ class MessageBridge:
                 self._op_lock.release()
 
     def _queue_forward(self, contact: str, text: str, label: str,
-                       sticker: dict | None = None, display_label: str = "") -> None:
+                       sticker: dict | None = None, display_label: str = "",
+                       kind: str = "") -> None:
         """把"小天才 -> QQ"的转发丢给工作线程，立刻返回。
 
         为什么异步：插件要等 QQ 侧真实发送结果才回包（最长 30 秒），同步做的话
@@ -888,12 +894,14 @@ class MessageBridge:
         display_label：显示用的标签（App 的分组标签，显示更准）；留空则用 label。
         sticker：表情图（{data, kind, animated, source}）。**必须在轮询线程里取**——
         那一刻界面快照/气泡位置才准、缓存里刚写进来的文件也还在；没有它就按文字发。
+        kind：`sticker`/`image`/`text`（由**气泡本身**判定）。手打的、内容恰好以"表情"
+        开头的文本必须传 text，否则会被当成表情包发出一条没有图的"空气消息"。
         """
         self.dedup.mark(("xtc", contact or "", text, label or ""))
         # 注意：内容级护栏（_recent_fwd_seen）**不在这里**打点 —— 打点必须发生在
         # "真的要发出去"那一刻（见 _do_forward_job），否则刚入队的这条会被自己挡掉。
         self._job_queue.put(("forward", contact, text, label or "", sticker,
-                             display_label or label or ""))
+                             display_label or label or "", kind or ""))
 
     # ---- 媒体（图片/表情）还没下载完时的"等一会儿再取" ----
     def _media_retry_decision(self, key: tuple) -> str:
@@ -910,7 +918,7 @@ class MessageBridge:
         return "now"
 
     def _media_retry_failed(self, key: tuple, contact, text: str, label: str,
-                            disp: str, reason: str = "") -> None:
+                            disp: str, reason: str = "", kind: str = "") -> None:
         """媒体取不到：登记"稍后重试"，这一轮**先不转发**（免得 QQ 只收到"图片"两个字）。"""
         now = time.monotonic()
         st = self._pending_media.get(key)
@@ -922,7 +930,8 @@ class MessageBridge:
         st["tries"] = int(st.get("tries") or 0) + 1
         gap = min(300.0, self._media_retry_base * (2 ** (st["tries"] - 1)))
         st["next_ts"] = now + gap
-        st.update({"contact": contact, "text": text, "label": label, "disp": disp})
+        st.update({"contact": contact, "text": text, "label": label, "disp": disp,
+                   "kind": kind or ""})
         self._log("info", f"[媒体] {text[:24]!r} 的原图还没就绪（{reason or '缓存/界面里都还没有'}）；"
                           f"{int(gap)} 秒后重试（第 {st['tries']}/{self._media_retry_max} 次），"
                           "先不发文字，免得只发出去「图片」两个字")
@@ -945,6 +954,7 @@ class MessageBridge:
             text = st.get("text") or ""
             label = st.get("label") or ""
             disp = st.get("disp") or label
+            kind = st.get("kind") or ""
             decision = self._media_retry_decision(key)
             if decision == "wait":
                 continue
@@ -954,7 +964,7 @@ class MessageBridge:
                 try:
                     sticker = self._capture_sticker(
                         root, text, near_epoch=self._label_epoch(disp or label),
-                        match_label=label or disp)
+                        match_label=label or disp, kind=kind)
                 except Exception as e:  # noqa: BLE001 取图失败继续等下一轮
                     self._log("debug", f"[媒体] 重试取图失败: {e}")
                 finally:
@@ -962,12 +972,13 @@ class MessageBridge:
                         self._op_lock.release()
             if sticker is None and decision != "give_up":
                 self._media_retry_failed(key, contact, text, label, disp,
-                                         "重试时还是没拿到原图/截图")
+                                         "重试时还是没拿到原图/截图", kind=kind)
                 continue
             self._media_retry_clear(key)
             self._log("info", f"[媒体] {'拿到图，补发' if sticker else '等太久了，按文字转发'}: "
                               f"{text[:24]!r}")
-            self._queue_forward(contact, text, label, sticker=sticker, display_label=disp)
+            self._queue_forward(contact, text, label, sticker=sticker,
+                                display_label=disp, kind=kind)
 
     def _label_age(self, label: str) -> float | None:
         """某个时间标签距今多少秒（解析不出来返回 None）。"""
@@ -1150,7 +1161,7 @@ class MessageBridge:
         return False
 
     def _schedule_fwd_plan(self, contact, text: str, label: str, disp: str,
-                           sticker: dict | None, failed: list) -> None:
+                           sticker: dict | None, failed: list, kind: str = "") -> None:
         """登记/更新补投计划：**只记没发出去的目标**。"""
         if not failed:
             return
@@ -1166,11 +1177,12 @@ class MessageBridge:
             if plan is None:
                 plan = {"contact": contact, "text": text, "label": label, "disp": disp,
                         "sticker": sticker, "failed": list(failed), "tries": 0,
-                        "next_ts": time.monotonic() + gap}
+                        "kind": kind, "next_ts": time.monotonic() + gap}
                 self._fwd_plan[key] = plan
             else:
                 plan["failed"] = list(failed)
                 plan["sticker"] = sticker or plan.get("sticker")
+                plan["kind"] = kind or plan.get("kind") or ""
                 plan["tries"] = 0
                 plan["next_ts"] = time.monotonic() + gap
         self._log("warning", f"[转发] 有 {len(failed)} 个目标没发出去"
@@ -1222,7 +1234,8 @@ class MessageBridge:
         ok, _sent, still_failed = self._forward(
             snapshot.get("contact", ""), text,
             snapshot.get("disp", "") or snapshot.get("label", ""),
-            sticker=snapshot.get("sticker"), only=failed)
+            sticker=snapshot.get("sticker"), only=failed,
+            kind=snapshot.get("kind") or "")
         if ok:
             with self._fwd_plan_lock:
                 self._fwd_plan.pop(key, None)
@@ -1248,10 +1261,12 @@ class MessageBridge:
         self._job_queue.put(("confirm", message))
 
     def _do_forward_job(self, contact: str, text: str, label: str,
-                        sticker: dict | None = None, display_label: str = "") -> None:
+                        sticker: dict | None = None, display_label: str = "",
+                        kind: str = "") -> None:
         """小天才 -> QQ 的**第一次**尝试（之后由补投线程只补失败的目标）。
 
         label 是身份标签（去重/历史都用它），display_label 只用于给 QQ 那条消息的抬头时间。
+        kind 是这条消息的类型（sticker/image/text，按**气泡本身**判定）。
         三条纪律（用户实测过的坑）：
           * 已有补投计划 / 刚转发过同一内容 -> 直接跳过（标签跳变也不能骗过它）；
           * 有目标成功就立刻记历史：轮询不会再拿这条消息重转（私聊不会被刷屏）；
@@ -1265,7 +1280,7 @@ class MessageBridge:
         # 靠它挡住"标签跳变 -> 被当成新消息 -> 整条重发"。
         self._mark_recent_fwd(contact, text)
         try:
-            ok, sent, failed = self._forward(contact, text, disp, sticker=sticker)
+            ok, sent, failed = self._forward(contact, text, disp, sticker=sticker, kind=kind)
         except Exception as e:  # noqa: BLE001
             self._log("warning", f"转发异常: {e}")
             ok, sent, failed = False, [], []
@@ -1275,7 +1290,7 @@ class MessageBridge:
         if sent:
             # 部分成功：**立刻**记历史（否则标签一变就会被当成新消息，重发一遍私聊）
             self._mark_forwarded(contact, text, label, disp)
-        self._schedule_fwd_plan(contact, text, label, disp, sticker, failed)
+        self._schedule_fwd_plan(contact, text, label, disp, sticker, failed, kind=kind)
 
     def _warm_emoji_store(self) -> None:
         """后台预热表情包名字索引（失败无所谓，收到表情时会按需再建）。"""
@@ -1287,7 +1302,7 @@ class MessageBridge:
 
     def _capture_sticker(self, root, text: str,
                          near_epoch: float | None = None,
-                         match_label: str = "") -> dict | None:
+                         match_label: str = "", kind: str = "") -> dict | None:
         """取"要发到 QQ 的那张图"（表情包 **和** 照片都走这里）。
 
         表情包：
@@ -1307,8 +1322,13 @@ class MessageBridge:
         """
         if not self._emoji_image:
             return None
-        is_image = (text or "").strip() == getattr(self.xtc, "IMAGE_TEXT", "图片")
-        is_sticker = (text or "").strip().startswith("表情")
+        k = (kind or "").strip().lower()
+        if k:
+            is_image, is_sticker = (k == "image"), (k == "sticker")
+        else:
+            # 没有类型信息时退回旧推断（老调用方/脚本补的 kind 为空）
+            is_image = (text or "").strip() == getattr(self.xtc, "IMAGE_TEXT", "图片")
+            is_sticker = (text or "").strip().startswith("表情")
         if not (is_image or is_sticker):
             # 防呆：文字消息**绝不能**取图。以前实时路径对每条消息都调这里，而下面
             # `sticker_of_latest(root, "")` 会退化成"屏幕上最新那张贴纸"—— 于是发一条
@@ -1525,12 +1545,13 @@ class MessageBridge:
                   "若使用 WSA / WSABuilds 且经常断网，可先在 WSA 设置里重启子系统"
                   "（或执行 wsa:// 设置里的 Repair），桥接会自动重连 ADB 继续工作")
 
-    def _typed_body(self, text: str) -> str:
+    def _typed_body(self, text: str, kind: str = "") -> str:
         """给转发内容加上**类型标记**，让表情和照片一眼分得开（用户要求）。
 
-        * 表情（贴纸）-> `[表情] 开心`（名字读不到时就是 `[表情]`）
-        * 照片（图片消息）-> `[图片]`
-        * 文字消息原样不动
+        * 表情（贴纸，kind=sticker）-> `[表情] 开心`（名字读不到时就是 `[表情]`）
+        * 照片（图片消息，kind=image）-> `[图片]`
+        * 文字消息（kind=text 或空）**原样不动** —— 包括手打的内容恰好以"表情"开头的文本：
+          用户实测那种消息被标成了"[表情]"、还没有图，看起来像"空气消息"。
 
         为什么要标：贴纸拿不到原图时会退化成**气泡截图**（一张 png），看起来和照片没区别，
         用户分不清哪条是表情、哪条是照片（实测 15:24 那条）。标记只加在**发出去的文字**上，
@@ -1539,10 +1560,19 @@ class MessageBridge:
         t = (text or "").strip()
         if not t:
             return t
-        if t == getattr(self.xtc, "IMAGE_TEXT", "图片"):
+        k = (kind or "").strip().lower()
+        if not k:
+            # 没有类型信息时退回旧推断（外部脚本/老调用方补的 kind 都是空）
+            if t == getattr(self.xtc, "IMAGE_TEXT", "图片"):
+                k = "image"
+            elif t.startswith("表情"):
+                k = "sticker"
+            else:
+                k = "text"
+        if k == "image":
             return "[图片]"
-        if t.startswith("表情"):
-            name = t[len("表情"):].strip()
+        if k == "sticker":
+            name = t[len("表情"):].strip() if t.startswith("表情") else t
             # 有的贴纸名字自带扩展名（实机：'表情弹吉他.png'）—— 显示时去掉
             name = re.sub(r"\.(png|gif|webp|jpe?g|apng)$", "", name, flags=re.I).strip()
             return f"[表情] {name}" if name else "[表情]"
@@ -1550,12 +1580,13 @@ class MessageBridge:
 
     def _forward(self, contact, text: str, time_label: str = "",
                  sticker: dict | None = None,
-                 only: list | None = None) -> tuple[bool, list, list]:
+                 only: list | None = None, kind: str = "") -> tuple[bool, list, list]:
         """转发到 QQ 目标。返回 (是否全部成功, 成功的目标, 失败的目标)。
 
         sticker：表情图（{data, kind, animated}）。给了就发"图片（+说明文字）"，
         失败自动退回纯文字。**单向**：只有 小天才 -> QQ 走图片，QQ -> 小天才 依旧是文字。
         only：只发这些目标（补投计划用它**只重试失败的目标**，绝不碰已经成功的那几个）。
+        kind：消息类型（sticker/image/text）；只有它才是 sticker/image 才加类型标记。
         """
         targets = self._qq_targets()
         if not targets:
@@ -1571,7 +1602,7 @@ class MessageBridge:
         # 只有时分（当天消息）时补当天日期；无标签时用当前时间。
         time_str = self._format_xtc_time(time_label)
         nickname = self._display_name(contact)
-        message = f"[{time_str}] [{nickname}] {self._typed_body(text)}"
+        message = f"[{time_str}] [{nickname}] {self._typed_body(text, kind)}"
         image_b64 = ""
         image_size = 0
         if sticker and sticker.get("data"):

@@ -1384,6 +1384,48 @@ def test_content_time_going_backwards_is_duplicate() -> None:
         cleanup(root)
 
 
+def test_typed_text_starting_with_sticker_word_is_text() -> None:
+    """手打的、以"表情"开头的**文本**消息不能被当成表情包。
+
+    用户实测（10-17 09:58）：手打了一条内容就是"表情"的文本消息，桥接按 `startswith("表情")`
+    当成表情包 -> 界面上根本没有对应气泡 -> 等原图重试 10 分钟 -> 最后发出一条
+    **没有图、只有"[表情]"的"空气消息"**。现在消息类型只认**气泡本身**
+    （`_chat_bubbles` 给的 sticker/image 标记），文本消息一律按文本走。
+    """
+    sticker_xml = node_xml(
+        n(cls="android.widget.TextView", text="回家中", desc="屑猹不喝茶发的消息,回家中",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[1070,586][1310,658]") +
+        n(cls="android.widget.ImageView", text="", desc="屑猹不喝茶发的消息,表情啊啊啊",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[948,267][1068,387]") +
+        n(cls="android.widget.TextView", text="表情包发我", desc="屑猹不喝茶发的消息,表情包发我",
+          rid="com.xtc.watch:id/chat_msg_item_content", bounds="[845,100][965,160]"))
+    text_xml = chat_page_xml("表情")
+    xtc_t, _ = make_xtc(text_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+    root_t = ET.fromstring(text_xml)
+    check("手打文本'表情'判为 text", xtc_t.message_kind(root_t, "表情") == "text",
+          xtc_t.message_kind(root_t, "表情"))
+    check("手打文本'表情包发我'判为 text",
+          xtc_t.message_kind(root_t, "表情包发我") == "text")
+    xtc_s, _ = make_xtc(sticker_xml, focus="com.xtc.watch/.ChatActivity", ui_cfg={})
+    root_s = ET.fromstring(sticker_xml)
+    check("真的表情气泡判为 sticker",
+          xtc_s.message_kind(root_s, "表情啊啊啊") == "sticker",
+          xtc_s.message_kind(root_s, "表情啊啊啊"))
+    check("同一屏里手打的'表情包发我'仍是 text",
+          xtc_s.message_kind(root_s, "表情包发我") == "text")
+    check("照片'图片'判为 image", xtc_s.message_kind(root_s, "图片") == "image")
+
+    br = bridge_mod.MessageBridge({"target": {}, "xiaotiancai": {}, "webhook": {}},
+                                  adb=None, xtc=xtc_s, forwarder=None, logger=None)
+    check("手打'表情'（kind=text）原样转发，不加标记",
+          br._typed_body("表情", "text") == "表情", br._typed_body("表情", "text"))
+    check("真表情（kind=sticker）加 [表情] 标记",
+          br._typed_body("表情啊啊啊", "sticker") == "[表情] 啊啊啊")
+    check("照片（kind=image）标成 [图片]", br._typed_body("图片", "image") == "[图片]")
+    check("没有 kind 时退回旧推断（兼容老调用方）",
+          br._typed_body("图片") == "[图片]" and br._typed_body("表情啊啊啊") == "[表情] 啊啊啊")
+
+
 def test_png_encoder_and_crop() -> None:
     """表情包转发用的纯标准库 PNG 编码 + 抠图（不引 Pillow）。
 
@@ -2521,7 +2563,7 @@ def test_media_pending_retry_when_original_arrives_late() -> None:
         br._emoji_photo = False           # 只走"气泡截图"这条路，避免依赖缓存
         br._emoji_store = None
         queued: list = []
-        br._queue_forward = lambda c, t, l, sticker=None, display_label="": queued.append(
+        br._queue_forward = lambda c, t, l, sticker=None, display_label="", kind="": queued.append(
             (c, t, l, sticker, display_label))
 
         # ① 原图还没就绪：登记等待，**不转发**
@@ -3026,7 +3068,7 @@ def test_backlog_media_uses_fresh_dump() -> None:
         adb.bridge = br
         br._emoji_from_data = True
         # 测试里没有工作线程：入队改成同步执行（与 _backlog_bridge 一致）
-        br._queue_forward = lambda c, t, l, sticker=None, display_label="": br._do_forward_job(
+        br._queue_forward = lambda c, t, l, sticker=None, display_label="", kind="": br._do_forward_job(
             c, t, l, sticker=sticker, display_label=display_label)
         br._emoji_store = type("S", (), {
             "find_photo": lambda self, **k: None,
@@ -3068,7 +3110,7 @@ def test_backlog_media_uses_fresh_dump() -> None:
         br2._cmd_done_file = str(root / f"{prefix}cmd_done2.json")
         adb2.bridge = br2
         br2._emoji_from_data = True
-        br2._queue_forward = lambda c, t, l, sticker=None, display_label="": br2._do_forward_job(
+        br2._queue_forward = lambda c, t, l, sticker=None, display_label="", kind="": br2._do_forward_job(
             c, t, l, sticker=sticker, display_label=display_label)
         real_shot = _png_pattern(136, 180, (235, 235, 235), (20, 20, 100, 100), (40, 30, 200))
         adb2.screencap_crop_png = lambda box: real_shot
@@ -5003,7 +5045,7 @@ def _backlog_bridge(root: Path, fwd, bubbles: list, known: list | None = None,
     br._catchup_max = catchup_max
     # 线上是"入队 + 工作线程异步转发"；测试里没有工作线程，
     # 这里把入队替换成同步执行，逻辑（撞库判定/入库/顺序）保持一致。
-    br._queue_forward = lambda c, t, l, sticker=None, display_label="": br._do_forward_job(
+    br._queue_forward = lambda c, t, l, sticker=None, display_label="", kind="": br._do_forward_job(
         c, t, l, sticker=sticker, display_label=display_label)
     for t in (known or []):
         br.msgs.append("xtc", "屑猹不喝茶", t)
@@ -5269,6 +5311,7 @@ def main() -> int:
                test_order_hold_while_media_pending,
                test_bare_time_label_in_future_is_yesterday,
                test_content_time_going_backwards_is_duplicate,
+               test_typed_text_starting_with_sticker_word_is_text,
                test_clipped_bubble_detection,
                test_blank_bubble_shot_is_not_sent,
                test_backlog_media_uses_fresh_dump,
